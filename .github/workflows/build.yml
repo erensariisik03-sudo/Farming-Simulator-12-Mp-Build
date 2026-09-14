@@ -1,4 +1,4 @@
-name: Build MultiplayerMod
+name: Build MultiplayerMod and Package APK
 
 on:
   workflow_dispatch:
@@ -17,8 +17,10 @@ jobs:
           unzip -q android-ndk-r16b-linux-x86_64.zip
           mv android-ndk-r16b "$HOME/android-ndk-r16b"
 
-      - name: Install dependencies for NDK r16b
-        run: sudo apt-get update && sudo apt-get install -y libncurses5
+      - name: Install dependencies (NDK, Zip, Java, Android Tools)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libncurses5 zip zipalign apksigner openjdk-17-jdk
 
       - name: Check NDK
         run: |
@@ -34,21 +36,57 @@ jobs:
             -DANDROID_TOOLCHAIN=gcc \
             -DCMAKE_BUILD_TYPE=Release
 
-      - name: Build
+      - name: Build .so Library
         run: |
           cmake --build build --config Release -j2
 
       - name: Verify generated library
         run: |
-          echo "Generated files:"
-          find build -type f -name "*.so" -print
-          echo
-          echo "Checking libmultiplayermod.so..."
+          echo "Checking built library..."
           test -f build/libmultiplayermod.so
           ls -lh build/libmultiplayermod.so
 
-      - name: Upload libmultiplayermod.so
+      - name: Inject .so into main.zip and Sign APK
+        run: |
+          echo "1. Klasor yapisi hazirlaniyor..."
+          mkdir -p lib/armeabi
+          # Derlenen kütüphaneyi belirtilen libmultiplayer.so adıyla kopyala
+          cp build/libmultiplayermod.so lib/armeabi/libmultiplayer.so
+
+          echo "2. main.zip APK yapisina kopyalaniyor..."
+          cp mainapk/main.zip game_unaligned.apk
+
+          echo "3. Yeni .so dosyasi APK icine enjekte ediliyor..."
+          zip -u game_unaligned.apk lib/armeabi/libmultiplayer.so
+
+          echo "4. APK hizalaniyor (zipalign)..."
+          zipalign -f -v 4 game_unaligned.apk game_aligned.apk
+
+          echo "5. Gecici Keystore uretiliyor..."
+          keytool -genkeypair -v \
+            -keystore debug.keystore \
+            -storepass android \
+            -alias androiddebugkey \
+            -keypass android \
+            -keyalg RSA \
+            -keysize 2048 \
+            -validity 10000 \
+            -dname "CN=Android Debug,O=Android,C=US"
+
+          echo "6. APK imzalaniyor (apksigner)..."
+          apksigner sign \
+            --ks debug.keystore \
+            --ks-pass pass:android \
+            --key-pass pass:android \
+            --ks-key-alias androiddebugkey \
+            --out MultiplayerMod_Signed.apk \
+            game_aligned.apk
+
+          echo "7. Imza kontrol ediliyor..."
+          apksigner verify MultiplayerMod_Signed.apk
+
+      - name: Upload Signed APK
         uses: actions/upload-artifact@v4
         with:
-          name: MultiplayerMod-armeabi
-          path: build/libmultiplayermod.so
+          name: MultiplayerMod-Game-APK
+          path: MultiplayerMod_Signed.apk
