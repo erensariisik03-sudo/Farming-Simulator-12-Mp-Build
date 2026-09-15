@@ -48,21 +48,24 @@ jobs:
 
       - name: Inject .so into main.zip and Sign APK
         run: |
-          echo "1. Klasor yapisi hazirlaniyor..."
+          echo "1. Preparing directory structure..."
           mkdir -p lib/armeabi
-          # Derlenen kütüphaneyi belirtilen libmultiplayer.so adıyla kopyala
-          cp build/libmultiplayermod.so lib/armeabi/libmultiplayer.so
+          # Copy the compiled library to match target filename
+          cp build/libmultiplayermod.so lib/armeabi/libmultiplayermod.so
 
-          echo "2. main.zip APK yapisina kopyalaniyor..."
+          echo "2. Copying main.zip to working APK structure..."
           cp mainapk/main.zip game_unaligned.apk
 
-          echo "3. Yeni .so dosyasi APK icine enjekte ediliyor..."
-          zip -u game_unaligned.apk lib/armeabi/libmultiplayer.so
+          echo "3. Removing existing .so file from ZIP..."
+          zip -d game_unaligned.apk lib/armeabi/libmultiplayermod.so || true
 
-          echo "4. APK hizalaniyor (zipalign)..."
+          echo "4. Injecting newly built uncompressed .so file..."
+          zip -g -0 game_unaligned.apk lib/armeabi/libmultiplayermod.so
+
+          echo "5. Aligning APK (zipalign)..."
           zipalign -f -v 4 game_unaligned.apk game_aligned.apk
 
-          echo "5. Gecici Keystore uretiliyor..."
+          echo "6. Generating temporary Keystore..."
           keytool -genkeypair -v \
             -keystore debug.keystore \
             -storepass android \
@@ -73,7 +76,7 @@ jobs:
             -validity 10000 \
             -dname "CN=Android Debug,O=Android,C=US"
 
-          echo "6. APK imzalaniyor (apksigner)..."
+          echo "7. Signing APK (apksigner)..."
           apksigner sign \
             --ks debug.keystore \
             --ks-pass pass:android \
@@ -82,7 +85,7 @@ jobs:
             --out MultiplayerMod_Signed.apk \
             game_aligned.apk
 
-          echo "7. Imza kontrol ediliyor..."
+          echo "8. Verifying APK signature..."
           apksigner verify MultiplayerMod_Signed.apk
 
       - name: Upload Signed APK
