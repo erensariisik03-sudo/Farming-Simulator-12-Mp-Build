@@ -27,7 +27,7 @@
 #include "imgui.h"
 #include "imgui_impl_opengl3.h"
 
-// Buton PNG Verisi
+// Button Texture Data
 #include "buton_texture.h"
 
 #define STB_IMAGE_IMPLEMENTATION
@@ -40,7 +40,7 @@
 #define TCP_SYNC_PORT 8889
 
 // ========================================================================
-// GLOBAL DEĞİŞKENLER
+// GLOBAL VARIABLES
 // ========================================================================
 JavaVM* g_GlobalJavaVM = nullptr; 
 
@@ -58,8 +58,8 @@ std::atomic<bool> g_TouchDown(false);
 
 static bool g_IsEatingTouch = false;
 
-// KULLANICI ADI
-char g_Nickname[32] = "Oyuncu"; 
+// USER NICKNAME
+char g_Nickname[32] = "Player"; 
 
 enum ActiveMenuType {
     MENU_NONE = 0,
@@ -74,7 +74,7 @@ std::vector<PeerDevice> g_DiscoveredPeers;
 std::mutex g_PeerMutex;
 std::atomic<bool> g_IsSearching(false);
 
-// POINTER YÖNETİMİ (Çakışmaları önlemek için ayrıldı)
+// POINTER MANAGEMENT
 uintptr_t g_EngineInstance = 0; 
 uintptr_t g_MenuInstance = 0;
 uintptr_t g_StartMenuInstance = 0;
@@ -84,19 +84,19 @@ std::atomic<bool> g_IsHost(false);
 std::atomic<bool> g_IsClient(false);
 std::atomic<bool> g_IsConnected(false);
 
-// SOKETLER
+// SOCKETS
 int g_TcpServerFd = -1; 
 int g_TcpSocket = -1;   
-std::string g_ConnectedStatus = "Bagli Degil";
+std::string g_ConnectedStatus = "Not Connected";
 
-// SOHBET SİSTEMİ DEĞİŞKENLERİ
+// CHAT SYSTEM
 std::vector<std::string> g_ChatMessages;
 std::mutex g_ChatMutex;
 
 std::vector<std::string> g_OutgoingChats;
 std::mutex g_OutgoingChatMutex;
 
-// NETWORK PAKET YAPISI
+// NETWORK PACKET STRUCTURE
 #pragma pack(push, 1)
 struct NetworkPacket {
     uint8_t type;          
@@ -114,7 +114,7 @@ JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM* vm, void* reserved) {
 }
 
 // ========================================================================
-// YEREL ANDROID NATIVE TOAST BİLDİRİMİ (JNI)
+// NATIVE ANDROID TOAST NOTIFICATION (JNI)
 // ========================================================================
 void ShowNativeToast(std::string message) {
     std::thread([message]() {
@@ -160,7 +160,7 @@ void ShowNativeToast(std::string message) {
 }
 
 // ========================================================================
-// YARDIMCI FONKSİYONLAR
+// HELPER FUNCTIONS
 // ========================================================================
 uintptr_t GetLibraryBase(const char* libName) {
     FILE* fp = fopen("/proc/self/maps", "r");
@@ -190,11 +190,11 @@ void ClearChat() {
 
 void AutoStartGameForClient() {
     g_IsMultiplayerMenuActive = false;
-    ShowNativeToast("Oyuna gecis yapiliyor. Lutfen oyunu manuel baslatin.");
+    ShowNativeToast("Switching to game. Please start the game manually.");
 }
 
 // ========================================================================
-// ORİJİNAL FONKSİYON POİNTERLARI
+// ORIGINAL FUNCTION POINTERS
 // ========================================================================
 typedef void* (*renderMenu_t)(void* thiz, void* p1, void* p2, void* p3);
 renderMenu_t orig_renderMenu = nullptr;
@@ -212,12 +212,7 @@ typedef void (*GameUpdate_t)(void* thiz, float param_1);
 GameUpdate_t orig_GameUpdate = nullptr;
 
 // ========================================================================
-// BOX2D / ARAÇ TRANSFORM TESTİ
-// Reverse-engineered libapp.so adresleri (Thumb -> +1):
-//   Vehicle::getPosition   = 0x000397da + 1
-//   Vehicle::getOrientation= 0x000397ea + 1
-//   b2Body::SetTransform   = 0x00060a0c + 1
-// Vehicle + 0x528 -> b2Body*
+// BOX2D / VEHICLE TRANSFORM TEST
 // ========================================================================
 struct TestB2Vec2 {
     float x;
@@ -239,19 +234,11 @@ static std::chrono::steady_clock::time_point g_LastTransformTest =
 static const uint32_t TRANSFORM_TEST_INTERVAL_MS = 3000;
 static const float TRANSFORM_TEST_STEP = 1.0f;
 
-// ========================================================================
-// ARAÇ TRANSFORM TEST YARDIMCILARI
-// ========================================================================
-
-// Game::updateStateBase/updateVehicleMapDot içinde görülen gerçek indeksleme:
-// vehicle = *(Game + ((*(Game + 0xA8) + 0x2A) * 4) + 4)
-// İlk testte bu aynı erişim kullanılıyor; böylece ayrı bir vehicle scan yapmıyoruz.
 static uintptr_t GetTestVehicleFromGame(uintptr_t game) {
     if (game == 0) return 0;
 
     uint32_t vehicleIndex = *(uint32_t*)(game + 0xA8);
 
-    // Bozuk/uninitialized değer yüzünden rastgele bellek okumayı önle.
     if (vehicleIndex > 512) return 0;
 
     uintptr_t vehicleSlotAddress =
@@ -273,7 +260,7 @@ static void RunVehicleTransformTest(uintptr_t game) {
 
     uintptr_t vehicle = GetTestVehicleFromGame(game);
     if (vehicle == 0) {
-        LOGI("[TRANSFORM TEST] Aktif vehicle bulunamadi.");
+        LOGI("[TRANSFORM TEST] Active vehicle not found.");
         return;
     }
 
@@ -281,7 +268,6 @@ static void RunVehicleTransformTest(uintptr_t game) {
     float p2 = 0.0f;
     float angle = 0.0f;
 
-    // Oyun içindeki gerçek Vehicle fonksiyonlarından mevcut transformu al.
     g_VehicleGetPosition((void*)vehicle, &p1, &p2);
     angle = g_VehicleGetOrientation((void*)vehicle);
 
@@ -295,8 +281,6 @@ static void RunVehicleTransformTest(uintptr_t game) {
     newPos.x = p1 + TRANSFORM_TEST_STEP;
     newPos.y = p2;
 
-    // İlk test: açıyı değiştirmeden yalnızca ilk pozisyon bileşenini +1.0 ilerlet.
-    // Amaç SetTransform zincirini cihaz üzerinde kanıtlamak.
     g_b2BodySetTransform((void*)body, &newPos, angle);
 
     LOGI("[TRANSFORM TEST] vehicle=%p body=%p pos=(%.3f, %.3f) -> (%.3f, %.3f) angle=%.3f",
@@ -304,7 +288,7 @@ static void RunVehicleTransformTest(uintptr_t game) {
 }
 
 // ========================================================================
-// AĞ & NETWORK FONKSİYONLARI 
+// NETWORK FUNCTIONS
 // ========================================================================
 bool IsNetworkAvailable() {
     int sock = socket(AF_INET, SOCK_DGRAM, 0);
@@ -487,7 +471,7 @@ GLuint LoadTextureFromPNGArray(const unsigned char* png_data, int data_len) {
 }
 
 // ========================================================================
-// AĞ THREADLERİ
+// NETWORK THREADS
 // ========================================================================
 void NetworkLoop() {
     fcntl(g_TcpSocket, F_SETFL, O_NONBLOCK);
@@ -510,13 +494,13 @@ void NetworkLoop() {
             } 
         } 
         else if (bytesRead == 0) {
-            ShowNativeToast("Baglanti Koptu (Diger oyuncu ayrildi)!");
+            ShowNativeToast("Connection Lost (Other player left)!");
             g_IsConnected = false;
             break; 
         }
         else if (bytesRead < 0) {
             if (errno != EWOULDBLOCK && errno != EAGAIN) {
-                ShowNativeToast("Hata: Ag Baglantisi Koptu!");
+                ShowNativeToast("Error: Network Connection Lost!");
                 g_IsConnected = false;
                 break;
             }
@@ -567,7 +551,7 @@ void StartPONGResponderThread() {
             buffer[n] = '\0';
             if (strcmp(buffer, "FS14_PING") == 0) {
                 if (g_IsHost.load()) {
-                    std::string roomName = std::string(g_Nickname) + " Odasi";
+                    std::string roomName = std::string(g_Nickname) + "'s Room";
                     std::string reply = "FS14_PONG|" + roomName;
                     sendto(sockfd, reply.c_str(), reply.length(), 0, (struct sockaddr*)&client_addr, client_len);
                 }
@@ -578,7 +562,7 @@ void StartPONGResponderThread() {
 
 void StartLANDiscoveryThread() {
     if (!IsNetworkAvailable()) {
-        ShowNativeToast("Hata: Ag baglantinizi kontrol edin!");
+        ShowNativeToast("Error: Check your network connection!");
         g_IsSearching.store(false);
         return;
     }
@@ -634,8 +618,8 @@ void StartLANDiscoveryThread() {
 
 void TCPHostThread() {
     if (!IsNetworkAvailable()) {
-        ShowNativeToast("Hata: Ag baglantinizi kontrol edin!");
-        g_ConnectedStatus = "Baglanti Hatasi (Ag Yok)";
+        ShowNativeToast("Error: Check your network connection!");
+        g_ConnectedStatus = "Connection Error (No Network)";
         g_IsHost = false;
         return;
     }
@@ -650,16 +634,16 @@ void TCPHostThread() {
     bind(g_TcpServerFd, (struct sockaddr*)&address, sizeof(address));
     listen(g_TcpServerFd, 3);
     
-    g_ConnectedStatus = "Host Acildi. Istemci Bekleniyor...";
-    ShowNativeToast("Oda Kuruldu. Istemci Bekleniyor...");
+    g_ConnectedStatus = "Host Started. Waiting for client...";
+    ShowNativeToast("Room Created. Waiting for client...");
     int addrlen = sizeof(address);
     
     g_TcpSocket = accept(g_TcpServerFd, (struct sockaddr*)&address, (socklen_t*)&addrlen);
     
     if (g_TcpSocket >= 0 && g_IsHost) {
         g_IsConnected = true;
-        g_ConnectedStatus = "Istemci Baglandi!";
-        ShowNativeToast("Istemci Odaya Katildi!"); 
+        g_ConnectedStatus = "Client Connected!";
+        ShowNativeToast("Client Joined the Room!"); 
         NetworkLoop(); 
     }
     
@@ -668,7 +652,7 @@ void TCPHostThread() {
     
     g_IsConnected = false;
     g_IsHost = false;
-    if (g_ConnectedStatus != "Oda Kapatildi.") g_ConnectedStatus = "Baglanti Koptu.";
+    if (g_ConnectedStatus != "Room Closed.") g_ConnectedStatus = "Connection Lost.";
 }
 
 void TCPClientThread(std::string hostIP) {
@@ -679,7 +663,7 @@ void TCPClientThread(std::string hostIP) {
     serv_addr.sin_port = htons(TCP_SYNC_PORT);
     
     if (inet_pton(AF_INET, hostIP.c_str(), &serv_addr.sin_addr) <= 0) {
-        ShowNativeToast("Hata: Gecersiz IP!");
+        ShowNativeToast("Error: Invalid IP!");
         g_IsClient = false;
         return;
     }
@@ -689,17 +673,17 @@ void TCPClientThread(std::string hostIP) {
     timeout.tv_usec = 0;
     setsockopt(g_TcpSocket, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout));
 
-    g_ConnectedStatus = "Odaya Baglaniliyor...";
-    ShowNativeToast("Odaya baglaniliyor: " + hostIP);
+    g_ConnectedStatus = "Connecting to room...";
+    ShowNativeToast("Connecting to room: " + hostIP);
 
     if (connect(g_TcpSocket, (struct sockaddr*)&serv_addr, sizeof(serv_addr)) >= 0) {
         g_IsConnected = true;
-        g_ConnectedStatus = "Host'a Baglandi!";
-        ShowNativeToast("Odaya Basariyla Katildiniz!"); 
+        g_ConnectedStatus = "Connected to Host!";
+        ShowNativeToast("Successfully Joined Room!"); 
         NetworkLoop(); 
     } else {
-        ShowNativeToast("Hata: Odaya Baglanilamadi!");
-        g_ConnectedStatus = "Baglanti Basarisiz";
+        ShowNativeToast("Error: Could not connect to room!");
+        g_ConnectedStatus = "Connection Failed";
     }
     
     if (g_TcpSocket >= 0) { shutdown(g_TcpSocket, SHUT_RDWR); close(g_TcpSocket); g_TcpSocket = -1; }
@@ -708,7 +692,7 @@ void TCPClientThread(std::string hostIP) {
 }
 
 // ========================================================================
-// KANCALAR VE ÇİZİM 
+// HOOKS AND RENDERING
 // ========================================================================
 int32_t my_AInputQueue_getEvent(void* queue, AInputEvent** outEvent) {
     int32_t result;
@@ -853,7 +837,7 @@ void DrawImGui() {
         ImGui_ImplOpenGL3_NewFrame();
         ImGui::NewFrame();
 
-        // MENÜ GEÇİŞ BUTONU
+        // MENU TOGGLE BUTTON
         if (g_CurrentMenu != MENU_INGAME && g_MultiplayerButtonTexture != 0) {
             float posX = 0.0f, posY = 0.0f;
             float targetWidth = 100.0f, targetHeight = 50.0f;
@@ -871,7 +855,7 @@ void DrawImGui() {
 
             ImGui::SetNextWindowPos(ImVec2(posX, posY), ImGuiCond_Always); 
             ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0, 0));
-            ImGui::Begin("Mod Menusu", nullptr, ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoBackground | ImGuiWindowFlags_NoResize | ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoSavedSettings); 
+            ImGui::Begin("Mod Menu", nullptr, ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoBackground | ImGuiWindowFlags_NoResize | ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoSavedSettings); 
             
             ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(0, 0));
             ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.0f, 0.0f, 0.0f, 0.0f));       
@@ -899,7 +883,7 @@ void DrawImGui() {
 
             auto RenderChatUI = [&]() {
                 ImGui::Separator();
-                ImGui::Text("Sohbet Paneli:");
+                ImGui::Text("Chat Panel:");
                 
                 float chatBoxHeight = winHeight * 0.33f;
                 ImGui::BeginChild("ChatHistory", ImVec2(-1.0f, chatBoxHeight), true);
@@ -925,12 +909,12 @@ void DrawImGui() {
                 }
 
                 ImGui::SameLine();
-                if (ImGui::Button("Gonder", ImVec2(sendBtnWidth, 42.0f * (uiScale / 1.5f))) || enterPressed) {
+                if (ImGui::Button("Send", ImVec2(sendBtnWidth, 42.0f * (uiScale / 1.5f))) || enterPressed) {
                     if (strlen(inputBuffer) > 0) {
                         std::string msgStr(inputBuffer);
                         {
                             std::lock_guard<std::mutex> lock(g_ChatMutex);
-                            g_ChatMessages.push_back("Sen: " + msgStr);
+                            g_ChatMessages.push_back("You: " + msgStr);
                         }
                         {
                             std::lock_guard<std::mutex> lock(g_OutgoingChatMutex);
@@ -942,19 +926,19 @@ void DrawImGui() {
                 }
             };
             
-            // MENU_SETTINGS (HOST MENÜSÜ)
+            // MENU_SETTINGS (HOST MENU)
             if (g_CurrentMenu == MENU_SETTINGS) {
-                ImGui::Begin("Ayarlar Menusu", &g_IsMultiplayerMenuActive, ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove);
+                ImGui::Begin("Settings Menu", &g_IsMultiplayerMenuActive, ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove);
                 
                 if (g_IsClient && g_IsConnected) {
-                    ImGui::TextColored(ImVec4(0.0f, 0.85f, 1.0f, 1.0f), "Ag Durumu: %s", g_ConnectedStatus.c_str());
+                    ImGui::TextColored(ImVec4(0.0f, 0.85f, 1.0f, 1.0f), "Network Status: %s", g_ConnectedStatus.c_str());
                     ImGui::Separator();
                     
                     ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.8f, 0.1f, 0.1f, 1.0f)); 
                     ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.9f, 0.2f, 0.2f, 1.0f));
                     ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(0.7f, 0.05f, 0.05f, 1.0f));
                     
-                    if (ImGui::Button("Odadan Ayril", ImVec2(-1.0f, 60.0f * (uiScale / 1.5f)))) {
+                    if (ImGui::Button("Leave Room", ImVec2(-1.0f, 60.0f * (uiScale / 1.5f)))) {
                         ClearChat(); 
                         g_IsClient = false; 
                         g_IsConnected = false;
@@ -963,24 +947,24 @@ void DrawImGui() {
                             close(g_TcpSocket);
                             g_TcpSocket = -1;
                         }
-                        g_ConnectedStatus = "Odadan Ayrildiniz.";
+                        g_ConnectedStatus = "Left the room.";
                     }
                     ImGui::PopStyleColor(3);
 
                     RenderChatUI();
                 } else {
-                    ImGui::Text("Oyun Durumu: %s", (g_StartMenuInstance != 0) ? "Oyuna Erisildi" : "Pointer Bekleniyor...");
-                    ImGui::TextColored(ImVec4(0.0f, 0.85f, 1.0f, 1.0f), "Ag Durumu: %s", g_ConnectedStatus.c_str());
+                    ImGui::Text("Game Status: %s", (g_StartMenuInstance != 0) ? "Game Hooked" : "Waiting for pointer...");
+                    ImGui::TextColored(ImVec4(0.0f, 0.85f, 1.0f, 1.0f), "Network Status: %s", g_ConnectedStatus.c_str());
                     ImGui::Separator();
 
                     if (!g_IsHost) {
-                        if (ImGui::Button("Oda Kur", ImVec2(-1.0f, 80.0f * (uiScale / 1.5f)))) {
+                        if (ImGui::Button("Host Room", ImVec2(-1.0f, 80.0f * (uiScale / 1.5f)))) {
                             ClearChat(); 
                             g_IsHost = true;
                             std::thread(TCPHostThread).detach();
                         }
                     } else {
-                        if (ImGui::Button("Odayi Kapat", ImVec2(-1.0f, 80.0f * (uiScale / 1.5f)))) {
+                        if (ImGui::Button("Close Room", ImVec2(-1.0f, 80.0f * (uiScale / 1.5f)))) {
                             ClearChat(); 
                             g_IsHost = false; 
                             g_IsConnected = false;
@@ -996,7 +980,7 @@ void DrawImGui() {
                                 g_TcpSocket = -1;
                             }
                             
-                            g_ConnectedStatus = "Oda Kapatildi.";
+                            g_ConnectedStatus = "Room Closed.";
                         }
                     }
 
@@ -1006,15 +990,15 @@ void DrawImGui() {
                 }
                 ImGui::End();
             }
-            // MENU_SAVELOAD (CLIENT KATILMA EKRANI)
+            // MENU_SAVELOAD (CLIENT JOIN MENU)
             else if (g_CurrentMenu == MENU_SAVELOAD) {
-                ImGui::Begin("Sunucu Arama (Client) Menusu", &g_IsMultiplayerMenuActive, ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove);
-                ImGui::Text("Oyun Durumu: %s", (g_MenuInstance != 0) ? "Oyuna Erisildi" : "Pointer Bekleniyor...");
-                ImGui::TextColored(ImVec4(0.0f, 0.85f, 1.0f, 1.0f), "Ag Durumu: %s", g_ConnectedStatus.c_str());
+                ImGui::Begin("Server Browser (Client)", &g_IsMultiplayerMenuActive, ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove);
+                ImGui::Text("Game Status: %s", (g_MenuInstance != 0) ? "Game Hooked" : "Waiting for pointer...");
+                ImGui::TextColored(ImVec4(0.0f, 0.85f, 1.0f, 1.0f), "Network Status: %s", g_ConnectedStatus.c_str());
                 ImGui::Separator();
 
                 if (!g_IsConnected) {
-                    ImGui::Text("Kullanici Adiniz:");
+                    ImGui::Text("Username:");
                     ImGui::SetNextItemWidth(-1.0f);
                     
                     bool nickEnterPressed = ImGui::InputText("##NicknameInput", g_Nickname, IM_ARRAYSIZE(g_Nickname), ImGuiInputTextFlags_EnterReturnsTrue);
@@ -1027,7 +1011,7 @@ void DrawImGui() {
                     
                     ImGui::Spacing();
 
-                    if (ImGui::Button(g_IsSearching.load() ? "Taraniyor..." : "Aglari Tara", ImVec2(-1.0f, 50.0f * (uiScale / 1.5f)))) {
+                    if (ImGui::Button(g_IsSearching.load() ? "Searching..." : "Scan Networks", ImVec2(-1.0f, 50.0f * (uiScale / 1.5f)))) {
                         if (!g_IsSearching.load()) {
                             g_IsSearching.store(true);
                             std::thread(StartLANDiscoveryThread).detach();
@@ -1035,12 +1019,12 @@ void DrawImGui() {
                     }
                     
                     ImGui::Separator();
-                    ImGui::Text("Bulunan Odalar (Katilmak icin dokunun):");
+                    ImGui::Text("Discovered Rooms (Tap to join):");
                     
                     {
                         std::lock_guard<std::mutex> lock(g_PeerMutex);
                         if (g_DiscoveredPeers.empty()) {
-                            ImGui::TextDisabled("Henuz aktif bir oda bulunamadi.");
+                            ImGui::TextDisabled("No active rooms found yet.");
                         } else {
                             for (size_t i = 0; i < g_DiscoveredPeers.size(); i++) {
                                 std::string label = g_DiscoveredPeers[i].name + " [" + g_DiscoveredPeers[i].ip + "]"; 
@@ -1060,13 +1044,13 @@ void DrawImGui() {
                     ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.1f, 0.6f, 0.1f, 1.0f)); 
                     ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.2f, 0.8f, 0.2f, 1.0f));
                     ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(0.05f, 0.5f, 0.05f, 1.0f));
-                    if (ImGui::Button("OYUNA KATIL (HEMEN BASLA)", ImVec2(-1.0f, 60.0f * (uiScale / 1.5f)))) {
+                    if (ImGui::Button("JOIN GAME (START NOW)", ImVec2(-1.0f, 60.0f * (uiScale / 1.5f)))) {
                         AutoStartGameForClient();
                     }
                     ImGui::PopStyleColor(3);
                     ImGui::Spacing();
 
-                    if (ImGui::Button("Baglantiyi Kes", ImVec2(-1.0f, 40.0f * (uiScale / 1.5f)))) {
+                    if (ImGui::Button("Disconnect", ImVec2(-1.0f, 40.0f * (uiScale / 1.5f)))) {
                         ClearChat(); 
                         g_IsHost = false; g_IsClient = false; g_IsConnected = false;
                         if (g_TcpSocket >= 0) {
@@ -1085,7 +1069,7 @@ void DrawImGui() {
 
         ImGui::Render();
         
-        // OPENGL DURUMUNU KAYDET VE GERİ YÜKLE
+        // SAVE AND RESTORE OPENGL STATE
         GLboolean depthTestEnabled = glIsEnabled(GL_DEPTH_TEST);
         GLboolean cullFaceEnabled = glIsEnabled(GL_CULL_FACE);
 
@@ -1094,21 +1078,19 @@ void DrawImGui() {
         
         ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
         
-        // Oyunun eski durumunu geri ver
         if (depthTestEnabled) glEnable(GL_DEPTH_TEST);
         if (cullFaceEnabled) glEnable(GL_CULL_FACE);
     }
 }
 
 // ========================================================================
-// RENDER KANCALARI
+// RENDER HOOKS
 // ========================================================================
 void my_GameUpdate(void* thiz, float param_1) {
     g_EngineInstance = (uintptr_t)thiz; 
     g_CurrentMenu = MENU_INGAME; 
     if (orig_GameUpdate) orig_GameUpdate(thiz, param_1);
 
-    // İlk aşama: network'e dokunmadan gerçek araç transformunu test et.
     RunVehicleTransformTest(g_EngineInstance);
 }
 
@@ -1143,11 +1125,11 @@ void* my_renderStartMenuMain(void* thiz, void* p1, void* p2, void* p3) {
 }
 
 // ========================================================================
-// ANA MOD BAŞLATICISI
+// MAIN MOD INITIALIZER
 // ========================================================================
 __attribute__((constructor))
 void ModMain() {
-    LOGI(">>> MULTIPLAYER MOD BASLATIYOR <<<");
+    LOGI(">>> MULTIPLAYER MOD STARTING <<<");
 
     std::thread(StartPONGResponderThread).detach();
 
@@ -1159,7 +1141,6 @@ void ModMain() {
     uintptr_t gameUpdateAddr = libBase + 0x00057ee8 + 1; 
     uintptr_t inGameMenuAddr = libBase + 0x00032090 + 1;  
 
-    // Reverse-engineered native calls. Ghidra'da adreslere Thumb biti (+1) eklenir.
     g_VehicleGetPosition = (VehicleGetPosition_t)(libBase + 0x000397da + 1);
     g_VehicleGetOrientation = (VehicleGetOrientation_t)(libBase + 0x000397ea + 1);
     g_b2BodySetTransform = (b2BodySetTransform_t)(libBase + 0x00060a0c + 1);
