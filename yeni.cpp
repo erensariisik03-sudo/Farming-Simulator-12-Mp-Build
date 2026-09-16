@@ -1,8 +1,10 @@
-// REVERTED STABLE VERSION + C# LERP & THRESHOLD LOGIC
+// REVERTED STABLE VERSION
 // Kept only:
 // 1) Vehicle ownership system
 // 2) VEHICLE_SYNC_INTERVAL_US = 16667 (60 Hz)
-// 3) Threshold filtering & Frame-based Lerp Interpolation
+//
+// GameUpdate / GameUpdateStateBase sync placement remains as in the
+// previously working version.
 
 #include <jni.h>
 #include <android/log.h>
@@ -29,10 +31,6 @@
 #include <net/if.h>
 #include <cerrno>
 #include <math.h>
-
-#ifndef M_PI
-#define M_PI 3.14159265358979323846f
-#endif
 
 #include "Substrate.h"
 #include "imgui.h"
@@ -267,13 +265,10 @@ static const uint8_t PACKET_VEHICLE_POSITION = 3;
 static const uint8_t MAX_PLAYERS = 4;
 static const uint16_t VEHICLE_ID_INVALID = 0xFFFF;
 
-// CHANGED: 16.667 ms (60 Hz) sync interval
 static const uint32_t VEHICLE_SYNC_INTERVAL_US = 16667;
 
-// C# UYUMLU SENSITIVITY DEGERLERI
-static const float POSITION_EPSILON = 0.005f; // moveThreshold
-static const float ANGLE_EPSILON = 0.05f;     // rotateThreshold
-static const float LERP_SPEED = 15.0f;        // lerpSpeed
+static const float POSITION_EPSILON = 0.02f;
+static const float ANGLE_EPSILON = 0.005f;
 
 #pragma pack(push, 1)
 
@@ -334,10 +329,6 @@ static float g_LastLocalY = 0.0f;
 static float g_LastLocalAngle = 0.0f;
 static std::chrono::steady_clock::time_point g_LastVehicleSync =
     std::chrono::steady_clock::now();
-
-// ========================================================================
-// KEPT: VEHICLE OWNERSHIP SYSTEM
-// ========================================================================
 
 static const uint16_t MAX_VEHICLE_SLOTS = 513;
 
@@ -486,7 +477,6 @@ static void CaptureAndQueueLocalVehicleState(uintptr_t game) {
 
     const auto now = std::chrono::steady_clock::now();
 
-    // CHANGED: Elapsed time calculated in microseconds
     const uint64_t elapsedUs =
         (uint64_t)std::chrono::duration_cast<
             std::chrono::microseconds
@@ -527,7 +517,6 @@ static void CaptureAndQueueLocalVehicleState(uintptr_t game) {
     const bool angleChanged =
         fabsf(angle - g_LastLocalAngle) > ANGLE_EPSILON;
 
-    // KEPT: do not send if not moving (Threshold Kontrolü C# ile aynı)
     if (!positionChanged && !angleChanged) {
         g_HasLastLocalVehicleState = true;
         g_LastLocalVehicleId = vehicleId;
@@ -537,7 +526,6 @@ static void CaptureAndQueueLocalVehicleState(uintptr_t game) {
         return;
     }
 
-    // KEPT: never echo a vehicle owned by the other player
     if (!TryClaimVehicle(vehicleId)) {
         g_HasLastLocalVehicleState = true;
         g_LastLocalVehicleId = vehicleId;
@@ -566,7 +554,6 @@ static void CaptureAndQueueLocalVehicleState(uintptr_t game) {
     g_LastLocalY = y;
     g_LastLocalAngle = angle;
 
-    /* (Log Spam engellemek icin kapatilabilir, aktif durumda birakildi)
     LOGI(
         "[VEHICLE SEND QUEUED] owner=%u vehicle=%u pos=(%.3f, %.3f) angle=%.3f",
         (unsigned)g_LocalPlayerId.load(),
@@ -575,23 +562,11 @@ static void CaptureAndQueueLocalVehicleState(uintptr_t game) {
         y,
         angle
     );
-    */
 }
 
 static void ApplyRemoteVehicleStates(uintptr_t game) {
     if (game == 0 || !g_b2BodySetTransform) return;
     if (!g_IsConnected.load()) return;
-    if (!g_VehicleGetPosition || !g_VehicleGetOrientation) return; 
-
-    // Frame-based DeltaTime hesaplama (C# Time.deltaTime)
-    static auto s_lastLerpTime = std::chrono::steady_clock::now();
-    auto now = std::chrono::steady_clock::now();
-    float dt = std::chrono::duration<float>(now - s_lastLerpTime).count();
-    s_lastLerpTime = now;
-
-    // Lag olursa Lerp uçmasın diye maksimum bir delta sınırı koyduk
-    if (dt > 0.1f) dt = 0.1f;
-    if (dt <= 0.0f) return;
 
     RemoteVehicleState snapshot[MAX_PLAYERS];
     memset(snapshot, 0, sizeof(snapshot));
@@ -609,6 +584,7 @@ static void ApplyRemoteVehicleStates(uintptr_t game) {
         if (!state.valid) continue;
         if (state.ownerId == g_LocalPlayerId.load()) continue;
         if (state.vehicleId >= vehicleCount) continue;
+        if (state.sequence == state.appliedSequence) continue;
 
         uintptr_t vehicle =
             GetVehicleFromIndex(game, state.vehicleId);
@@ -620,55 +596,25 @@ static void ApplyRemoteVehicleStates(uintptr_t game) {
 
         if (body == 0) continue;
 
-        // C# Transform yakalama işleminin Box2D karşılığı
-        float currentX = 0.0f;
-        float currentY = 0.0f;
-        g_VehicleGetPosition((void*)vehicle, &currentX, &currentY);
-        float currentAngle = g_VehicleGetOrientation((void*)vehicle);
+        TestB2Vec2 position;
+        position.x = state.x;
+        position.y = state.y;
 
-        float diffX = state.x - currentX;
-        float diffY = state.y - currentY;
-        float dist = sqrtf(diffX * diffX + diffY * diffY);
-
-        // Quaternion.Slerp yapısına benzer en kısa yoldan rotasyon çözümü
-        float angleDiff = state.angle - currentAngle;
-        while (angleDiff < -M_PI) angleDiff += 2.0f * M_PI;
-        while (angleDiff > M_PI) angleDiff -= 2.0f * M_PI;
-
-        // Eşik değere çok yaklaşıldıysa fizik motorunu uyutmak/titretmemek için boş dön 
-        if (dist < 0.001f && fabsf(angleDiff) < 0.001f) {
-            continue; 
-        }
-
-        // Lerp Oranı 
-        float lerpFactor = dt * LERP_SPEED;
-        if (lerpFactor > 1.0f) lerpFactor = 1.0f; 
-
-        TestB2Vec2 newPosition;
-        newPosition.x = currentX + (diffX * lerpFactor);
-        newPosition.y = currentY + (diffY * lerpFactor);
-        float newAngle = currentAngle + (angleDiff * lerpFactor);
-
-        // Vector3.Lerp ve Quaternion.Slerp'in C++ uygulanmış haliyle aracı setliyoruz
         g_b2BodySetTransform(
             (void*)body,
-            &newPosition,
-            newAngle
+            &position,
+            state.angle
         );
 
-        bool isNewSequence = (state.sequence != state.appliedSequence);
-        if (isNewSequence) {
-            // Sadece yeni bir paket hedeflenmeye başlandığında log basalım ki Logcat dolmasın
-            LOGI(
-                "[VEHICLE LERP TARGET] owner=%u vehicle=%u seq=%u target=(%.3f, %.3f) angle=%.3f",
-                (unsigned)state.ownerId,
-                (unsigned)state.vehicleId,
-                (unsigned)state.sequence,
-                state.x,
-                state.y,
-                state.angle
-            );
-        }
+        LOGI(
+            "[VEHICLE RECEIVE APPLY] owner=%u vehicle=%u seq=%u pos=(%.3f, %.3f) angle=%.3f",
+            (unsigned)state.ownerId,
+            (unsigned)state.vehicleId,
+            (unsigned)state.sequence,
+            state.x,
+            state.y,
+            state.angle
+        );
 
         std::lock_guard<std::mutex> lock(g_RemoteVehicleMutex);
 
@@ -676,7 +622,8 @@ static void ApplyRemoteVehicleStates(uintptr_t game) {
             g_RemoteVehicles[ownerId].valid &&
             g_RemoteVehicles[ownerId].sequence == state.sequence
         ) {
-            g_RemoteVehicles[ownerId].appliedSequence = state.sequence;
+            g_RemoteVehicles[ownerId].appliedSequence =
+                state.sequence;
         }
     }
 }
@@ -718,7 +665,6 @@ static void HandleVehiclePositionPacket(
     if (pkt.ownerId == g_LocalPlayerId.load()) return;
     if (pkt.vehicleId >= MAX_VEHICLE_SLOTS) return;
 
-    // KEPT: assign vehicle ownership from the sender
     {
         std::lock_guard<std::mutex> ownerLock(
             g_VehicleOwnerMutex
@@ -765,7 +711,6 @@ static void HandleVehiclePositionPacket(
     state.angle = pkt.angle;
     state.sequence = pkt.sequence;
 
-    /* (Log Spam engellemek icin kapatilabilir, aktif durumda birakildi)
     LOGI(
         "[VEHICLE RECEIVED] owner=%u vehicle=%u seq=%u pos=(%.3f, %.3f) angle=%.3f",
         (unsigned)pkt.ownerId,
@@ -775,7 +720,6 @@ static void HandleVehiclePositionPacket(
         pkt.y,
         pkt.angle
     );
-    */
 }
 
 static void ResetVehicleSyncState() {
@@ -1188,10 +1132,6 @@ GLuint LoadTextureFromPNGArray(
     return textureID;
 }
 
-// ========================================================================
-// NETWORK LOOP
-// ========================================================================
-
 void NetworkLoop() {
     fcntl(g_TcpSocket, F_SETFL, O_NONBLOCK);
 
@@ -1357,6 +1297,16 @@ void NetworkLoop() {
                 g_IsConnected.store(false);
                 break;
             }
+
+            LOGI(
+                "[VEHICLE SENT] owner=%u vehicle=%u seq=%u pos=(%.3f, %.3f) angle=%.3f",
+                (unsigned)vehiclePkt.ownerId,
+                (unsigned)vehiclePkt.vehicleId,
+                (unsigned)vehiclePkt.sequence,
+                vehiclePkt.x,
+                vehiclePkt.y,
+                vehiclePkt.angle
+            );
         }
 
         std::this_thread::sleep_for(
@@ -2678,10 +2628,6 @@ void DrawImGui() {
     }
 }
 
-// ========================================================================
-// REVERTED UPDATE HOOKS
-// ========================================================================
-
 void my_GameUpdate(void* thiz, float param_1) {
     g_EngineInstance = (uintptr_t)thiz;
     g_CurrentMenu = MENU_INGAME;
@@ -2710,11 +2656,7 @@ void my_GameUpdateStateBase(
         );
     }
 
-    // IMPORTANT:
-    // Keep sync in the previously working update hook.
-    // This was NOT moved into GameUpdate.
     if (g_IsConnected.load()) {
-        // Artik her update çagrısında (her frame) calısarak aracı hedefe dogru puruzsuz kaydirir
         ApplyRemoteVehicleStates(g_EngineInstance);
         CaptureAndQueueLocalVehicleState(g_EngineInstance);
     }
@@ -2750,16 +2692,146 @@ void* my_renderMenu(
     void* p2,
     void* p3
 ) {
-    g_MenuMerhaba dostum! Gönderdiğin C# yapılandırmasındaki eşik (threshold) ve interpolasyon (Lerp) mantığı, multiplayer oyunlarda paket trafiğini hafifletmek ve titremeyi sıfırlamak için en doğru yaklaşımlardan biridir. 
+    g_MenuInstance = (uintptr_t)thiz;
 
-İstediğin bu özellikleri `MultiplayerMod_2.cpp` dosyasına uyarlamak oldukça kolay. Mevcut C++ dosyasında paket trafiğini kısıtlayan `POSITION_EPSILON` ve `ANGLE_EPSILON` adında eşik değişkenleri zaten bulunuyor[cite: 1]. Ayrıca `ApplyRemoteVehicleStates` fonksiyonu, gelen veriyi araçlara anında (ışınlayarak) uyguluyor[cite: 1].
+    void* ret = nullptr;
 
-C# kodundaki mantığı C++ tarafına (Box2D ve Android Native ortamına) uyarlamak için dosyada **iki yeri** değiştirmen yeterli olacaktır:
+    if (orig_renderMenu) {
+        ret =
+            orig_renderMenu(
+                thiz,
+                p1,
+                p2,
+                p3
+            );
+    }
 
-### 1. Eşik (Threshold) ve Lerp Değişkenlerini Güncelleme
-Dosyanın üst kısımlarında bulunan eski epsilon değerlerini bulup, C# kodunda belirttiğin hassasiyetlere göre değiştirmelisin. C++ (Box2D) tarafında Quaternion yerine radyan cinsinden açılar (Euler) kullanıldığı için Slerp işlemini radyan matematiği üzerinden yapacağız.
+    g_CurrentMenu = MENU_SAVELOAD;
+    DrawImGui();
 
-**Mevcut olan şu satırları bul:**
-```cpp
-static const float POSITION_EPSILON = 0.02f;
-static const float ANGLE_EPSILON = 0.005f;
+    return ret;
+}
+
+void* my_renderStartMenuMain(
+    void* thiz,
+    void* p1,
+    void* p2,
+    void* p3
+) {
+    g_StartMenuInstance =
+        (uintptr_t)thiz;
+
+    void* ret = nullptr;
+
+    if (orig_renderStartMenuMain) {
+        ret =
+            orig_renderStartMenuMain(
+                thiz,
+                p1,
+                p2,
+                p3
+            );
+    }
+
+    g_CurrentMenu = MENU_SETTINGS;
+    DrawImGui();
+
+    return ret;
+}
+
+__attribute__((constructor))
+void ModMain() {
+    LOGI(">>> MULTIPLAYER MOD STARTING <<<");
+
+    ResetVehicleSyncState();
+    std::thread(StartPONGResponderThread).detach();
+
+    uintptr_t libBase =
+        GetLibraryBase("libapp.so");
+
+    if (libBase == 0) {
+        return;
+    }
+
+    uintptr_t renderMenuAddr =
+        libBase + 0x00033974 + 1;
+
+    uintptr_t updateGUIAddr =
+        libBase + 0x0002f6a0 + 1;
+
+    uintptr_t gameUpdateAddr =
+        libBase + 0x00047ee8 + 1;
+
+    uintptr_t updateStateBaseAddr =
+        libBase + 0x00046748 + 1;
+
+    uintptr_t inGameMenuAddr =
+        libBase + 0x00032090 + 1;
+
+    g_VehicleGetPosition =
+        (VehicleGetPosition_t)(
+            libBase + 0x000397da + 1
+        );
+
+    g_VehicleGetOrientation =
+        (VehicleGetOrientation_t)(
+            libBase + 0x000397ea + 1
+        );
+
+    g_b2BodySetTransform =
+        (b2BodySetTransform_t)(
+            libBase + 0x00060a0c + 1
+        );
+
+    LOGI(
+        "Multiplayer vehicle funcs: getPos=%p getOri=%p setTransform=%p stateBase=%p",
+        (void*)g_VehicleGetPosition,
+        (void*)g_VehicleGetOrientation,
+        (void*)g_b2BodySetTransform,
+        (void*)updateStateBaseAddr
+    );
+
+    MSHookFunction(
+        (void*)renderMenuAddr,
+        (void*)my_renderMenu,
+        (void**)&orig_renderMenu
+    );
+
+    MSHookFunction(
+        (void*)updateGUIAddr,
+        (void*)my_updateGUI,
+        (void**)&orig_updateGUI
+    );
+
+    MSHookFunction(
+        (void*)gameUpdateAddr,
+        (void*)my_GameUpdate,
+        (void**)&orig_GameUpdate
+    );
+
+    MSHookFunction(
+        (void*)updateStateBaseAddr,
+        (void*)my_GameUpdateStateBase,
+        (void**)&orig_GameUpdateStateBase
+    );
+
+    MSHookFunction(
+        (void*)inGameMenuAddr,
+        (void*)my_renderStartMenuMain,
+        (void**)&orig_renderStartMenuMain
+    );
+
+    void* inputQueueGetEventAddr =
+        dlsym(
+            RTLD_DEFAULT,
+            "AInputQueue_getEvent"
+        );
+
+    if (inputQueueGetEventAddr != nullptr) {
+        MSHookFunction(
+            inputQueueGetEventAddr,
+            (void*)my_AInputQueue_getEvent,
+            (void**)&orig_AInputQueue_getEvent
+        );
+    }
+}
