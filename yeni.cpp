@@ -22,7 +22,7 @@
 #include <sys/ioctl.h>
 #include <net/if.h>
 #include <cerrno>
-#include <cmath>
+#include <math.h>
 
 #include "Substrate.h"
 #include "imgui.h"
@@ -96,15 +96,6 @@ std::mutex g_ChatMutex;
 
 std::vector<std::string> g_OutgoingChats;
 std::mutex g_OutgoingChatMutex;
-
-// NETWORK PACKET STRUCTURE
-#pragma pack(push, 1)
-struct NetworkPacket {
-    uint8_t type;          
-    char senderName[32];   
-    char chatData[223];    
-};
-#pragma pack(pop)
 
 // ========================================================================
 // JNI_OnLoad
@@ -216,139 +207,336 @@ typedef void (*GameUpdateStateBase_t)(void* thiz, float param_1, uint32_t param_
 GameUpdateStateBase_t orig_GameUpdateStateBase = nullptr;
 
 // ========================================================================
-// VEHICLE NETWORK STATE TEST
+// VEHICLE / MULTIPLAYER SYNCHRONIZATION
 // ========================================================================
-// The game stores the vehicle array at Game+0xAC and the vehicle count at
-// Game+0xA4. updateStateBase() iterates this exact array and calls Vehicle::update().
-// We assign a session-local network ID to each discovered vehicle pointer.
-
-struct VehicleNetState {
-    uintptr_t vehiclePtr;
-    uint16_t networkId;
-    float lastX;
-    float lastY;
-    float lastAngle;
-    bool initialized;
+struct TestB2Vec2 {
+    float x;
+    float y;
 };
 
-static std::vector<VehicleNetState> g_VehicleStates;
-static uint16_t g_NextVehicleNetworkId = 0;
-static std::mutex g_VehicleStateMutex;
+typedef void (*VehicleGetPosition_t)(void* vehicle, float* p1, float* p2);
+typedef float (*VehicleGetOrientation_t)(void* vehicle);
+typedef void (*b2BodySetTransform_t)(void* body, const TestB2Vec2* position, float angle);
 
-static const uint32_t VEHICLE_SCAN_INTERVAL_MS = 200; // 5 Hz
+VehicleGetPosition_t g_VehicleGetPosition = nullptr;
+VehicleGetOrientation_t g_VehicleGetOrientation = nullptr;
+b2BodySetTransform_t g_b2BodySetTransform = nullptr;
+
+static const uint8_t PACKET_SESSION_WELCOME = 1;
+static const uint8_t PACKET_CHAT = 2;
+static const uint8_t PACKET_VEHICLE_POSITION = 3;
+
+static const uint8_t MAX_PLAYERS = 4;
+static const uint16_t VEHICLE_ID_INVALID = 0xFFFF;
+
+static const uint32_t VEHICLE_SYNC_INTERVAL_MS = 200;
 static const float POSITION_EPSILON = 0.02f;
-static const float ANGLE_EPSILON = 0.01f;
-static const uint32_t MAX_GAME_VEHICLES = 128;
+static const float ANGLE_EPSILON = 0.005f;
 
-static uintptr_t GetVehicleAtIndex(uintptr_t game, uint32_t index) {
+#pragma pack(push, 1)
+
+// Server -> client: assigns the client's player ID.
+struct SessionWelcomePacket {
+    uint8_t type;
+    uint8_t ownerId;
+    uint8_t maxPlayers;
+    uint8_t reserved;
+};
+
+// Existing chat packet.
+struct NetworkPacket {
+    uint8_t type;
+    char senderName[32];
+    char chatData[223];
+};
+
+// Vehicle transform packet.
+struct VehiclePositionPacket {
+    uint8_t type;
+    uint8_t ownerId;
+    uint16_t vehicleId;
+    float x;
+    float y;
+    float angle;
+    uint32_t sequence;
+};
+
+#pragma pack(pop)
+
+static_assert(sizeof(SessionWelcomePacket) == 4, "SessionWelcomePacket size mismatch");
+static_assert(sizeof(NetworkPacket) == 256, "NetworkPacket size mismatch");
+static_assert(sizeof(VehiclePositionPacket) == 20, "VehiclePositionPacket size mismatch");
+
+static std::atomic<uint8_t> g_LocalPlayerId(0xFF);
+static std::atomic<uint32_t> g_LocalVehicleSequence(0);
+
+struct RemoteVehicleState {
+    bool valid;
+    uint8_t ownerId;
+    uint16_t vehicleId;
+    float x;
+    float y;
+    float angle;
+    uint32_t sequence;
+    uint32_t appliedSequence;
+};
+
+static RemoteVehicleState g_RemoteVehicles[MAX_PLAYERS];
+static std::mutex g_RemoteVehicleMutex;
+
+static VehiclePositionPacket g_PendingVehiclePacket;
+static bool g_HasPendingVehiclePacket = false;
+static std::mutex g_VehicleSendMutex;
+
+static bool g_HasLastLocalVehicleState = false;
+static uint16_t g_LastLocalVehicleId = VEHICLE_ID_INVALID;
+static float g_LastLocalX = 0.0f;
+static float g_LastLocalY = 0.0f;
+static float g_LastLocalAngle = 0.0f;
+static std::chrono::steady_clock::time_point g_LastVehicleSync =
+    std::chrono::steady_clock::now();
+
+static uintptr_t GetVehicleFromIndex(uintptr_t game, uint16_t vehicleId) {
     if (game == 0) return 0;
-    if (index >= MAX_GAME_VEHICLES) return 0;
 
-    // Game vehicle array starts at Game+0xAC.
-    return *(uintptr_t*)(game + 0xAC + (index * 4u));
+    const uint32_t vehicleCount = *(uint32_t*)(game + 0xA4);
+    if (vehicleId >= vehicleCount || vehicleId > 512) return 0;
+
+    const uintptr_t vehicleSlotAddress =
+        game + ((uintptr_t)(vehicleId + 0x2A) * 4u) + 4u;
+
+    return *(uintptr_t*)vehicleSlotAddress;
 }
 
-static VehicleNetState* FindVehicleStateLocked(uintptr_t vehicle) {
-    for (size_t i = 0; i < g_VehicleStates.size(); ++i) {
-        if (g_VehicleStates[i].vehiclePtr == vehicle) {
-            return &g_VehicleStates[i];
-        }
-    }
-    return nullptr;
-}
+static uintptr_t GetActiveVehicleFromGame(uintptr_t game, uint16_t* outVehicleId) {
+    if (game == 0) return 0;
 
-static VehicleNetState* GetOrCreateVehicleStateLocked(uintptr_t vehicle, uint32_t gameIndex) {
-    VehicleNetState* state = FindVehicleStateLocked(vehicle);
-    if (state != nullptr) return state;
+    const uint32_t vehicleIndex = *(uint32_t*)(game + 0xA8);
+    if (vehicleIndex > 512) return 0;
 
-    VehicleNetState newState;
-    newState.vehiclePtr = vehicle;
-    newState.networkId = g_NextVehicleNetworkId++;
-    newState.lastX = 0.0f;
-    newState.lastY = 0.0f;
-    newState.lastAngle = 0.0f;
-    newState.initialized = false;
-
-    g_VehicleStates.push_back(newState);
-
-    LOGI("[VEHICLE ID] New vehicle: gameIndex=%u networkId=%u vehicle=%p",
-         gameIndex,
-         (unsigned)newState.networkId,
-         (void*)vehicle);
-
-    return &g_VehicleStates.back();
-}
-
-static void ScanVehicleStates(uintptr_t game) {
-    static std::chrono::steady_clock::time_point lastScan =
-        std::chrono::steady_clock::now();
-
-    if (game == 0 || !g_VehicleGetPosition || !g_VehicleGetOrientation) return;
-
-    const std::chrono::steady_clock::time_point now = std::chrono::steady_clock::now();
-    const uint64_t elapsedMs = (uint64_t)std::chrono::duration_cast<std::chrono::milliseconds>(
-        now - lastScan).count();
-
-    if (elapsedMs < VEHICLE_SCAN_INTERVAL_MS) return;
-    lastScan = now;
-
-    uint32_t vehicleCount = *(uint32_t*)(game + 0xA4);
-    uint32_t activeVehicleIndex = *(uint32_t*)(game + 0xA8);
-
-    if (vehicleCount > MAX_GAME_VEHICLES) {
-        LOGI("[VEHICLE SCAN] Ignoring invalid vehicleCount=%u", vehicleCount);
-        vehicleCount = MAX_GAME_VEHICLES;
+    if (outVehicleId) {
+        *outVehicleId = (uint16_t)vehicleIndex;
     }
 
-    std::lock_guard<std::mutex> lock(g_VehicleStateMutex);
+    return GetVehicleFromIndex(game, (uint16_t)vehicleIndex);
+}
 
-    for (uint32_t i = 0; i < vehicleCount; ++i) {
-        uintptr_t vehicle = GetVehicleAtIndex(game, i);
-        if (vehicle == 0) continue;
+static bool SendAllBytes(int socketFd, const void* data, size_t size) {
+    if (socketFd < 0 || data == nullptr || size == 0) return false;
 
-        VehicleNetState* state = GetOrCreateVehicleStateLocked(vehicle, i);
-        if (state == nullptr) continue;
+    const uint8_t* bytes = (const uint8_t*)data;
+    size_t totalSent = 0;
 
-        float x = 0.0f;
-        float y = 0.0f;
-        float angle = 0.0f;
-
-        g_VehicleGetPosition((void*)vehicle, &x, &y);
-        angle = g_VehicleGetOrientation((void*)vehicle);
-
-        if (!std::isfinite(x) || !std::isfinite(y) || !std::isfinite(angle)) {
-            LOGI("[VEHICLE SCAN] Invalid transform: gameIndex=%u networkId=%u vehicle=%p",
-                 i, (unsigned)state->networkId, (void*)vehicle);
+    while (totalSent < size) {
+        ssize_t sent = send(socketFd, bytes + totalSent, size - totalSent, MSG_NOSIGNAL);
+        if (sent > 0) {
+            totalSent += (size_t)sent;
             continue;
         }
 
-        bool changed = !state->initialized ||
-                       std::fabs(x - state->lastX) > POSITION_EPSILON ||
-                       std::fabs(y - state->lastY) > POSITION_EPSILON ||
-                       std::fabs(angle - state->lastAngle) > ANGLE_EPSILON;
-
-        if (changed) {
-            if (!state->initialized) {
-                LOGI("[VEHICLE STATE] INIT gameIndex=%u networkId=%u pos=(%.3f, %.3f) angle=%.3f",
-                     i, (unsigned)state->networkId, x, y, angle);
-            } else {
-                LOGI("[VEHICLE STATE] CHANGED gameIndex=%u networkId=%u pos=(%.3f, %.3f) angle=%.3f delta=(%.3f, %.3f, %.3f)%s",
-                     i,
-                     (unsigned)state->networkId,
-                     x,
-                     y,
-                     angle,
-                     x - state->lastX,
-                     y - state->lastY,
-                     angle - state->lastAngle,
-                     (i == activeVehicleIndex) ? " ACTIVE" : "");
-            }
-
-            state->lastX = x;
-            state->lastY = y;
-            state->lastAngle = angle;
-            state->initialized = true;
+        if (sent < 0 && (errno == EINTR)) {
+            continue;
         }
+
+        return false;
+    }
+
+    return true;
+}
+
+static void QueueVehiclePosition(uint16_t vehicleId, float x, float y, float angle) {
+    if (!g_IsConnected.load()) return;
+
+    const uint8_t ownerId = g_LocalPlayerId.load();
+    if (ownerId == 0xFF || ownerId >= MAX_PLAYERS) return;
+
+    VehiclePositionPacket pkt;
+    memset(&pkt, 0, sizeof(pkt));
+    pkt.type = PACKET_VEHICLE_POSITION;
+    pkt.ownerId = ownerId;
+    pkt.vehicleId = vehicleId;
+    pkt.x = x;
+    pkt.y = y;
+    pkt.angle = angle;
+    pkt.sequence = g_LocalVehicleSequence.fetch_add(1) + 1;
+
+    {
+        std::lock_guard<std::mutex> lock(g_VehicleSendMutex);
+        g_PendingVehiclePacket = pkt;
+        g_HasPendingVehiclePacket = true;
+    }
+}
+
+static void CaptureAndQueueLocalVehicleState(uintptr_t game) {
+    if (game == 0 || !g_IsConnected.load()) return;
+    if (!g_VehicleGetPosition || !g_VehicleGetOrientation) return;
+
+    const std::chrono::steady_clock::time_point now = std::chrono::steady_clock::now();
+    const uint64_t elapsedMs =
+        (uint64_t)std::chrono::duration_cast<std::chrono::milliseconds>(
+            now - g_LastVehicleSync).count();
+
+    if (elapsedMs < VEHICLE_SYNC_INTERVAL_MS) return;
+    g_LastVehicleSync = now;
+
+    uint16_t vehicleId = VEHICLE_ID_INVALID;
+    uintptr_t vehicle = GetActiveVehicleFromGame(game, &vehicleId);
+
+    if (vehicle == 0) {
+        LOGI("[VEHICLE SYNC] Local active vehicle not found.");
+        return;
+    }
+
+    float x = 0.0f;
+    float y = 0.0f;
+    float angle = 0.0f;
+
+    g_VehicleGetPosition((void*)vehicle, &x, &y);
+    angle = g_VehicleGetOrientation((void*)vehicle);
+
+    const bool vehicleChanged = (!g_HasLastLocalVehicleState ||
+                                 vehicleId != g_LastLocalVehicleId);
+
+    const bool positionChanged =
+        fabsf(x - g_LastLocalX) > POSITION_EPSILON ||
+        fabsf(y - g_LastLocalY) > POSITION_EPSILON;
+
+    const bool angleChanged =
+        fabsf(angle - g_LastLocalAngle) > ANGLE_EPSILON;
+
+    if (!vehicleChanged && !positionChanged && !angleChanged) {
+        return;
+    }
+
+    QueueVehiclePosition(vehicleId, x, y, angle);
+
+    g_HasLastLocalVehicleState = true;
+    g_LastLocalVehicleId = vehicleId;
+    g_LastLocalX = x;
+    g_LastLocalY = y;
+    g_LastLocalAngle = angle;
+
+    LOGI("[VEHICLE SEND QUEUED] owner=%u vehicle=%u pos=(%.3f, %.3f) angle=%.3f",
+         (unsigned)g_LocalPlayerId.load(),
+         (unsigned)vehicleId,
+         x, y, angle);
+}
+
+static void ApplyRemoteVehicleStates(uintptr_t game) {
+    if (game == 0 || !g_b2BodySetTransform) return;
+    if (!g_IsConnected.load()) return;
+
+    RemoteVehicleState snapshot[MAX_PLAYERS];
+    memset(snapshot, 0, sizeof(snapshot));
+
+    {
+        std::lock_guard<std::mutex> lock(g_RemoteVehicleMutex);
+        memcpy(snapshot, g_RemoteVehicles, sizeof(snapshot));
+    }
+
+    const uint32_t vehicleCount = *(uint32_t*)(game + 0xA4);
+
+    for (uint8_t ownerId = 0; ownerId < MAX_PLAYERS; ++ownerId) {
+        RemoteVehicleState& state = snapshot[ownerId];
+
+        if (!state.valid) continue;
+        if (state.ownerId == g_LocalPlayerId.load()) continue;
+        if (state.vehicleId >= vehicleCount) continue;
+        if (state.sequence == state.appliedSequence) continue;
+
+        uintptr_t vehicle = GetVehicleFromIndex(game, state.vehicleId);
+        if (vehicle == 0) continue;
+
+        uintptr_t body = *(uintptr_t*)(vehicle + 0x528);
+        if (body == 0) continue;
+
+        TestB2Vec2 position;
+        position.x = state.x;
+        position.y = state.y;
+
+        g_b2BodySetTransform((void*)body, &position, state.angle);
+
+        LOGI("[VEHICLE RECEIVE APPLY] owner=%u vehicle=%u seq=%u pos=(%.3f, %.3f) angle=%.3f",
+             (unsigned)state.ownerId,
+             (unsigned)state.vehicleId,
+             (unsigned)state.sequence,
+             state.x,
+             state.y,
+             state.angle);
+
+        std::lock_guard<std::mutex> lock(g_RemoteVehicleMutex);
+
+        if (g_RemoteVehicles[ownerId].valid &&
+            g_RemoteVehicles[ownerId].sequence == state.sequence) {
+            g_RemoteVehicles[ownerId].appliedSequence = state.sequence;
+        }
+    }
+}
+
+static void HandleSessionWelcome(const SessionWelcomePacket& pkt) {
+    if (pkt.ownerId >= MAX_PLAYERS) {
+        LOGI("[NETWORK] Invalid assigned player ID: %u", (unsigned)pkt.ownerId);
+        return;
+    }
+
+    g_LocalPlayerId.store(pkt.ownerId);
+
+    LOGI("[NETWORK] Assigned local player ID=%u maxPlayers=%u",
+         (unsigned)pkt.ownerId,
+         (unsigned)pkt.maxPlayers);
+
+    ShowNativeToast("Joined multiplayer as Player " +
+                    std::to_string((int)pkt.ownerId + 1));
+}
+
+static void HandleVehiclePositionPacket(const VehiclePositionPacket& pkt) {
+    if (pkt.ownerId >= MAX_PLAYERS) return;
+    if (pkt.ownerId == g_LocalPlayerId.load()) return;
+
+    std::lock_guard<std::mutex> lock(g_RemoteVehicleMutex);
+
+    RemoteVehicleState& state = g_RemoteVehicles[pkt.ownerId];
+
+    // Ignore stale or duplicate packets.
+    if (state.valid && pkt.sequence <= state.sequence) return;
+
+    state.valid = true;
+    state.ownerId = pkt.ownerId;
+    state.vehicleId = pkt.vehicleId;
+    state.x = pkt.x;
+    state.y = pkt.y;
+    state.angle = pkt.angle;
+    state.sequence = pkt.sequence;
+
+    LOGI("[VEHICLE RECEIVED] owner=%u vehicle=%u seq=%u pos=(%.3f, %.3f) angle=%.3f",
+         (unsigned)pkt.ownerId,
+         (unsigned)pkt.vehicleId,
+         (unsigned)pkt.sequence,
+         pkt.x,
+         pkt.y,
+         pkt.angle);
+}
+
+static void ResetVehicleSyncState() {
+    g_LocalPlayerId.store(0xFF);
+    g_LocalVehicleSequence.store(0);
+
+    g_HasLastLocalVehicleState = false;
+    g_LastLocalVehicleId = VEHICLE_ID_INVALID;
+    g_LastLocalX = 0.0f;
+    g_LastLocalY = 0.0f;
+    g_LastLocalAngle = 0.0f;
+    g_LastVehicleSync = std::chrono::steady_clock::now();
+
+    {
+        std::lock_guard<std::mutex> lock(g_RemoteVehicleMutex);
+        memset(g_RemoteVehicles, 0, sizeof(g_RemoteVehicles));
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(g_VehicleSendMutex);
+        memset(&g_PendingVehiclePacket, 0, sizeof(g_PendingVehiclePacket));
+        g_HasPendingVehiclePacket = false;
     }
 }
 
@@ -540,39 +728,91 @@ GLuint LoadTextureFromPNGArray(const unsigned char* png_data, int data_len) {
 // ========================================================================
 void NetworkLoop() {
     fcntl(g_TcpSocket, F_SETFL, O_NONBLOCK);
-    NetworkPacket pkt;
-    while (g_IsConnected) {
-        int bytesRead = recv(g_TcpSocket, &pkt, sizeof(pkt), 0);
-        
-        if (bytesRead > 0) {
-            if (pkt.type == 2) { 
-                std::string senderStr(pkt.senderName);
-                std::string msgStr(pkt.chatData);
-                std::string formattedMsg = senderStr + ": " + msgStr;
-                
-                {
-                    std::lock_guard<std::mutex> lock(g_ChatMutex);
-                    g_ChatMessages.push_back(formattedMsg);
-                }
-                
-                ShowNativeToast(formattedMsg);
-            } 
-        } 
-        else if (bytesRead == 0) {
-            ShowNativeToast("Connection Lost (Other player left)!");
-            g_IsConnected = false;
-            break; 
-        }
-        else if (bytesRead < 0) {
-            if (errno != EWOULDBLOCK && errno != EAGAIN) {
+
+    uint8_t recvBuffer[4096];
+    size_t bufferedBytes = 0;
+
+    while (g_IsConnected.load()) {
+        if (g_TcpSocket < 0) break;
+
+        if (bufferedBytes < sizeof(recvBuffer)) {
+            ssize_t bytesRead = recv(
+                g_TcpSocket,
+                recvBuffer + bufferedBytes,
+                sizeof(recvBuffer) - bufferedBytes,
+                0
+            );
+
+            if (bytesRead > 0) {
+                bufferedBytes += (size_t)bytesRead;
+            } else if (bytesRead == 0) {
+                ShowNativeToast("Connection Lost (Other player left)!");
+                g_IsConnected.store(false);
+                break;
+            } else if (errno != EWOULDBLOCK && errno != EAGAIN && errno != EINTR) {
                 ShowNativeToast("Error: Network Connection Lost!");
-                g_IsConnected = false;
+                g_IsConnected.store(false);
                 break;
             }
         }
 
+        // Parse the TCP byte stream into complete packets.
+        while (bufferedBytes > 0) {
+            const uint8_t packetType = recvBuffer[0];
+            size_t packetSize = 0;
+
+            if (packetType == PACKET_SESSION_WELCOME) {
+                packetSize = sizeof(SessionWelcomePacket);
+            } else if (packetType == PACKET_CHAT) {
+                packetSize = sizeof(NetworkPacket);
+            } else if (packetType == PACKET_VEHICLE_POSITION) {
+                packetSize = sizeof(VehiclePositionPacket);
+            } else {
+                LOGI("[NETWORK] Unknown packet type=%u", (unsigned)packetType);
+                g_IsConnected.store(false);
+                break;
+            }
+
+            if (bufferedBytes < packetSize) break;
+
+            if (packetType == PACKET_SESSION_WELCOME) {
+                SessionWelcomePacket pkt;
+                memcpy(&pkt, recvBuffer, sizeof(pkt));
+                HandleSessionWelcome(pkt);
+            } else if (packetType == PACKET_CHAT) {
+                NetworkPacket pkt;
+                memcpy(&pkt, recvBuffer, sizeof(pkt));
+
+                pkt.senderName[sizeof(pkt.senderName) - 1] = '\0';
+                pkt.chatData[sizeof(pkt.chatData) - 1] = '\0';
+
+                std::string senderStr(pkt.senderName);
+                std::string msgStr(pkt.chatData);
+                std::string formattedMsg = senderStr + ": " + msgStr;
+
+                {
+                    std::lock_guard<std::mutex> lock(g_ChatMutex);
+                    g_ChatMessages.push_back(formattedMsg);
+                }
+
+                ShowNativeToast(formattedMsg);
+            } else if (packetType == PACKET_VEHICLE_POSITION) {
+                VehiclePositionPacket pkt;
+                memcpy(&pkt, recvBuffer, sizeof(pkt));
+                HandleVehiclePositionPacket(pkt);
+            }
+
+            bufferedBytes -= packetSize;
+
+            if (bufferedBytes > 0) {
+                memmove(recvBuffer, recvBuffer + packetSize, bufferedBytes);
+            }
+        }
+
+        // Send queued chat packet.
         std::string outMsg;
         bool hasOutMsg = false;
+
         {
             std::lock_guard<std::mutex> lock(g_OutgoingChatMutex);
             if (!g_OutgoingChats.empty()) {
@@ -582,21 +822,54 @@ void NetworkLoop() {
             }
         }
 
-        if (hasOutMsg) {
+        if (hasOutMsg && g_IsConnected.load()) {
             NetworkPacket outPkt;
-            outPkt.type = 2; 
-            strncpy(outPkt.senderName, g_Nickname, 31);
-            outPkt.senderName[31] = '\0';
-            
-            strncpy(outPkt.chatData, outMsg.c_str(), 222);
-            outPkt.chatData[222] = '\0';
-            
-            send(g_TcpSocket, &outPkt, sizeof(outPkt), 0);
+            memset(&outPkt, 0, sizeof(outPkt));
+            outPkt.type = PACKET_CHAT;
+
+            strncpy(outPkt.senderName, g_Nickname, sizeof(outPkt.senderName) - 1);
+            strncpy(outPkt.chatData, outMsg.c_str(), sizeof(outPkt.chatData) - 1);
+
+            if (!SendAllBytes(g_TcpSocket, &outPkt, sizeof(outPkt))) {
+                ShowNativeToast("Error: Failed to send chat.");
+                g_IsConnected.store(false);
+                break;
+            }
         }
 
-        std::this_thread::sleep_for(std::chrono::milliseconds(16)); 
+        // Send only the newest vehicle state. Older states are not useful.
+        VehiclePositionPacket vehiclePkt;
+        bool hasVehiclePkt = false;
+
+        {
+            std::lock_guard<std::mutex> lock(g_VehicleSendMutex);
+            if (g_HasPendingVehiclePacket) {
+                vehiclePkt = g_PendingVehiclePacket;
+                g_HasPendingVehiclePacket = false;
+                hasVehiclePkt = true;
+            }
+        }
+
+        if (hasVehiclePkt && g_IsConnected.load()) {
+            if (!SendAllBytes(g_TcpSocket, &vehiclePkt, sizeof(vehiclePkt))) {
+                ShowNativeToast("Error: Failed to send vehicle data.");
+                g_IsConnected.store(false);
+                break;
+            }
+
+            LOGI("[VEHICLE SENT] owner=%u vehicle=%u seq=%u pos=(%.3f, %.3f) angle=%.3f",
+                 (unsigned)vehiclePkt.ownerId,
+                 (unsigned)vehiclePkt.vehicleId,
+                 (unsigned)vehiclePkt.sequence,
+                 vehiclePkt.x,
+                 vehiclePkt.y,
+                 vehiclePkt.angle);
+        }
+
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
     }
 }
+
 
 void StartPONGResponderThread() {
     int sockfd = socket(AF_INET, SOCK_DGRAM, 0);
@@ -682,6 +955,9 @@ void StartLANDiscoveryThread() {
 }
 
 void TCPHostThread() {
+    ResetVehicleSyncState();
+    g_LocalPlayerId.store(0);
+
     if (!IsNetworkAvailable()) {
         ShowNativeToast("Error: Check your network connection!");
         g_ConnectedStatus = "Connection Error (No Network)";
@@ -706,10 +982,21 @@ void TCPHostThread() {
     g_TcpSocket = accept(g_TcpServerFd, (struct sockaddr*)&address, (socklen_t*)&addrlen);
     
     if (g_TcpSocket >= 0 && g_IsHost) {
-        g_IsConnected = true;
-        g_ConnectedStatus = "Client Connected!";
-        ShowNativeToast("Client Joined the Room!"); 
-        NetworkLoop(); 
+        SessionWelcomePacket welcome;
+        memset(&welcome, 0, sizeof(welcome));
+        welcome.type = PACKET_SESSION_WELCOME;
+        welcome.ownerId = 1;
+        welcome.maxPlayers = MAX_PLAYERS;
+
+        if (!SendAllBytes(g_TcpSocket, &welcome, sizeof(welcome))) {
+            ShowNativeToast("Error: Failed to initialize multiplayer session.");
+            g_ConnectedStatus = "Connection Error";
+        } else {
+            g_IsConnected = true;
+            g_ConnectedStatus = "Client Connected!";
+            ShowNativeToast("Client Joined the Room!");
+            NetworkLoop();
+        }
     }
     
     if (g_TcpSocket >= 0) { shutdown(g_TcpSocket, SHUT_RDWR); close(g_TcpSocket); g_TcpSocket = -1; }
@@ -717,10 +1004,14 @@ void TCPHostThread() {
     
     g_IsConnected = false;
     g_IsHost = false;
+    ResetVehicleSyncState();
     if (g_ConnectedStatus != "Room Closed.") g_ConnectedStatus = "Connection Lost.";
 }
 
 void TCPClientThread(std::string hostIP) {
+    ResetVehicleSyncState();
+    g_LocalPlayerId.store(0xFF);
+
     g_TcpSocket = socket(AF_INET, SOCK_STREAM, 0);
     struct sockaddr_in serv_addr;
     memset(&serv_addr, 0, sizeof(serv_addr));
@@ -754,6 +1045,7 @@ void TCPClientThread(std::string hostIP) {
     if (g_TcpSocket >= 0) { shutdown(g_TcpSocket, SHUT_RDWR); close(g_TcpSocket); g_TcpSocket = -1; }
     g_IsConnected = false;
     g_IsClient = false;
+    ResetVehicleSyncState();
 }
 
 // ========================================================================
@@ -1158,12 +1450,14 @@ void my_GameUpdate(void* thiz, float param_1) {
 }
 
 void my_GameUpdateStateBase(void* thiz, float param_1, uint32_t param_2, uint32_t param_3, uint32_t param_4) {
+    g_EngineInstance = (uintptr_t)thiz;
+
     if (orig_GameUpdateStateBase) {
         orig_GameUpdateStateBase(thiz, param_1, param_2, param_3, param_4);
     }
 
-    g_EngineInstance = (uintptr_t)thiz;
-    ScanVehicleStates(g_EngineInstance);
+    ApplyRemoteVehicleStates(g_EngineInstance);
+    CaptureAndQueueLocalVehicleState(g_EngineInstance);
 }
 
 void* my_updateGUI(void* thiz, void* p1, void* p2, void* p3, void* p4) {
@@ -1203,6 +1497,7 @@ __attribute__((constructor))
 void ModMain() {
     LOGI(">>> MULTIPLAYER MOD STARTING <<<");
 
+    ResetVehicleSyncState();
     std::thread(StartPONGResponderThread).detach();
 
     uintptr_t libBase = GetLibraryBase("libapp.so");
@@ -1216,10 +1511,12 @@ void ModMain() {
 
     g_VehicleGetPosition = (VehicleGetPosition_t)(libBase + 0x000397da + 1);
     g_VehicleGetOrientation = (VehicleGetOrientation_t)(libBase + 0x000397ea + 1);
+    g_b2BodySetTransform = (b2BodySetTransform_t)(libBase + 0x00060a0c + 1);
 
-    LOGI("Vehicle state funcs: getPos=%p getOri=%p stateBase=%p",
+    LOGI("Multiplayer vehicle funcs: getPos=%p getOri=%p setTransform=%p stateBase=%p",
          (void*)g_VehicleGetPosition,
          (void*)g_VehicleGetOrientation,
+         (void*)g_b2BodySetTransform,
          (void*)updateStateBaseAddr);
     
     MSHookFunction((void*)renderMenuAddr, (void*)my_renderMenu, (void**)&orig_renderMenu);
