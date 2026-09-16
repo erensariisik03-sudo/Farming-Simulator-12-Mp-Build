@@ -1,3 +1,11 @@
+// REVERTED STABLE VERSION
+// Kept only:
+// 1) Vehicle ownership system
+// 2) VEHICLE_SYNC_INTERVAL_US = 16667 (60 Hz)
+//
+// GameUpdate / GameUpdateStateBase sync placement remains as in the
+// previously working version.
+
 #include <jni.h>
 #include <android/log.h>
 #include <android/input.h>
@@ -257,8 +265,8 @@ static const uint8_t PACKET_VEHICLE_POSITION = 3;
 static const uint8_t MAX_PLAYERS = 4;
 static const uint16_t VEHICLE_ID_INVALID = 0xFFFF;
 
-// KEPT: 50 ms sync interval
-static const uint32_t VEHICLE_SYNC_INTERVAL_MS = 50;
+// CHANGED: 16.667 ms (60 Hz) sync interval
+static const uint32_t VEHICLE_SYNC_INTERVAL_US = 16667;
 
 static const float POSITION_EPSILON = 0.02f;
 static const float ANGLE_EPSILON = 0.005f;
@@ -474,12 +482,15 @@ static void CaptureAndQueueLocalVehicleState(uintptr_t game) {
 
     const auto now = std::chrono::steady_clock::now();
 
-    const uint64_t elapsedMs =
-        (uint64_t)std::chrono::duration_cast<std::chrono::milliseconds>(
+    // CHANGED: Elapsed time calculated in microseconds
+    const uint64_t elapsedUs =
+        (uint64_t)std::chrono::duration_cast<
+            std::chrono::microseconds
+        >(
             now - g_LastVehicleSync
         ).count();
 
-    if (elapsedMs < VEHICLE_SYNC_INTERVAL_MS) {
+    if (elapsedUs < VEHICLE_SYNC_INTERVAL_US) {
         return;
     }
 
