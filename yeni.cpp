@@ -485,8 +485,10 @@ static void HandleSessionWelcome(const SessionWelcomePacket& pkt) {
          (unsigned)pkt.ownerId,
          (unsigned)pkt.maxPlayers);
 
-    ShowNativeToast("Joined multiplayer as Player " +
-                    std::to_string((int)pkt.ownerId + 1));
+    char playerMsg[64];
+    snprintf(playerMsg, sizeof(playerMsg), "Joined multiplayer as Player %u",
+             (unsigned)(pkt.ownerId + 1));
+    ShowNativeToast(playerMsg);
 }
 
 static void HandleVehiclePositionPacket(const VehiclePositionPacket& pkt) {
