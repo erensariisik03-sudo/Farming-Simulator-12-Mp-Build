@@ -22,6 +22,7 @@
 #include <sys/ioctl.h>
 #include <net/if.h>
 #include <cerrno>
+#include <cmath>
 
 #include "Substrate.h"
 #include "imgui.h"
@@ -215,90 +216,140 @@ typedef void (*GameUpdateStateBase_t)(void* thiz, float param_1, uint32_t param_
 GameUpdateStateBase_t orig_GameUpdateStateBase = nullptr;
 
 // ========================================================================
-// BOX2D / VEHICLE TRANSFORM TEST
+// VEHICLE NETWORK STATE TEST
 // ========================================================================
-struct TestB2Vec2 {
-    float x;
-    float y;
+// The game stores the vehicle array at Game+0xAC and the vehicle count at
+// Game+0xA4. updateStateBase() iterates this exact array and calls Vehicle::update().
+// We assign a session-local network ID to each discovered vehicle pointer.
+
+struct VehicleNetState {
+    uintptr_t vehiclePtr;
+    uint16_t networkId;
+    float lastX;
+    float lastY;
+    float lastAngle;
+    bool initialized;
 };
 
-typedef void (*VehicleGetPosition_t)(void* vehicle, float* p1, float* p2);
-typedef float (*VehicleGetOrientation_t)(void* vehicle);
-typedef void (*b2BodySetTransform_t)(void* body, const TestB2Vec2* position, float angle);
+static std::vector<VehicleNetState> g_VehicleStates;
+static uint16_t g_NextVehicleNetworkId = 0;
+static std::mutex g_VehicleStateMutex;
 
-VehicleGetPosition_t g_VehicleGetPosition = nullptr;
-VehicleGetOrientation_t g_VehicleGetOrientation = nullptr;
-b2BodySetTransform_t g_b2BodySetTransform = nullptr;
+static const uint32_t VEHICLE_SCAN_INTERVAL_MS = 200; // 5 Hz
+static const float POSITION_EPSILON = 0.02f;
+static const float ANGLE_EPSILON = 0.01f;
+static const uint32_t MAX_GAME_VEHICLES = 128;
 
-static bool g_TransformTestEnabled = true;
-static std::chrono::steady_clock::time_point g_LastTransformTest =
-    std::chrono::steady_clock::now();
-
-static const uint32_t TRANSFORM_TEST_INTERVAL_MS = 3000;
-static const float TRANSFORM_TEST_STEP = 3.0f;
-
-static uintptr_t GetTestVehicleFromGame(uintptr_t game) {
+static uintptr_t GetVehicleAtIndex(uintptr_t game, uint32_t index) {
     if (game == 0) return 0;
+    if (index >= MAX_GAME_VEHICLES) return 0;
 
-    uint32_t vehicleIndex = *(uint32_t*)(game + 0xA8);
-
-    if (vehicleIndex > 512) return 0;
-
-    uintptr_t vehicleSlotAddress =
-        game + ((uintptr_t)(vehicleIndex + 0x2A) * 4u) + 4u;
-
-    return *(uintptr_t*)vehicleSlotAddress;
+    // Game vehicle array starts at Game+0xAC.
+    return *(uintptr_t*)(game + 0xAC + (index * 4u));
 }
 
-static void RunVehicleTransformTest(uintptr_t game) {
-    if (!g_TransformTestEnabled || game == 0) return;
-    if (!g_VehicleGetPosition || !g_VehicleGetOrientation || !g_b2BodySetTransform) return;
+static VehicleNetState* FindVehicleStateLocked(uintptr_t vehicle) {
+    for (size_t i = 0; i < g_VehicleStates.size(); ++i) {
+        if (g_VehicleStates[i].vehiclePtr == vehicle) {
+            return &g_VehicleStates[i];
+        }
+    }
+    return nullptr;
+}
+
+static VehicleNetState* GetOrCreateVehicleStateLocked(uintptr_t vehicle, uint32_t gameIndex) {
+    VehicleNetState* state = FindVehicleStateLocked(vehicle);
+    if (state != nullptr) return state;
+
+    VehicleNetState newState;
+    newState.vehiclePtr = vehicle;
+    newState.networkId = g_NextVehicleNetworkId++;
+    newState.lastX = 0.0f;
+    newState.lastY = 0.0f;
+    newState.lastAngle = 0.0f;
+    newState.initialized = false;
+
+    g_VehicleStates.push_back(newState);
+
+    LOGI("[VEHICLE ID] New vehicle: gameIndex=%u networkId=%u vehicle=%p",
+         gameIndex,
+         (unsigned)newState.networkId,
+         (void*)vehicle);
+
+    return &g_VehicleStates.back();
+}
+
+static void ScanVehicleStates(uintptr_t game) {
+    static std::chrono::steady_clock::time_point lastScan =
+        std::chrono::steady_clock::now();
+
+    if (game == 0 || !g_VehicleGetPosition || !g_VehicleGetOrientation) return;
 
     const std::chrono::steady_clock::time_point now = std::chrono::steady_clock::now();
     const uint64_t elapsedMs = (uint64_t)std::chrono::duration_cast<std::chrono::milliseconds>(
-        now - g_LastTransformTest).count();
+        now - lastScan).count();
 
-    if (elapsedMs < TRANSFORM_TEST_INTERVAL_MS) return;
-    g_LastTransformTest = now;
+    if (elapsedMs < VEHICLE_SCAN_INTERVAL_MS) return;
+    lastScan = now;
 
-    const uint32_t vehicleIndex = *(uint32_t*)(game + 0xA8);
-    uintptr_t vehicle = GetTestVehicleFromGame(game);
+    uint32_t vehicleCount = *(uint32_t*)(game + 0xA4);
+    uint32_t activeVehicleIndex = *(uint32_t*)(game + 0xA8);
 
-    if (vehicle == 0) {
-        LOGI("[TRANSFORM TEST] Active vehicle not found. game=%p activeIndex=%u vehicleCount=%u",
-             (void*)game, vehicleIndex, *(uint32_t*)(game + 0xA4));
-        return;
+    if (vehicleCount > MAX_GAME_VEHICLES) {
+        LOGI("[VEHICLE SCAN] Ignoring invalid vehicleCount=%u", vehicleCount);
+        vehicleCount = MAX_GAME_VEHICLES;
     }
 
-    float p1 = 0.0f;
-    float p2 = 0.0f;
-    float angle = 0.0f;
+    std::lock_guard<std::mutex> lock(g_VehicleStateMutex);
 
-    g_VehicleGetPosition((void*)vehicle, &p1, &p2);
-    angle = g_VehicleGetOrientation((void*)vehicle);
+    for (uint32_t i = 0; i < vehicleCount; ++i) {
+        uintptr_t vehicle = GetVehicleAtIndex(game, i);
+        if (vehicle == 0) continue;
 
-    uintptr_t body = *(uintptr_t*)(vehicle + 0x528);
-    if (body == 0) {
-        LOGI("[TRANSFORM TEST] Vehicle+0x528 b2Body null. vehicle=%p activeIndex=%u",
-             (void*)vehicle, vehicleIndex);
-        return;
+        VehicleNetState* state = GetOrCreateVehicleStateLocked(vehicle, i);
+        if (state == nullptr) continue;
+
+        float x = 0.0f;
+        float y = 0.0f;
+        float angle = 0.0f;
+
+        g_VehicleGetPosition((void*)vehicle, &x, &y);
+        angle = g_VehicleGetOrientation((void*)vehicle);
+
+        if (!std::isfinite(x) || !std::isfinite(y) || !std::isfinite(angle)) {
+            LOGI("[VEHICLE SCAN] Invalid transform: gameIndex=%u networkId=%u vehicle=%p",
+                 i, (unsigned)state->networkId, (void*)vehicle);
+            continue;
+        }
+
+        bool changed = !state->initialized ||
+                       std::fabs(x - state->lastX) > POSITION_EPSILON ||
+                       std::fabs(y - state->lastY) > POSITION_EPSILON ||
+                       std::fabs(angle - state->lastAngle) > ANGLE_EPSILON;
+
+        if (changed) {
+            if (!state->initialized) {
+                LOGI("[VEHICLE STATE] INIT gameIndex=%u networkId=%u pos=(%.3f, %.3f) angle=%.3f",
+                     i, (unsigned)state->networkId, x, y, angle);
+            } else {
+                LOGI("[VEHICLE STATE] CHANGED gameIndex=%u networkId=%u pos=(%.3f, %.3f) angle=%.3f delta=(%.3f, %.3f, %.3f)%s",
+                     i,
+                     (unsigned)state->networkId,
+                     x,
+                     y,
+                     angle,
+                     x - state->lastX,
+                     y - state->lastY,
+                     angle - state->lastAngle,
+                     (i == activeVehicleIndex) ? " ACTIVE" : "");
+            }
+
+            state->lastX = x;
+            state->lastY = y;
+            state->lastAngle = angle;
+            state->initialized = true;
+        }
     }
-
-    TestB2Vec2 newPos;
-    newPos.x = p1 + TRANSFORM_TEST_STEP;
-    newPos.y = p2;
-
-    LOGI("[TRANSFORM TEST] BEFORE index=%u vehicle=%p body=%p pos=(%.3f, %.3f) angle=%.3f",
-         vehicleIndex, (void*)vehicle, (void*)body, p1, p2, angle);
-
-    g_b2BodySetTransform((void*)body, &newPos, angle);
-
-    float readbackP1 = 0.0f;
-    float readbackP2 = 0.0f;
-    g_VehicleGetPosition((void*)vehicle, &readbackP1, &readbackP2);
-
-    LOGI("[TRANSFORM TEST] AFTER index=%u requested=(%.3f, %.3f) readback=(%.3f, %.3f)",
-         vehicleIndex, newPos.x, newPos.y, readbackP1, readbackP2);
 }
 
 // ========================================================================
@@ -1112,7 +1163,7 @@ void my_GameUpdateStateBase(void* thiz, float param_1, uint32_t param_2, uint32_
     }
 
     g_EngineInstance = (uintptr_t)thiz;
-    RunVehicleTransformTest(g_EngineInstance);
+    ScanVehicleStates(g_EngineInstance);
 }
 
 void* my_updateGUI(void* thiz, void* p1, void* p2, void* p3, void* p4) {
@@ -1165,12 +1216,10 @@ void ModMain() {
 
     g_VehicleGetPosition = (VehicleGetPosition_t)(libBase + 0x000397da + 1);
     g_VehicleGetOrientation = (VehicleGetOrientation_t)(libBase + 0x000397ea + 1);
-    g_b2BodySetTransform = (b2BodySetTransform_t)(libBase + 0x00060a0c + 1);
 
-    LOGI("Transform test funcs: getPos=%p getOri=%p setTransform=%p stateBase=%p",
+    LOGI("Vehicle state funcs: getPos=%p getOri=%p stateBase=%p",
          (void*)g_VehicleGetPosition,
          (void*)g_VehicleGetOrientation,
-         (void*)g_b2BodySetTransform,
          (void*)updateStateBaseAddr);
     
     MSHookFunction((void*)renderMenuAddr, (void*)my_renderMenu, (void**)&orig_renderMenu);
