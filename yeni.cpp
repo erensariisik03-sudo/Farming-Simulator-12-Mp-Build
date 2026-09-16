@@ -212,7 +212,7 @@ typedef void (*GameUpdate_t)(void* thiz, float param_1);
 GameUpdate_t orig_GameUpdate = nullptr;
 
 // ========================================================================
-// PHYSICS ORDER / TRANSFORM OVERWRITE TEST
+// BOX2D / VEHICLE TRANSFORM TEST
 // ========================================================================
 struct TestB2Vec2 {
     float x;
@@ -227,20 +227,18 @@ VehicleGetPosition_t g_VehicleGetPosition = nullptr;
 VehicleGetOrientation_t g_VehicleGetOrientation = nullptr;
 b2BodySetTransform_t g_b2BodySetTransform = nullptr;
 
-// This is deliberately a pre/post GameUpdate test.
-// It does NOT hook Vehicle::update directly, so it uses only addresses already
-// verified by the previous transform experiment.
-static bool g_PhysicsOrderTestEnabled = true;
-static std::chrono::steady_clock::time_point g_LastPhysicsOrderTest =
+static bool g_TransformTestEnabled = true;
+static std::chrono::steady_clock::time_point g_LastTransformTest =
     std::chrono::steady_clock::now();
 
-static const uint32_t PHYSICS_TEST_INTERVAL_MS = 2000;
-static const float PHYSICS_TEST_STEP = 3.0f;
+static const uint32_t TRANSFORM_TEST_INTERVAL_MS = 3000;
+static const float TRANSFORM_TEST_STEP = 1.0f;
 
 static uintptr_t GetTestVehicleFromGame(uintptr_t game) {
     if (game == 0) return 0;
 
     uint32_t vehicleIndex = *(uint32_t*)(game + 0xA8);
+
     if (vehicleIndex > 512) return 0;
 
     uintptr_t vehicleSlotAddress =
@@ -249,81 +247,44 @@ static uintptr_t GetTestVehicleFromGame(uintptr_t game) {
     return *(uintptr_t*)vehicleSlotAddress;
 }
 
-static bool ReadVehiclePosition(uintptr_t vehicle, float& x, float& y) {
-    if (vehicle == 0 || !g_VehicleGetPosition) return false;
-    g_VehicleGetPosition((void*)vehicle, &x, &y);
-    return true;
-}
-
-static void RunPhysicsOrderTestBefore(uintptr_t game, uintptr_t& testedVehicle) {
-    testedVehicle = 0;
-
-    if (!g_PhysicsOrderTestEnabled || game == 0) return;
+static void RunVehicleTransformTest(uintptr_t game) {
+    if (!g_TransformTestEnabled || game == 0) return;
     if (!g_VehicleGetPosition || !g_VehicleGetOrientation || !g_b2BodySetTransform) return;
 
-    auto now = std::chrono::steady_clock::now();
-    uint64_t elapsedMs = (uint64_t)std::chrono::duration_cast<std::chrono::milliseconds>(
-        now - g_LastPhysicsOrderTest).count();
+    const std::chrono::steady_clock::time_point now = std::chrono::steady_clock::now();
+    const uint64_t elapsedMs = (uint64_t)std::chrono::duration_cast<std::chrono::milliseconds>(
+        now - g_LastTransformTest).count();
 
-    if (elapsedMs < PHYSICS_TEST_INTERVAL_MS) return;
-    g_LastPhysicsOrderTest = now;
+    if (elapsedMs < TRANSFORM_TEST_INTERVAL_MS) return;
+    g_LastTransformTest = now;
 
     uintptr_t vehicle = GetTestVehicleFromGame(game);
     if (vehicle == 0) {
-        LOGI("[PHYSICS TEST] active vehicle not found");
+        LOGI("[TRANSFORM TEST] Active vehicle not found.");
         return;
     }
+
+    float p1 = 0.0f;
+    float p2 = 0.0f;
+    float angle = 0.0f;
+
+    g_VehicleGetPosition((void*)vehicle, &p1, &p2);
+    angle = g_VehicleGetOrientation((void*)vehicle);
 
     uintptr_t body = *(uintptr_t*)(vehicle + 0x528);
     if (body == 0) {
-        LOGI("[PHYSICS TEST] body null vehicle=%p", (void*)vehicle);
+        LOGI("[TRANSFORM TEST] Vehicle+0x528 b2Body null. vehicle=%p", (void*)vehicle);
         return;
     }
 
-    float beforeX = 0.0f;
-    float beforeY = 0.0f;
-    float angle = 0.0f;
+    TestB2Vec2 newPos;
+    newPos.x = p1 + TRANSFORM_TEST_STEP;
+    newPos.y = p2;
 
-    if (!ReadVehiclePosition(vehicle, beforeX, beforeY)) return;
-    angle = g_VehicleGetOrientation((void*)vehicle);
+    g_b2BodySetTransform((void*)body, &newPos, angle);
 
-    TestB2Vec2 requested;
-    requested.x = beforeX + PHYSICS_TEST_STEP;
-    requested.y = beforeY;
-
-    g_b2BodySetTransform((void*)body, &requested, angle);
-
-    float immediateX = 0.0f;
-    float immediateY = 0.0f;
-    ReadVehiclePosition(vehicle, immediateX, immediateY);
-
-    LOGI("[PHYSICS TEST][PRE] vehicle=%p body=%p before=(%.3f,%.3f) "
-         "requested=(%.3f,%.3f) immediate=(%.3f,%.3f) angle=%.3f",
-         (void*)vehicle, (void*)body,
-         beforeX, beforeY, requested.x, requested.y,
-         immediateX, immediateY, angle);
-
-    testedVehicle = vehicle;
-}
-
-static void RunPhysicsOrderTestAfter(uintptr_t game, uintptr_t testedVehicle) {
-    if (!g_PhysicsOrderTestEnabled || game == 0 || testedVehicle == 0) return;
-    if (!g_VehicleGetPosition) return;
-
-    // Confirm that this object still belongs to the current active slot.
-    uintptr_t currentVehicle = GetTestVehicleFromGame(game);
-    if (currentVehicle != testedVehicle) {
-        LOGI("[PHYSICS TEST][POST] vehicle changed old=%p current=%p",
-             (void*)testedVehicle, (void*)currentVehicle);
-        return;
-    }
-
-    float afterX = 0.0f;
-    float afterY = 0.0f;
-    if (!ReadVehiclePosition(testedVehicle, afterX, afterY)) return;
-
-    LOGI("[PHYSICS TEST][POST] vehicle=%p after_game_update=(%.3f,%.3f)",
-         (void*)testedVehicle, afterX, afterY);
+    LOGI("[TRANSFORM TEST] vehicle=%p body=%p pos=(%.3f, %.3f) -> (%.3f, %.3f) angle=%.3f",
+         (void*)vehicle, (void*)body, p1, p2, newPos.x, newPos.y, angle);
 }
 
 // ========================================================================
@@ -1126,20 +1087,11 @@ void DrawImGui() {
 // RENDER HOOKS
 // ========================================================================
 void my_GameUpdate(void* thiz, float param_1) {
-    g_EngineInstance = (uintptr_t)thiz;
-    g_CurrentMenu = MENU_INGAME;
+    g_EngineInstance = (uintptr_t)thiz; 
+    g_CurrentMenu = MENU_INGAME; 
+    if (orig_GameUpdate) orig_GameUpdate(thiz, param_1);
 
-    // IMPORTANT: inject BEFORE the original GameUpdate, then observe AFTER it.
-    // This lets us see whether the game's own physics/update pipeline overwrites
-    // the transform during the same frame.
-    uintptr_t testedVehicle = 0;
-    RunPhysicsOrderTestBefore(g_EngineInstance, testedVehicle);
-
-    if (orig_GameUpdate) {
-        orig_GameUpdate(thiz, param_1);
-    }
-
-    RunPhysicsOrderTestAfter(g_EngineInstance, testedVehicle);
+    RunVehicleTransformTest(g_EngineInstance);
 }
 
 void* my_updateGUI(void* thiz, void* p1, void* p2, void* p3, void* p4) {
@@ -1193,7 +1145,7 @@ void ModMain() {
     g_VehicleGetOrientation = (VehicleGetOrientation_t)(libBase + 0x000397ea + 1);
     g_b2BodySetTransform = (b2BodySetTransform_t)(libBase + 0x00060a0c + 1);
 
-    LOGI("Physics test funcs: getPos=%p getOri=%p setTransform=%p",
+    LOGI("Transform test funcs: getPos=%p getOri=%p setTransform=%p",
          (void*)g_VehicleGetPosition,
          (void*)g_VehicleGetOrientation,
          (void*)g_b2BodySetTransform);
