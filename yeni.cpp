@@ -211,6 +211,9 @@ AInputQueue_getEvent_t orig_AInputQueue_getEvent = nullptr;
 typedef void (*GameUpdate_t)(void* thiz, float param_1);
 GameUpdate_t orig_GameUpdate = nullptr;
 
+typedef void (*GameUpdateStateBase_t)(void* thiz, float param_1, uint32_t param_2, uint32_t param_3, uint32_t param_4);
+GameUpdateStateBase_t orig_GameUpdateStateBase = nullptr;
+
 // ========================================================================
 // BOX2D / VEHICLE TRANSFORM TEST
 // ========================================================================
@@ -232,7 +235,7 @@ static std::chrono::steady_clock::time_point g_LastTransformTest =
     std::chrono::steady_clock::now();
 
 static const uint32_t TRANSFORM_TEST_INTERVAL_MS = 3000;
-static const float TRANSFORM_TEST_STEP = 1.0f;
+static const float TRANSFORM_TEST_STEP = 3.0f;
 
 static uintptr_t GetTestVehicleFromGame(uintptr_t game) {
     if (game == 0) return 0;
@@ -258,9 +261,12 @@ static void RunVehicleTransformTest(uintptr_t game) {
     if (elapsedMs < TRANSFORM_TEST_INTERVAL_MS) return;
     g_LastTransformTest = now;
 
+    const uint32_t vehicleIndex = *(uint32_t*)(game + 0xA8);
     uintptr_t vehicle = GetTestVehicleFromGame(game);
+
     if (vehicle == 0) {
-        LOGI("[TRANSFORM TEST] Active vehicle not found.");
+        LOGI("[TRANSFORM TEST] Active vehicle not found. game=%p activeIndex=%u vehicleCount=%u",
+             (void*)game, vehicleIndex, *(uint32_t*)(game + 0xA4));
         return;
     }
 
@@ -273,7 +279,8 @@ static void RunVehicleTransformTest(uintptr_t game) {
 
     uintptr_t body = *(uintptr_t*)(vehicle + 0x528);
     if (body == 0) {
-        LOGI("[TRANSFORM TEST] Vehicle+0x528 b2Body null. vehicle=%p", (void*)vehicle);
+        LOGI("[TRANSFORM TEST] Vehicle+0x528 b2Body null. vehicle=%p activeIndex=%u",
+             (void*)vehicle, vehicleIndex);
         return;
     }
 
@@ -281,10 +288,17 @@ static void RunVehicleTransformTest(uintptr_t game) {
     newPos.x = p1 + TRANSFORM_TEST_STEP;
     newPos.y = p2;
 
+    LOGI("[TRANSFORM TEST] BEFORE index=%u vehicle=%p body=%p pos=(%.3f, %.3f) angle=%.3f",
+         vehicleIndex, (void*)vehicle, (void*)body, p1, p2, angle);
+
     g_b2BodySetTransform((void*)body, &newPos, angle);
 
-    LOGI("[TRANSFORM TEST] vehicle=%p body=%p pos=(%.3f, %.3f) -> (%.3f, %.3f) angle=%.3f",
-         (void*)vehicle, (void*)body, p1, p2, newPos.x, newPos.y, angle);
+    float readbackP1 = 0.0f;
+    float readbackP2 = 0.0f;
+    g_VehicleGetPosition((void*)vehicle, &readbackP1, &readbackP2);
+
+    LOGI("[TRANSFORM TEST] AFTER index=%u requested=(%.3f, %.3f) readback=(%.3f, %.3f)",
+         vehicleIndex, newPos.x, newPos.y, readbackP1, readbackP2);
 }
 
 // ========================================================================
@@ -1090,7 +1104,14 @@ void my_GameUpdate(void* thiz, float param_1) {
     g_EngineInstance = (uintptr_t)thiz; 
     g_CurrentMenu = MENU_INGAME; 
     if (orig_GameUpdate) orig_GameUpdate(thiz, param_1);
+}
 
+void my_GameUpdateStateBase(void* thiz, float param_1, uint32_t param_2, uint32_t param_3, uint32_t param_4) {
+    if (orig_GameUpdateStateBase) {
+        orig_GameUpdateStateBase(thiz, param_1, param_2, param_3, param_4);
+    }
+
+    g_EngineInstance = (uintptr_t)thiz;
     RunVehicleTransformTest(g_EngineInstance);
 }
 
@@ -1138,21 +1159,24 @@ void ModMain() {
     
     uintptr_t renderMenuAddr = libBase + 0x00033974 + 1; 
     uintptr_t updateGUIAddr  = libBase + 0x0002f6a0 + 1; 
-    uintptr_t gameUpdateAddr = libBase + 0x00057ee8 + 1; 
-    uintptr_t inGameMenuAddr = libBase + 0x00032090 + 1;  
+    uintptr_t gameUpdateAddr = libBase + 0x00047ee8 + 1;
+    uintptr_t updateStateBaseAddr = libBase + 0x00046748 + 1;
+    uintptr_t inGameMenuAddr = libBase + 0x00032090 + 1;
 
     g_VehicleGetPosition = (VehicleGetPosition_t)(libBase + 0x000397da + 1);
     g_VehicleGetOrientation = (VehicleGetOrientation_t)(libBase + 0x000397ea + 1);
     g_b2BodySetTransform = (b2BodySetTransform_t)(libBase + 0x00060a0c + 1);
 
-    LOGI("Transform test funcs: getPos=%p getOri=%p setTransform=%p",
+    LOGI("Transform test funcs: getPos=%p getOri=%p setTransform=%p stateBase=%p",
          (void*)g_VehicleGetPosition,
          (void*)g_VehicleGetOrientation,
-         (void*)g_b2BodySetTransform);
+         (void*)g_b2BodySetTransform,
+         (void*)updateStateBaseAddr);
     
     MSHookFunction((void*)renderMenuAddr, (void*)my_renderMenu, (void**)&orig_renderMenu);
     MSHookFunction((void*)updateGUIAddr, (void*)my_updateGUI, (void**)&orig_updateGUI);
     MSHookFunction((void*)gameUpdateAddr, (void*)my_GameUpdate, (void**)&orig_GameUpdate);
+    MSHookFunction((void*)updateStateBaseAddr, (void*)my_GameUpdateStateBase, (void**)&orig_GameUpdateStateBase);
     MSHookFunction((void*)inGameMenuAddr, (void*)my_renderStartMenuMain, (void**)&orig_renderStartMenuMain);
 
     void* inputQueueGetEventAddr = dlsym(RTLD_DEFAULT, "AInputQueue_getEvent");
