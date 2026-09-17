@@ -840,13 +840,31 @@ static void ApplyRemoteVehicleStates(uintptr_t game) {
             : rawVehicleCount;
 
     const uint8_t localOwner = g_LocalPlayerId.load();
+    if (localOwner == VEHICLE_OWNER_NONE || localOwner >= MAX_PLAYERS) return;
+
     const uint64_t nowMs = GetMonotonicMilliseconds();
 
     for (uint16_t vehicleId = 0; vehicleId < vehicleCount; ++vehicleId) {
         VehicleRemoteState state;
+        uint8_t authorityOwner = VEHICLE_OWNER_NONE;
 
         {
             std::lock_guard<std::mutex> lock(g_VehicleStateMutex);
+
+            // A snapshot may arrive before the host's authority packet.
+            // Keep buffering it, but NEVER apply it until this vehicle is
+            // explicitly owned by that remote player. This is the critical
+            // separation between network reception and local physics control.
+            authorityOwner = g_VehicleAuthority[vehicleId].ownerId;
+
+            if (authorityOwner == VEHICLE_OWNER_NONE) {
+                continue;
+            }
+
+            if (authorityOwner == localOwner) {
+                continue;
+            }
+
             if (!g_RemoteVehicles[vehicleId].valid) {
                 continue;
             }
@@ -854,7 +872,9 @@ static void ApplyRemoteVehicleStates(uintptr_t game) {
             state = g_RemoteVehicles[vehicleId];
         }
 
-        if (state.ownerId == localOwner) continue;
+        // A remote snapshot is valid only when its sender is the current
+        // authoritative owner for this exact vehicle slot.
+        if (state.ownerId != authorityOwner) continue;
         if (state.vehicleId != vehicleId) continue;
 
         uintptr_t vehicle = GetVehicleFromIndex(game, vehicleId);
@@ -872,8 +892,6 @@ static void ApplyRemoteVehicleStates(uintptr_t game) {
                 (float)(nowMs - state.lastReceiveMs) / 1000.0f;
 
             // Never extrapolate too far past the newest snapshot.
-            // This prevents a delayed network update from launching a
-            // remote vehicle too far ahead.
             if (elapsedSec > 0.12f) {
                 elapsedSec = 0.12f;
             }
@@ -887,6 +905,8 @@ static void ApplyRemoteVehicleStates(uintptr_t game) {
         position.x = predictedX;
         position.y = predictedY;
 
+        // This call is intentionally restricted to remotely-authoritative
+        // vehicles. The local driver's physics is left completely intact.
         g_b2BodySetTransform(
             (void*)body,
             &position,
@@ -987,6 +1007,9 @@ static void StoreRemoteVehicleState(
 
     VehicleRemoteState& state = g_RemoteVehicles[vehicleId];
 
+    // Receiving is deliberately independent from authority. The state is
+    // buffered here; ApplyRemoteVehicleStates() is the only place allowed to
+    // touch the physics body, and it checks authority before doing so.
     if (state.valid &&
         state.ownerId == ownerId &&
         sequence <= state.sequence) {
