@@ -357,6 +357,31 @@ static uintptr_t GetActiveVehicleFromGame(uintptr_t game, uint16_t* outVehicleId
     return GetVehicleFromIndex(game, (uint16_t)vehicleIndex);
 }
 
+// Send a complete packet over TCP, handling partial sends.
+static bool SendAllBytes(int socketFd, const void* data, size_t size) {
+    if (socketFd < 0 || data == nullptr || size == 0) return false;
+
+    const uint8_t* bytes = (const uint8_t*)data;
+    size_t totalSent = 0;
+
+    while (totalSent < size) {
+        ssize_t sent = send(socketFd, bytes + totalSent, size - totalSent, MSG_NOSIGNAL);
+
+        if (sent > 0) {
+            totalSent += (size_t)sent;
+            continue;
+        }
+
+        if (sent < 0 && (errno == EINTR)) {
+            continue;
+        }
+
+        return false;
+    }
+
+    return true;
+}
+
 static void ClearVehicleStateSlot(uint16_t vehicleId) {
     if (vehicleId >= VEHICLE_SLOT_LIMIT) return;
 
