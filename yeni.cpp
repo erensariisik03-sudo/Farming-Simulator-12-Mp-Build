@@ -16,7 +16,6 @@
 #include <chrono>
 #include <sys/socket.h>
 #include <netinet/in.h>
-#include <netinet/tcp.h>
 #include <arpa/inet.h>
 #include <unistd.h>
 #include <fcntl.h>
@@ -229,17 +228,20 @@ static const uint8_t PACKET_VEHICLE_POSITION = 3;
 static const uint8_t PACKET_VEHICLE_CLAIM = 4;
 static const uint8_t PACKET_VEHICLE_AUTHORITY = 5;
 static const uint8_t PACKET_VEHICLE_RELEASE = 6;
+static const uint8_t PACKET_VEHICLE_SNAPSHOT = 7;
 
 static const uint8_t MAX_PLAYERS = 4;
 static const uint16_t VEHICLE_ID_INVALID = 0xFFFF;
 static const uint16_t VEHICLE_SLOT_LIMIT = 512;
 static const uint8_t VEHICLE_OWNER_NONE = 0xFF;
 
-// Network snapshots are sent at 5 Hz; local interpolation keeps remote motion smooth.
-// Send one vehicle snapshot every 200 ms (5 snapshots per second).
-static const uint32_t VEHICLE_SYNC_INTERVAL_MS = 200;
-static const uint32_t VEHICLE_INTERPOLATION_MS = 190;
+// Local vehicle sampling target: 120 Hz.
+// The actual callback frequency still follows the game's own update/vsync loop.
+// Network vehicle snapshots are deliberately limited to 10 snapshots/sec.
+static const uint32_t VEHICLE_LOCAL_SAMPLE_INTERVAL_US = 8333;
+static const uint32_t VEHICLE_NETWORK_INTERVAL_MS = 100;
 static const uint32_t VEHICLE_STOP_RELEASE_MS = 1000;
+static const uint8_t VEHICLE_SNAPSHOT_MAX_COUNT = 64;
 static const float POSITION_EPSILON = 0.02f;
 static const float ANGLE_EPSILON = 0.005f;
 static const float CLAIM_POSITION_EPSILON = 0.05f;
@@ -271,16 +273,24 @@ struct VehiclePositionPacket {
     uint8_t moving;
 };
 
-// One network snapshot contains up to 12 vehicle states.
-// 4-byte header + (12 * 21-byte states) = exactly 256 bytes.
-static const uint8_t VEHICLE_BATCH_MAX = 12;
-
-struct VehiclePositionBatchPacket {
+// One TCP message can carry the newest state of many vehicles.
+// This keeps vehicle traffic at ~10 network messages/sec regardless of
+// how many local vehicles are being sampled.
+struct VehicleSnapshotHeader {
     uint8_t type;
     uint8_t ownerId;
     uint8_t count;
     uint8_t reserved;
-    VehiclePositionPacket states[VEHICLE_BATCH_MAX];
+    uint32_t sequence;
+};
+
+struct VehicleSnapshotEntry {
+    uint16_t vehicleId;
+    float x;
+    float y;
+    float angle;
+    uint32_t sequence;
+    uint8_t moving;
 };
 
 // Client -> host. The host decides which player gets authority first.
@@ -313,7 +323,8 @@ struct VehicleReleasePacket {
 static_assert(sizeof(SessionWelcomePacket) == 4, "SessionWelcomePacket size mismatch");
 static_assert(sizeof(NetworkPacket) == 256, "NetworkPacket size mismatch");
 static_assert(sizeof(VehiclePositionPacket) == 21, "VehiclePositionPacket size mismatch");
-static_assert(sizeof(VehiclePositionBatchPacket) == 256, "VehiclePositionBatchPacket size mismatch");
+static_assert(sizeof(VehicleSnapshotHeader) == 8, "VehicleSnapshotHeader size mismatch");
+static_assert(sizeof(VehicleSnapshotEntry) == 17, "VehicleSnapshotEntry size mismatch");
 static_assert(sizeof(VehicleClaimPacket) == 8, "VehicleClaimPacket size mismatch");
 static_assert(sizeof(VehicleAuthorityPacket) == 8, "VehicleAuthorityPacket size mismatch");
 static_assert(sizeof(VehicleReleasePacket) == 8, "VehicleReleasePacket size mismatch");
@@ -334,19 +345,13 @@ struct VehicleRemoteState {
     float x;
     float y;
     float angle;
+    float vx;
+    float vy;
+    float angularVelocity;
     uint32_t sequence;
     uint32_t appliedSequence;
+    uint64_t lastReceiveMs;
     bool moving;
-
-    // Smooth the 5 Hz network snapshots locally at the game frame rate.
-    float smoothX;
-    float smoothY;
-    float smoothAngle;
-    float interpolationStartX;
-    float interpolationStartY;
-    float interpolationStartAngle;
-    uint64_t interpolationStartMs;
-    bool interpolationActive;
 };
 
 struct VehicleSampleState {
@@ -368,8 +373,12 @@ static uint64_t g_RemoteStationarySince[VEHICLE_SLOT_LIMIT];
 static uint32_t g_LastKnownVehicleCount = 0;
 static std::mutex g_VehicleStateMutex;
 
-// Each pending item is a complete 256-byte snapshot containing up to 12 vehicles.
-static std::vector<VehiclePositionBatchPacket> g_PendingVehicleBatches;
+// Network transport keeps only the newest sample for each vehicle.
+// The network thread packs all valid samples into one snapshot every 100 ms.
+static VehiclePositionPacket g_LatestOutgoingVehicles[VEHICLE_SLOT_LIMIT];
+static bool g_HasLatestOutgoingVehicle[VEHICLE_SLOT_LIMIT];
+static uint64_t g_LastVehicleNetworkSendMs = 0;
+
 static VehicleClaimPacket g_PendingClaimPacket;
 static bool g_HasPendingClaimPacket = false;
 static VehicleReleasePacket g_PendingReleasePacket;
@@ -436,15 +445,15 @@ static float GetAngleDelta(float a, float b) {
     return fabsf(delta);
 }
 
-static float LerpAngleShortest(float a, float b, float t) {
-    float delta = b - a;
+static float GetSignedAngleDelta(float from, float to) {
+    float delta = to - from;
     const float pi = 3.14159265359f;
     const float twoPi = 6.28318530718f;
 
     while (delta > pi) delta -= twoPi;
     while (delta < -pi) delta += twoPi;
 
-    return a + delta * t;
+    return delta;
 }
 
 static void ClearVehicleStateSlot(uint16_t vehicleId) {
@@ -507,21 +516,16 @@ static bool GetVehicleOwner(uint16_t vehicleId, uint8_t* outOwner) {
     return true;
 }
 
-static bool BuildVehiclePositionState(uint16_t vehicleId, float x, float y, float angle, bool moving,
-                                       VehiclePositionPacket* outPacket) {
-    if (!outPacket) return false;
-    if (vehicleId >= VEHICLE_SLOT_LIMIT) return false;
+static void QueueVehiclePosition(uint16_t vehicleId, float x, float y, float angle, bool moving) {
+    if (!g_IsConnected.load()) return;
 
     const uint8_t ownerId = g_LocalPlayerId.load();
-    if (ownerId == VEHICLE_OWNER_NONE || ownerId >= MAX_PLAYERS) return false;
-
-    {
-        std::lock_guard<std::mutex> lock(g_VehicleStateMutex);
-        if (g_VehicleAuthority[vehicleId].ownerId != ownerId) return false;
-    }
+    if (ownerId == VEHICLE_OWNER_NONE || ownerId >= MAX_PLAYERS) return;
+    if (vehicleId >= VEHICLE_SLOT_LIMIT) return;
 
     VehiclePositionPacket pkt;
     memset(&pkt, 0, sizeof(pkt));
+
     pkt.type = PACKET_VEHICLE_POSITION;
     pkt.ownerId = ownerId;
     pkt.vehicleId = vehicleId;
@@ -531,87 +535,11 @@ static bool BuildVehiclePositionState(uint16_t vehicleId, float x, float y, floa
     pkt.sequence = g_LocalVehicleSequence.fetch_add(1) + 1;
     pkt.moving = moving ? 1 : 0;
 
-    *outPacket = pkt;
-    return true;
-}
-
-static void QueueVehiclePositionBatches(const std::vector<VehiclePositionPacket>& states) {
-    if (!g_IsConnected.load()) return;
-    if (states.empty()) return;
-
-    const uint8_t localOwner = g_LocalPlayerId.load();
-    if (localOwner == VEHICLE_OWNER_NONE || localOwner >= MAX_PLAYERS) return;
-
-    size_t offset = 0;
-    std::vector<VehiclePositionBatchPacket> batches;
-
-    while (offset < states.size()) {
-        VehiclePositionBatchPacket batch;
-        memset(&batch, 0, sizeof(batch));
-        batch.type = PACKET_VEHICLE_POSITION;
-        batch.ownerId = localOwner;
-
-        const size_t remaining = states.size() - offset;
-        const size_t count = (remaining > VEHICLE_BATCH_MAX) ? VEHICLE_BATCH_MAX : remaining;
-        batch.count = (uint8_t)count;
-
-        for (size_t i = 0; i < count; ++i) {
-            batch.states[i] = states[offset + i];
-        }
-
-        batches.push_back(batch);
-        offset += count;
+    {
+        std::lock_guard<std::mutex> lock(g_VehicleSendMutex);
+        g_LatestOutgoingVehicles[vehicleId] = pkt;
+        g_HasLatestOutgoingVehicle[vehicleId] = true;
     }
-
-    std::lock_guard<std::mutex> lock(g_VehicleSendMutex);
-    for (size_t i = 0; i < batches.size(); ++i) {
-        if (g_PendingVehicleBatches.size() >= 16) {
-            g_PendingVehicleBatches.erase(g_PendingVehicleBatches.begin());
-        }
-        g_PendingVehicleBatches.push_back(batches[i]);
-    }
-}
-
-// Relay validated client vehicle states from the host back to the client.
-// The original ownerId is preserved so each side knows which player owns the vehicle.
-static void QueueRelayedVehiclePositionBatch(const std::vector<VehiclePositionPacket>& states, uint8_t ownerId) {
-    if (!g_IsConnected.load() || !g_IsHost.load()) return;
-    if (states.empty() || ownerId >= MAX_PLAYERS) return;
-
-    size_t offset = 0;
-    while (offset < states.size()) {
-        VehiclePositionBatchPacket batch;
-        memset(&batch, 0, sizeof(batch));
-        batch.type = PACKET_VEHICLE_POSITION;
-        batch.ownerId = ownerId;
-
-        const size_t remaining = states.size() - offset;
-        const size_t count = (remaining > VEHICLE_BATCH_MAX) ? VEHICLE_BATCH_MAX : remaining;
-        batch.count = (uint8_t)count;
-
-        for (size_t i = 0; i < count; ++i) {
-            batch.states[i] = states[offset + i];
-            batch.states[i].type = PACKET_VEHICLE_POSITION;
-            batch.states[i].ownerId = ownerId;
-        }
-
-        {
-            std::lock_guard<std::mutex> lock(g_VehicleSendMutex);
-            if (g_PendingVehicleBatches.size() >= 16) {
-                g_PendingVehicleBatches.erase(g_PendingVehicleBatches.begin());
-            }
-            g_PendingVehicleBatches.push_back(batch);
-        }
-
-        offset += count;
-    }
-}
-
-static void ConfigureTcpSocket(int socketFd) {
-    if (socketFd < 0) return;
-
-    int noDelay = 1;
-    setsockopt(socketFd, IPPROTO_TCP, TCP_NODELAY, &noDelay, sizeof(noDelay));
 }
 
 static void QueueVehicleClaim(uint16_t vehicleId) {
@@ -783,16 +711,20 @@ static void CaptureAndQueueLocalVehicleState(uintptr_t game) {
     if (!g_VehicleGetPosition || !g_VehicleGetOrientation) return;
 
     const std::chrono::steady_clock::time_point now = std::chrono::steady_clock::now();
-    const uint64_t elapsedMs = (uint64_t)std::chrono::duration_cast<std::chrono::milliseconds>(
-        now - g_LastVehicleSync).count();
-    if (elapsedMs < VEHICLE_SYNC_INTERVAL_MS) return;
+    const uint64_t elapsedUs =
+        (uint64_t)std::chrono::duration_cast<std::chrono::microseconds>(
+            now - g_LastVehicleSync).count();
+
+    if (elapsedUs < VEHICLE_LOCAL_SAMPLE_INTERVAL_US) return;
     g_LastVehicleSync = now;
 
     RefreshVehicleTopology(game);
 
     const uint32_t rawVehicleCount = *(uint32_t*)(game + 0xA4);
-    const uint32_t vehicleCount = (rawVehicleCount > VEHICLE_SLOT_LIMIT)
-        ? VEHICLE_SLOT_LIMIT : rawVehicleCount;
+    const uint32_t vehicleCount =
+        (rawVehicleCount > VEHICLE_SLOT_LIMIT)
+            ? VEHICLE_SLOT_LIMIT
+            : rawVehicleCount;
 
     uint16_t activeVehicleId = VEHICLE_ID_INVALID;
     GetActiveVehicleFromGame(game, &activeVehicleId);
@@ -801,8 +733,6 @@ static void CaptureAndQueueLocalVehicleState(uintptr_t game) {
     if (localOwner == VEHICLE_OWNER_NONE || localOwner >= MAX_PLAYERS) return;
 
     const uint64_t nowMs = GetMonotonicMilliseconds();
-    std::vector<VehiclePositionPacket> snapshotStates;
-    snapshotStates.reserve(VEHICLE_BATCH_MAX);
 
     for (uint16_t vehicleId = 0; vehicleId < vehicleCount; ++vehicleId) {
         uintptr_t vehicle = GetVehicleFromIndex(game, vehicleId);
@@ -811,6 +741,7 @@ static void CaptureAndQueueLocalVehicleState(uintptr_t game) {
         float x = 0.0f;
         float y = 0.0f;
         float angle = 0.0f;
+
         g_VehicleGetPosition((void*)vehicle, &x, &y);
         angle = g_VehicleGetOrientation((void*)vehicle);
 
@@ -823,9 +754,13 @@ static void CaptureAndQueueLocalVehicleState(uintptr_t game) {
             VehicleSampleState& sample = g_LocalSamples[vehicleId];
 
             if (sample.valid) {
-                moved = fabsf(x - sample.x) > CLAIM_POSITION_EPSILON ||
-                        fabsf(y - sample.y) > CLAIM_POSITION_EPSILON;
-                rotated = GetAngleDelta(angle, sample.angle) > CLAIM_ANGLE_EPSILON;
+                moved =
+                    fabsf(x - sample.x) > CLAIM_POSITION_EPSILON ||
+                    fabsf(y - sample.y) > CLAIM_POSITION_EPSILON;
+
+                rotated =
+                    GetAngleDelta(angle, sample.angle) >
+                    CLAIM_ANGLE_EPSILON;
             }
 
             sample.valid = true;
@@ -836,17 +771,16 @@ static void CaptureAndQueueLocalVehicleState(uintptr_t game) {
             ownerId = g_VehicleAuthority[vehicleId].ownerId;
         }
 
-        // An unowned vehicle is claimed only by the player who is currently using
-        // it and actually starts moving or turning it. Standing in a vehicle does
-        // not win ownership by itself.
-        if (ownerId == VEHICLE_OWNER_NONE && vehicleId == activeVehicleId && (moved || rotated)) {
-            TryClaimLocalVehicle(vehicleId);
-            continue;
-        }
-
-        if (ownerId != localOwner) continue;
-
         const bool moving = moved || rotated;
+
+        // Ask the host for authority when appropriate, but do not make
+        // network publication depend on the authority handshake. This is
+        // what allows Player A to drive the harvester while Player B drives
+        // the tractor on a different vehicle slot.
+        if (vehicleId == activeVehicleId && moving &&
+            ownerId == VEHICLE_OWNER_NONE) {
+            TryClaimLocalVehicle(vehicleId);
+        }
 
         if (moving) {
             g_LocalStationarySince[vehicleId] = 0;
@@ -854,31 +788,43 @@ static void CaptureAndQueueLocalVehicleState(uintptr_t game) {
             g_LocalStationarySince[vehicleId] = nowMs;
         }
 
-        // Keep broadcasting the owner state even when the vehicle is stationary.
-        // This prevents the remote copy from appearing to stop receiving data.
         const bool stoppedLongEnough =
             g_LocalStationarySince[vehicleId] != 0 &&
             (nowMs - g_LocalStationarySince[vehicleId]) >= VEHICLE_STOP_RELEASE_MS;
 
-        if (stoppedLongEnough) {
+        if (stoppedLongEnough && ownerId == localOwner) {
             if (g_IsHost.load()) {
                 ReleaseVehicleAuthority(vehicleId, localOwner, true);
             } else {
                 QueueVehicleRelease(vehicleId);
+
                 std::lock_guard<std::mutex> lock(g_VehicleStateMutex);
                 g_ClaimPending[vehicleId] = true;
             }
-            continue;
         }
 
-        VehiclePositionPacket packet;
-        if (BuildVehiclePositionState(vehicleId, x, y, angle, moving, &packet)) {
-            snapshotStates.push_back(packet);
+        // Publish:
+        //   - the currently driven vehicle even if it is still contested;
+        //   - vehicles for which this device already has authority.
+        //
+        // Therefore different vehicles can travel simultaneously, while the
+        // same vehicle can still exhibit the expected tug-of-war/tremble.
+        const bool publishActiveVehicle =
+            (vehicleId == activeVehicleId);
+
+        const bool publishOwnedVehicle =
+            (ownerId == localOwner);
+
+        if (publishActiveVehicle || publishOwnedVehicle) {
+            QueueVehiclePosition(
+                vehicleId,
+                x,
+                y,
+                angle,
+                moving
+            );
         }
     }
-
-    // Send all locally-owned vehicle states as a single 256-byte snapshot.
-    QueueVehiclePositionBatches(snapshotStates);
 }
 
 static void ApplyRemoteVehicleStates(uintptr_t game) {
@@ -888,33 +834,27 @@ static void ApplyRemoteVehicleStates(uintptr_t game) {
     RefreshVehicleTopology(game);
 
     const uint32_t rawVehicleCount = *(uint32_t*)(game + 0xA4);
-    const uint32_t vehicleCount = (rawVehicleCount > VEHICLE_SLOT_LIMIT)
-        ? VEHICLE_SLOT_LIMIT : rawVehicleCount;
+    const uint32_t vehicleCount =
+        (rawVehicleCount > VEHICLE_SLOT_LIMIT)
+            ? VEHICLE_SLOT_LIMIT
+            : rawVehicleCount;
 
     const uint8_t localOwner = g_LocalPlayerId.load();
     const uint64_t nowMs = GetMonotonicMilliseconds();
 
     for (uint16_t vehicleId = 0; vehicleId < vehicleCount; ++vehicleId) {
         VehicleRemoteState state;
-        memset(&state, 0, sizeof(state));
-
-        uint8_t authorityOwner = VEHICLE_OWNER_NONE;
-        bool shouldApply = false;
 
         {
             std::lock_guard<std::mutex> lock(g_VehicleStateMutex);
-            authorityOwner = g_VehicleAuthority[vehicleId].ownerId;
-
-            if (g_RemoteVehicles[vehicleId].valid) {
-                state = g_RemoteVehicles[vehicleId];
-                shouldApply = state.interpolationActive || state.sequence != state.appliedSequence;
+            if (!g_RemoteVehicles[vehicleId].valid) {
+                continue;
             }
+
+            state = g_RemoteVehicles[vehicleId];
         }
 
-        // Never allow a remote packet to touch a locally-owned vehicle.
-        if (authorityOwner == VEHICLE_OWNER_NONE || authorityOwner == localOwner) continue;
-        if (!shouldApply) continue;
-        if (!state.valid || state.ownerId != authorityOwner) continue;
+        if (state.ownerId == localOwner) continue;
         if (state.vehicleId != vehicleId) continue;
 
         uintptr_t vehicle = GetVehicleFromIndex(game, vehicleId);
@@ -923,51 +863,35 @@ static void ApplyRemoteVehicleStates(uintptr_t game) {
         uintptr_t body = *(uintptr_t*)(vehicle + 0x528);
         if (body == 0) continue;
 
-        float applyX = state.x;
-        float applyY = state.y;
-        float applyAngle = state.angle;
-        bool interpolationFinished = true;
+        float predictedX = state.x;
+        float predictedY = state.y;
+        float predictedAngle = state.angle;
 
-        if (state.interpolationActive) {
-            uint64_t elapsedMs = 0;
-            if (nowMs >= state.interpolationStartMs) {
-                elapsedMs = nowMs - state.interpolationStartMs;
+        if (state.moving && state.lastReceiveMs != 0) {
+            float elapsedSec =
+                (float)(nowMs - state.lastReceiveMs) / 1000.0f;
+
+            // Never extrapolate too far past the newest snapshot.
+            // This prevents a delayed network update from launching a
+            // remote vehicle too far ahead.
+            if (elapsedSec > 0.12f) {
+                elapsedSec = 0.12f;
             }
 
-            float t = (float)elapsedMs / (float)VEHICLE_INTERPOLATION_MS;
-            if (t < 0.0f) t = 0.0f;
-            if (t > 1.0f) t = 1.0f;
-
-            applyX = state.interpolationStartX +
-                     (state.x - state.interpolationStartX) * t;
-            applyY = state.interpolationStartY +
-                     (state.y - state.interpolationStartY) * t;
-            applyAngle = LerpAngleShortest(state.interpolationStartAngle, state.angle, t);
-            interpolationFinished = (t >= 1.0f);
+            predictedX += state.vx * elapsedSec;
+            predictedY += state.vy * elapsedSec;
+            predictedAngle += state.angularVelocity * elapsedSec;
         }
 
         TestB2Vec2 position;
-        position.x = applyX;
-        position.y = applyY;
+        position.x = predictedX;
+        position.y = predictedY;
 
-        g_b2BodySetTransform((void*)body, &position, applyAngle);
-
-        std::lock_guard<std::mutex> lock(g_VehicleStateMutex);
-        VehicleRemoteState& liveState = g_RemoteVehicles[vehicleId];
-        if (liveState.valid && liveState.sequence == state.sequence &&
-            liveState.ownerId == authorityOwner) {
-            liveState.smoothX = applyX;
-            liveState.smoothY = applyY;
-            liveState.smoothAngle = applyAngle;
-
-            if (interpolationFinished) {
-                liveState.smoothX = liveState.x;
-                liveState.smoothY = liveState.y;
-                liveState.smoothAngle = liveState.angle;
-                liveState.interpolationActive = false;
-                liveState.appliedSequence = liveState.sequence;
-            }
-        }
+        g_b2BodySetTransform(
+            (void*)body,
+            &position,
+            predictedAngle
+        );
     }
 }
 
@@ -1042,71 +966,109 @@ static void HandleVehicleAuthorityPacket(const VehicleAuthorityPacket& pkt) {
          (unsigned)pkt.generation);
 }
 
-static bool HandleVehiclePositionPacket(const VehiclePositionPacket& pkt) {
-    if (pkt.ownerId >= MAX_PLAYERS) return false;
-    if (pkt.vehicleId >= VEHICLE_SLOT_LIMIT) return false;
+static void StoreRemoteVehicleState(
+    uint8_t ownerId,
+    uint16_t vehicleId,
+    float x,
+    float y,
+    float angle,
+    uint32_t sequence,
+    bool moving
+) {
+    if (ownerId >= MAX_PLAYERS) return;
+    if (vehicleId >= VEHICLE_SLOT_LIMIT) return;
 
     const uint8_t localOwner = g_LocalPlayerId.load();
-    if (pkt.ownerId == localOwner) return false;
+    if (ownerId == localOwner) return;
 
-    bool shouldRelease = false;
     const uint64_t nowMs = GetMonotonicMilliseconds();
 
-    {
-        std::lock_guard<std::mutex> lock(g_VehicleStateMutex);
-        const uint8_t authorityOwner = g_VehicleAuthority[pkt.vehicleId].ownerId;
+    std::lock_guard<std::mutex> lock(g_VehicleStateMutex);
 
-        // Only the current authoritative owner is allowed to update this vehicle.
-        if (authorityOwner == VEHICLE_OWNER_NONE) return false;
-        if (authorityOwner != pkt.ownerId) return false;
+    VehicleRemoteState& state = g_RemoteVehicles[vehicleId];
 
-        VehicleRemoteState& state = g_RemoteVehicles[pkt.vehicleId];
-        if (state.valid && state.ownerId == pkt.ownerId && pkt.sequence <= state.sequence) return false;
-
-        if (!state.valid) {
-            state.smoothX = pkt.x;
-            state.smoothY = pkt.y;
-            state.smoothAngle = pkt.angle;
-            state.interpolationStartX = pkt.x;
-            state.interpolationStartY = pkt.y;
-            state.interpolationStartAngle = pkt.angle;
-            state.interpolationActive = false;
-        } else {
-            state.interpolationStartX = state.smoothX;
-            state.interpolationStartY = state.smoothY;
-            state.interpolationStartAngle = state.smoothAngle;
-            state.interpolationStartMs = nowMs;
-            state.interpolationActive = true;
-        }
-
-        state.valid = true;
-        state.ownerId = pkt.ownerId;
-        state.vehicleId = pkt.vehicleId;
-        state.x = pkt.x;
-        state.y = pkt.y;
-        state.angle = pkt.angle;
-        state.sequence = pkt.sequence;
-        state.appliedSequence = 0;
-        state.moving = (pkt.moving != 0);
-
-        if (pkt.moving != 0) {
-            g_RemoteStationarySince[pkt.vehicleId] = 0;
-        } else if (g_RemoteStationarySince[pkt.vehicleId] == 0) {
-            g_RemoteStationarySince[pkt.vehicleId] = nowMs;
-        }
-
-        if (g_IsHost.load() && pkt.moving == 0 &&
-            g_RemoteStationarySince[pkt.vehicleId] != 0 &&
-            (nowMs - g_RemoteStationarySince[pkt.vehicleId]) >= VEHICLE_STOP_RELEASE_MS) {
-            shouldRelease = true;
-        }
+    if (state.valid &&
+        state.ownerId == ownerId &&
+        sequence <= state.sequence) {
+        return;
     }
 
-    if (shouldRelease && g_IsHost.load()) {
-        ReleaseVehicleAuthority(pkt.vehicleId, pkt.ownerId, true);
+    if (state.valid &&
+        state.ownerId == ownerId &&
+        state.lastReceiveMs != 0) {
+
+        uint64_t deltaMs = nowMs - state.lastReceiveMs;
+
+        if (deltaMs >= 10 && deltaMs <= 500) {
+            float dt = (float)deltaMs / 1000.0f;
+
+            state.vx = (x - state.x) / dt;
+            state.vy = (y - state.y) / dt;
+
+            const float angleDelta =
+                GetSignedAngleDelta(state.angle, angle);
+
+            state.angularVelocity =
+                angleDelta / dt;
+        }
+    } else {
+        state.vx = 0.0f;
+        state.vy = 0.0f;
+        state.angularVelocity = 0.0f;
     }
 
-    return true;
+    state.valid = true;
+    state.ownerId = ownerId;
+    state.vehicleId = vehicleId;
+    state.x = x;
+    state.y = y;
+    state.angle = angle;
+    state.sequence = sequence;
+    state.appliedSequence = 0;
+    state.lastReceiveMs = nowMs;
+    state.moving = moving;
+}
+
+static void HandleVehiclePositionPacket(
+    const VehiclePositionPacket& pkt
+) {
+    StoreRemoteVehicleState(
+        pkt.ownerId,
+        pkt.vehicleId,
+        pkt.x,
+        pkt.y,
+        pkt.angle,
+        pkt.sequence,
+        pkt.moving != 0
+    );
+}
+
+static void HandleVehicleSnapshotPacket(
+    const VehicleSnapshotHeader& header,
+    const uint8_t* payload
+) {
+    if (header.ownerId >= MAX_PLAYERS) return;
+    if (header.count > VEHICLE_SNAPSHOT_MAX_COUNT) return;
+    if (payload == nullptr && header.count != 0) return;
+
+    for (uint8_t i = 0; i < header.count; ++i) {
+        VehicleSnapshotEntry entry;
+        memcpy(
+            &entry,
+            payload + ((size_t)i * sizeof(VehicleSnapshotEntry)),
+            sizeof(entry)
+        );
+
+        StoreRemoteVehicleState(
+            header.ownerId,
+            entry.vehicleId,
+            entry.x,
+            entry.y,
+            entry.angle,
+            entry.sequence,
+            entry.moving != 0
+        );
+    }
 }
 
 static void HandleVehicleReleasePacket(const VehicleReleasePacket& pkt) {
@@ -1133,7 +1095,20 @@ static void ResetVehicleSyncState() {
 
     {
         std::lock_guard<std::mutex> lock(g_VehicleSendMutex);
-        g_PendingVehicleBatches.clear();
+
+        memset(
+            g_LatestOutgoingVehicles,
+            0,
+            sizeof(g_LatestOutgoingVehicles)
+        );
+
+        memset(
+            g_HasLatestOutgoingVehicle,
+            0,
+            sizeof(g_HasLatestOutgoingVehicle)
+        );
+
+        g_LastVehicleNetworkSendMs = 0;
         g_PendingAuthorityPackets.clear();
         memset(&g_PendingClaimPacket, 0, sizeof(g_PendingClaimPacket));
         g_HasPendingClaimPacket = false;
@@ -1394,13 +1369,33 @@ void NetworkLoop() {
             } else if (packetType == PACKET_CHAT) {
                 packetSize = sizeof(NetworkPacket);
             } else if (packetType == PACKET_VEHICLE_POSITION) {
-                packetSize = sizeof(VehiclePositionBatchPacket);
+                packetSize = sizeof(VehiclePositionPacket);
             } else if (packetType == PACKET_VEHICLE_CLAIM) {
                 packetSize = sizeof(VehicleClaimPacket);
             } else if (packetType == PACKET_VEHICLE_AUTHORITY) {
                 packetSize = sizeof(VehicleAuthorityPacket);
             } else if (packetType == PACKET_VEHICLE_RELEASE) {
                 packetSize = sizeof(VehicleReleasePacket);
+            } else if (packetType == PACKET_VEHICLE_SNAPSHOT) {
+                if (bufferedBytes < sizeof(VehicleSnapshotHeader)) {
+                    break;
+                }
+
+                VehicleSnapshotHeader header;
+                memcpy(
+                    &header,
+                    recvBuffer,
+                    sizeof(header)
+                );
+
+                if (header.count > VEHICLE_SNAPSHOT_MAX_COUNT) {
+                    g_IsConnected.store(false);
+                    break;
+                }
+
+                packetSize =
+                    sizeof(VehicleSnapshotHeader) +
+                    ((size_t)header.count * sizeof(VehicleSnapshotEntry));
             } else {
                 g_IsConnected.store(false);
                 break;
@@ -1429,35 +1424,21 @@ void NetworkLoop() {
 
                 ShowNativeToast(formattedMsg);
             } else if (packetType == PACKET_VEHICLE_POSITION) {
-                VehiclePositionBatchPacket batch;
-                memcpy(&batch, recvBuffer, sizeof(batch));
+                VehiclePositionPacket pkt;
+                memcpy(&pkt, recvBuffer, sizeof(pkt));
+                HandleVehiclePositionPacket(pkt);
+            } else if (packetType == PACKET_VEHICLE_SNAPSHOT) {
+                VehicleSnapshotHeader header;
+                memcpy(
+                    &header,
+                    recvBuffer,
+                    sizeof(header)
+                );
 
-                const uint8_t count = (batch.count > VEHICLE_BATCH_MAX)
-                    ? VEHICLE_BATCH_MAX : batch.count;
-
-                // On the host, the client snapshot is first validated against the
-                // authority table and applied to the host game. Every accepted
-                // state is then relayed to the client using the original owner ID.
-                // This is what enables two players to drive different vehicles
-                // simultaneously (for example a tractor and a harvester).
-                std::vector<VehiclePositionPacket> acceptedStates;
-                acceptedStates.reserve(count);
-
-                for (uint8_t i = 0; i < count; ++i) {
-                    VehiclePositionPacket state = batch.states[i];
-
-                    // The batch header is authoritative for packet type/owner.
-                    state.type = PACKET_VEHICLE_POSITION;
-                    state.ownerId = batch.ownerId;
-
-                    if (HandleVehiclePositionPacket(state)) {
-                        acceptedStates.push_back(state);
-                    }
-                }
-
-                if (g_IsHost.load() && !acceptedStates.empty()) {
-                    QueueRelayedVehiclePositionBatch(acceptedStates, batch.ownerId);
-                }
+                HandleVehicleSnapshotPacket(
+                    header,
+                    recvBuffer + sizeof(header)
+                );
             } else if (packetType == PACKET_VEHICLE_CLAIM) {
                 VehicleClaimPacket pkt;
                 memcpy(&pkt, recvBuffer, sizeof(pkt));
@@ -1556,24 +1537,90 @@ void NetworkLoop() {
             }
         }
 
+        // Vehicle network traffic is intentionally capped at 10 snapshots/sec.
+        // All currently-known local vehicle states are packed into one TCP message.
         if (g_IsConnected.load()) {
-            // The queue can contain local snapshots or host-relayed snapshots.
-            // Relayed batches keep the remote player's owner ID intact.
-            std::vector<VehiclePositionBatchPacket> vehicleBatches;
-            {
-                std::lock_guard<std::mutex> lock(g_VehicleSendMutex);
-                vehicleBatches.swap(g_PendingVehicleBatches);
-            }
+            const uint64_t nowMs = GetMonotonicMilliseconds();
 
-            for (size_t i = 0; i < vehicleBatches.size() && g_IsConnected.load(); ++i) {
-                if (!SendAllBytes(g_TcpSocket, &vehicleBatches[i], sizeof(vehicleBatches[i]))) {
-                    g_IsConnected.store(false);
-                    break;
+            if (g_LastVehicleNetworkSendMs == 0 ||
+                (nowMs - g_LastVehicleNetworkSendMs) >= VEHICLE_NETWORK_INTERVAL_MS) {
+
+                std::vector<VehicleSnapshotEntry> entries;
+                entries.reserve(VEHICLE_SNAPSHOT_MAX_COUNT);
+
+                {
+                    std::lock_guard<std::mutex> lock(g_VehicleSendMutex);
+
+                    for (uint16_t vehicleId = 0;
+                         vehicleId < VEHICLE_SLOT_LIMIT &&
+                         entries.size() < VEHICLE_SNAPSHOT_MAX_COUNT;
+                         ++vehicleId) {
+
+                        if (!g_HasLatestOutgoingVehicle[vehicleId]) {
+                            continue;
+                        }
+
+                        const VehiclePositionPacket& srcPkt =
+                            g_LatestOutgoingVehicles[vehicleId];
+
+                        VehicleSnapshotEntry entry;
+                        memset(&entry, 0, sizeof(entry));
+
+                        entry.vehicleId = srcPkt.vehicleId;
+                        entry.x = srcPkt.x;
+                        entry.y = srcPkt.y;
+                        entry.angle = srcPkt.angle;
+                        entry.sequence = srcPkt.sequence;
+                        entry.moving = srcPkt.moving;
+
+                        entries.push_back(entry);
+                    }
                 }
+
+                if (!entries.empty()) {
+                    VehicleSnapshotHeader header;
+                    memset(&header, 0, sizeof(header));
+
+                    header.type = PACKET_VEHICLE_SNAPSHOT;
+                    header.ownerId = g_LocalPlayerId.load();
+                    header.count = (uint8_t)entries.size();
+                    header.sequence =
+                        g_LocalVehicleSequence.load();
+
+                    std::vector<uint8_t> snapshotBuffer;
+                    snapshotBuffer.resize(
+                        sizeof(header) +
+                        (entries.size() * sizeof(VehicleSnapshotEntry))
+                    );
+
+                    memcpy(
+                        snapshotBuffer.data(),
+                        &header,
+                        sizeof(header)
+                    );
+
+                    memcpy(
+                        snapshotBuffer.data() + sizeof(header),
+                        entries.data(),
+                        entries.size() * sizeof(VehicleSnapshotEntry)
+                    );
+
+                    if (!SendAllBytes(
+                            g_TcpSocket,
+                            snapshotBuffer.data(),
+                            snapshotBuffer.size()
+                        )) {
+
+                        g_IsConnected.store(false);
+                        break;
+                    }
+                }
+
+                g_LastVehicleNetworkSendMs = nowMs;
             }
         }
 
-        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
     }
 }
 
@@ -1686,8 +1733,6 @@ void TCPHostThread() {
     g_TcpSocket = accept(g_TcpServerFd, (struct sockaddr*)&address, (socklen_t*)&addrlen);
     
     if (g_TcpSocket >= 0 && g_IsHost) {
-        ConfigureTcpSocket(g_TcpSocket);
-
         SessionWelcomePacket welcome;
         memset(&welcome, 0, sizeof(welcome));
         welcome.type = PACKET_SESSION_WELCOME;
@@ -1740,7 +1785,6 @@ void TCPClientThread(std::string hostIP) {
     ShowNativeToast("Connecting to room: " + hostIP);
 
     if (connect(g_TcpSocket, (struct sockaddr*)&serv_addr, sizeof(serv_addr)) >= 0) {
-        ConfigureTcpSocket(g_TcpSocket);
         g_IsConnected = true;
         g_ConnectedStatus = "Connected to Host!";
         ShowNativeToast("Successfully Joined Room!"); 
@@ -2164,6 +2208,10 @@ void my_GameUpdateStateBase(void* thiz, float param_1, uint32_t param_2, uint32_
         orig_GameUpdateStateBase(thiz, param_1, param_2, param_3, param_4);
     }
 
+    // The game itself decides the real frame/vsync cadence. The C output shows
+    // Game::update() ends with waitVSync(), so this hook must not try to force
+    // the engine to 120 FPS. We sample at up to 120 Hz when callbacks allow it,
+    // and the network is independently capped at 10 snapshots/sec.
     ApplyRemoteVehicleStates(g_EngineInstance);
     CaptureAndQueueLocalVehicleState(g_EngineInstance);
 }
