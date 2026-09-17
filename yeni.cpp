@@ -227,6 +227,7 @@ static const uint8_t PACKET_CHAT = 2;
 static const uint8_t PACKET_VEHICLE_POSITION = 3;
 static const uint8_t PACKET_VEHICLE_CLAIM = 4;
 static const uint8_t PACKET_VEHICLE_AUTHORITY = 5;
+static const uint8_t PACKET_VEHICLE_RELEASE = 6;
 
 static const uint8_t MAX_PLAYERS = 4;
 static const uint16_t VEHICLE_ID_INVALID = 0xFFFF;
@@ -235,7 +236,8 @@ static const uint8_t VEHICLE_OWNER_NONE = 0xFF;
 
 // Keep the current update frequency. Authority ownership prevents two devices
 // from controlling and publishing the same vehicle at the same time.
-static const uint32_t VEHICLE_SYNC_INTERVAL_MS = 16;
+static const uint32_t VEHICLE_SYNC_INTERVAL_MS = 33;
+static const uint32_t VEHICLE_STOP_RELEASE_MS = 1000;
 static const float POSITION_EPSILON = 0.02f;
 static const float ANGLE_EPSILON = 0.005f;
 static const float CLAIM_POSITION_EPSILON = 0.05f;
@@ -264,6 +266,7 @@ struct VehiclePositionPacket {
     float y;
     float angle;
     uint32_t sequence;
+    uint8_t moving;
 };
 
 // Client -> host. The host decides which player gets authority first.
@@ -275,6 +278,7 @@ struct VehicleClaimPacket {
 };
 
 // Host -> client. This is the authoritative owner of one vehicle.
+// ownerId == VEHICLE_OWNER_NONE means that the vehicle was released.
 struct VehicleAuthorityPacket {
     uint8_t type;
     uint8_t ownerId;
@@ -282,13 +286,22 @@ struct VehicleAuthorityPacket {
     uint32_t generation;
 };
 
+// Client -> host. The owner explicitly releases a vehicle after stopping.
+struct VehicleReleasePacket {
+    uint8_t type;
+    uint8_t ownerId;
+    uint16_t vehicleId;
+    uint32_t releaseSequence;
+};
+
 #pragma pack(pop)
 
 static_assert(sizeof(SessionWelcomePacket) == 4, "SessionWelcomePacket size mismatch");
 static_assert(sizeof(NetworkPacket) == 256, "NetworkPacket size mismatch");
-static_assert(sizeof(VehiclePositionPacket) == 20, "VehiclePositionPacket size mismatch");
+static_assert(sizeof(VehiclePositionPacket) == 21, "VehiclePositionPacket size mismatch");
 static_assert(sizeof(VehicleClaimPacket) == 8, "VehicleClaimPacket size mismatch");
 static_assert(sizeof(VehicleAuthorityPacket) == 8, "VehicleAuthorityPacket size mismatch");
+static_assert(sizeof(VehicleReleasePacket) == 8, "VehicleReleasePacket size mismatch");
 
 static std::atomic<uint8_t> g_LocalPlayerId(0xFF);
 static std::atomic<uint32_t> g_LocalVehicleSequence(0);
@@ -308,6 +321,7 @@ struct VehicleRemoteState {
     float angle;
     uint32_t sequence;
     uint32_t appliedSequence;
+    bool moving;
 };
 
 struct VehicleSampleState {
@@ -323,6 +337,8 @@ static VehicleSampleState g_LocalSamples[VEHICLE_SLOT_LIMIT];
 static VehicleSampleState g_LastSentLocalVehicles[VEHICLE_SLOT_LIMIT];
 static uintptr_t g_KnownVehiclePointers[VEHICLE_SLOT_LIMIT];
 static bool g_ClaimPending[VEHICLE_SLOT_LIMIT];
+static uint64_t g_LocalStationarySince[VEHICLE_SLOT_LIMIT];
+static uint64_t g_RemoteStationarySince[VEHICLE_SLOT_LIMIT];
 
 static uint32_t g_LastKnownVehicleCount = 0;
 static std::mutex g_VehicleStateMutex;
@@ -332,6 +348,8 @@ static std::mutex g_VehicleStateMutex;
 static std::vector<VehiclePositionPacket> g_PendingVehiclePackets;
 static VehicleClaimPacket g_PendingClaimPacket;
 static bool g_HasPendingClaimPacket = false;
+static VehicleReleasePacket g_PendingReleasePacket;
+static bool g_HasPendingReleasePacket = false;
 static std::vector<VehicleAuthorityPacket> g_PendingAuthorityPackets;
 static std::mutex g_VehicleSendMutex;
 
@@ -382,6 +400,18 @@ static bool SendAllBytes(int socketFd, const void* data, size_t size) {
     return true;
 }
 
+static uint64_t GetMonotonicMilliseconds() {
+    return (uint64_t)std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+
+static float GetAngleDelta(float a, float b) {
+    float delta = fabsf(a - b);
+    const float twoPi = 6.28318530718f;
+    if (delta > 3.14159265359f) delta = twoPi - delta;
+    return fabsf(delta);
+}
+
 static void ClearVehicleStateSlot(uint16_t vehicleId) {
     if (vehicleId >= VEHICLE_SLOT_LIMIT) return;
 
@@ -392,6 +422,8 @@ static void ClearVehicleStateSlot(uint16_t vehicleId) {
     memset(&g_LastSentLocalVehicles[vehicleId], 0, sizeof(g_LastSentLocalVehicles[vehicleId]));
     g_KnownVehiclePointers[vehicleId] = 0;
     g_ClaimPending[vehicleId] = false;
+    g_LocalStationarySince[vehicleId] = 0;
+    g_RemoteStationarySince[vehicleId] = 0;
 }
 
 static void RefreshVehicleTopology(uintptr_t game) {
@@ -401,13 +433,25 @@ static void RefreshVehicleTopology(uintptr_t game) {
     const uint32_t safeVehicleCount = (vehicleCount > VEHICLE_SLOT_LIMIT)
         ? VEHICLE_SLOT_LIMIT : vehicleCount;
 
-    if (safeVehicleCount == g_LastKnownVehicleCount) return;
+    bool topologyChanged = (safeVehicleCount != g_LastKnownVehicleCount);
+
+    if (!topologyChanged) {
+        for (uint16_t i = 0; i < safeVehicleCount; ++i) {
+            const uintptr_t currentVehicle = GetVehicleFromIndex(game, i);
+            if (currentVehicle != g_KnownVehiclePointers[i]) {
+                topologyChanged = true;
+                break;
+            }
+        }
+    }
+
+    if (!topologyChanged) return;
 
     std::lock_guard<std::mutex> lock(g_VehicleStateMutex);
 
-    // Game::removeVehicle() compacts the array, so numeric indices can change.
-    // Reset session vehicle ownership whenever the topology changes instead of
-    // accidentally attaching an old owner to a different vehicle.
+    // Vehicle::removeVehicle() compacts the pointer array, so a numeric index
+    // is not a persistent identity. Reset all ownership if the pointer topology
+    // changes instead of assigning an old owner to a different vehicle.
     for (uint16_t i = 0; i < VEHICLE_SLOT_LIMIT; ++i) {
         ClearVehicleStateSlot(i);
     }
@@ -428,12 +472,17 @@ static bool GetVehicleOwner(uint16_t vehicleId, uint8_t* outOwner) {
     return true;
 }
 
-static void QueueVehiclePosition(uint16_t vehicleId, float x, float y, float angle) {
+static void QueueVehiclePosition(uint16_t vehicleId, float x, float y, float angle, bool moving) {
     if (!g_IsConnected.load()) return;
 
     const uint8_t ownerId = g_LocalPlayerId.load();
     if (ownerId == VEHICLE_OWNER_NONE || ownerId >= MAX_PLAYERS) return;
     if (vehicleId >= VEHICLE_SLOT_LIMIT) return;
+
+    {
+        std::lock_guard<std::mutex> lock(g_VehicleStateMutex);
+        if (g_VehicleAuthority[vehicleId].ownerId != ownerId) return;
+    }
 
     VehiclePositionPacket pkt;
     memset(&pkt, 0, sizeof(pkt));
@@ -444,9 +493,10 @@ static void QueueVehiclePosition(uint16_t vehicleId, float x, float y, float ang
     pkt.y = y;
     pkt.angle = angle;
     pkt.sequence = g_LocalVehicleSequence.fetch_add(1) + 1;
+    pkt.moving = moving ? 1 : 0;
 
     std::lock_guard<std::mutex> lock(g_VehicleSendMutex);
-    if (g_PendingVehiclePackets.size() >= 32) {
+    if (g_PendingVehiclePackets.size() >= 64) {
         g_PendingVehiclePackets.erase(g_PendingVehiclePackets.begin());
     }
     g_PendingVehiclePackets.push_back(pkt);
@@ -469,6 +519,25 @@ static void QueueVehicleClaim(uint16_t vehicleId) {
     std::lock_guard<std::mutex> lock(g_VehicleSendMutex);
     g_PendingClaimPacket = pkt;
     g_HasPendingClaimPacket = true;
+}
+
+static void QueueVehicleRelease(uint16_t vehicleId) {
+    if (!g_IsConnected.load() || g_IsHost.load()) return;
+    if (vehicleId >= VEHICLE_SLOT_LIMIT) return;
+
+    const uint8_t ownerId = g_LocalPlayerId.load();
+    if (ownerId == VEHICLE_OWNER_NONE || ownerId >= MAX_PLAYERS) return;
+
+    VehicleReleasePacket pkt;
+    memset(&pkt, 0, sizeof(pkt));
+    pkt.type = PACKET_VEHICLE_RELEASE;
+    pkt.ownerId = ownerId;
+    pkt.vehicleId = vehicleId;
+    pkt.releaseSequence = g_LocalClaimSequence.fetch_add(1) + 1;
+
+    std::lock_guard<std::mutex> lock(g_VehicleSendMutex);
+    g_PendingReleasePacket = pkt;
+    g_HasPendingReleasePacket = true;
 }
 
 static void QueueVehicleAuthority(uint16_t vehicleId, uint8_t ownerId, uint32_t generation) {
@@ -515,6 +584,9 @@ static bool AssignVehicleAuthority(uint16_t vehicleId, uint8_t requestedOwner, b
         if (changed) {
             memset(&g_RemoteVehicles[vehicleId], 0, sizeof(g_RemoteVehicles[vehicleId]));
             g_ClaimPending[vehicleId] = false;
+            g_LocalStationarySince[vehicleId] = 0;
+            g_RemoteStationarySince[vehicleId] = 0;
+            memset(&g_LastSentLocalVehicles[vehicleId], 0, sizeof(g_LastSentLocalVehicles[vehicleId]));
         }
     }
 
@@ -523,6 +595,39 @@ static bool AssignVehicleAuthority(uint16_t vehicleId, uint8_t requestedOwner, b
     }
 
     return changed || finalOwner == requestedOwner;
+}
+
+static bool ReleaseVehicleAuthority(uint16_t vehicleId, uint8_t requestedOwner, bool notifyClient) {
+    if (vehicleId >= VEHICLE_SLOT_LIMIT) return false;
+    if (requestedOwner >= MAX_PLAYERS) return false;
+
+    uint32_t generation = 0;
+
+    {
+        std::lock_guard<std::mutex> lock(g_VehicleStateMutex);
+        VehicleAuthorityState& auth = g_VehicleAuthority[vehicleId];
+
+        if (auth.ownerId != requestedOwner) return false;
+
+        auth.ownerId = VEHICLE_OWNER_NONE;
+        auth.generation++;
+        generation = auth.generation;
+
+        memset(&g_RemoteVehicles[vehicleId], 0, sizeof(g_RemoteVehicles[vehicleId]));
+        memset(&g_LocalSamples[vehicleId], 0, sizeof(g_LocalSamples[vehicleId]));
+        memset(&g_LastSentLocalVehicles[vehicleId], 0, sizeof(g_LastSentLocalVehicles[vehicleId]));
+        g_ClaimPending[vehicleId] = false;
+        g_LocalStationarySince[vehicleId] = 0;
+        g_RemoteStationarySince[vehicleId] = 0;
+    }
+
+    if (notifyClient && g_IsHost.load() && g_IsConnected.load()) {
+        QueueVehicleAuthority(vehicleId, VEHICLE_OWNER_NONE, generation);
+    }
+
+    LOGI("[AUTHORITY] released vehicle=%u owner=%u generation=%u",
+         (unsigned)vehicleId, (unsigned)requestedOwner, (unsigned)generation);
+    return true;
 }
 
 static bool TryClaimLocalVehicle(uint16_t vehicleId) {
@@ -583,55 +688,9 @@ static void CaptureAndQueueLocalVehicleState(uintptr_t game) {
     const uint8_t localOwner = g_LocalPlayerId.load();
     if (localOwner == VEHICLE_OWNER_NONE || localOwner >= MAX_PLAYERS) return;
 
-    // First, use the active vehicle to detect a real local input/movement event.
-    // An unowned vehicle is not claimed merely by entering it and standing still.
-    if (activeVehicleId != VEHICLE_ID_INVALID && activeVehicleId < vehicleCount) {
-        uintptr_t activeVehicle = GetVehicleFromIndex(game, activeVehicleId);
-        if (activeVehicle != 0) {
-            float x = 0.0f;
-            float y = 0.0f;
-            float angle = 0.0f;
-            g_VehicleGetPosition((void*)activeVehicle, &x, &y);
-            angle = g_VehicleGetOrientation((void*)activeVehicle);
+    const uint64_t nowMs = GetMonotonicMilliseconds();
 
-            bool claimVehicle = false;
-            {
-                std::lock_guard<std::mutex> lock(g_VehicleStateMutex);
-                VehicleSampleState& sample = g_LocalSamples[activeVehicleId];
-                if (!sample.valid) {
-                    sample.valid = true;
-                    sample.x = x;
-                    sample.y = y;
-                    sample.angle = angle;
-                } else {
-                    const bool moved = fabsf(x - sample.x) > CLAIM_POSITION_EPSILON ||
-                                       fabsf(y - sample.y) > CLAIM_POSITION_EPSILON;
-                    const bool rotated = fabsf(angle - sample.angle) > CLAIM_ANGLE_EPSILON;
-
-                    if (moved || rotated) {
-                        if (g_VehicleAuthority[activeVehicleId].ownerId == VEHICLE_OWNER_NONE) {
-                            claimVehicle = true;
-                        }
-                    }
-
-                    sample.x = x;
-                    sample.y = y;
-                    sample.angle = angle;
-                }
-            }
-
-            if (claimVehicle) {
-                TryClaimLocalVehicle(activeVehicleId);
-            }
-        }
-    }
-
-    // Sync every vehicle currently owned by this player, not only the active one.
-    // This keeps the previous vehicle alive on the network after switching vehicles.
     for (uint16_t vehicleId = 0; vehicleId < vehicleCount; ++vehicleId) {
-        uint8_t ownerId = VEHICLE_OWNER_NONE;
-        if (!GetVehicleOwner(vehicleId, &ownerId) || ownerId != localOwner) continue;
-
         uintptr_t vehicle = GetVehicleFromIndex(game, vehicleId);
         if (vehicle == 0) continue;
 
@@ -641,30 +700,64 @@ static void CaptureAndQueueLocalVehicleState(uintptr_t game) {
         g_VehicleGetPosition((void*)vehicle, &x, &y);
         angle = g_VehicleGetOrientation((void*)vehicle);
 
-        bool changed = false;
+        bool moved = false;
+        bool rotated = false;
+        uint8_t ownerId = VEHICLE_OWNER_NONE;
+
         {
             std::lock_guard<std::mutex> lock(g_VehicleStateMutex);
-            VehicleSampleState& lastSent = g_LastSentLocalVehicles[vehicleId];
+            VehicleSampleState& sample = g_LocalSamples[vehicleId];
 
-            if (!lastSent.valid) {
-                changed = true;
+            if (sample.valid) {
+                moved = fabsf(x - sample.x) > CLAIM_POSITION_EPSILON ||
+                        fabsf(y - sample.y) > CLAIM_POSITION_EPSILON;
+                rotated = GetAngleDelta(angle, sample.angle) > CLAIM_ANGLE_EPSILON;
+            }
+
+            sample.valid = true;
+            sample.x = x;
+            sample.y = y;
+            sample.angle = angle;
+
+            ownerId = g_VehicleAuthority[vehicleId].ownerId;
+        }
+
+        // An unowned vehicle is claimed only by the player who is currently using
+        // it and actually starts moving or turning it. Standing in a vehicle does
+        // not win ownership by itself.
+        if (ownerId == VEHICLE_OWNER_NONE && vehicleId == activeVehicleId && (moved || rotated)) {
+            TryClaimLocalVehicle(vehicleId);
+            continue;
+        }
+
+        if (ownerId != localOwner) continue;
+
+        const bool moving = moved || rotated;
+
+        if (moving) {
+            g_LocalStationarySince[vehicleId] = 0;
+        } else if (g_LocalStationarySince[vehicleId] == 0) {
+            g_LocalStationarySince[vehicleId] = nowMs;
+        }
+
+        // Keep broadcasting the owner state even when the vehicle is stationary.
+        // This prevents the remote copy from appearing to stop receiving data.
+        const bool stoppedLongEnough =
+            g_LocalStationarySince[vehicleId] != 0 &&
+            (nowMs - g_LocalStationarySince[vehicleId]) >= VEHICLE_STOP_RELEASE_MS;
+
+        if (stoppedLongEnough) {
+            if (g_IsHost.load()) {
+                ReleaseVehicleAuthority(vehicleId, localOwner, true);
             } else {
-                changed = (fabsf(x - lastSent.x) > POSITION_EPSILON) ||
-                          (fabsf(y - lastSent.y) > POSITION_EPSILON) ||
-                          (fabsf(angle - lastSent.angle) > ANGLE_EPSILON);
+                QueueVehicleRelease(vehicleId);
+                std::lock_guard<std::mutex> lock(g_VehicleStateMutex);
+                g_ClaimPending[vehicleId] = true;
             }
-
-            if (changed) {
-                lastSent.valid = true;
-                lastSent.x = x;
-                lastSent.y = y;
-                lastSent.angle = angle;
-            }
+            continue;
         }
 
-        if (changed) {
-            QueueVehiclePosition(vehicleId, x, y, angle);
-        }
+        QueueVehiclePosition(vehicleId, x, y, angle, moving);
     }
 }
 
@@ -774,7 +867,13 @@ static void HandleVehicleAuthorityPacket(const VehicleAuthorityPacket& pkt) {
     auth.generation = pkt.generation;
     g_ClaimPending[pkt.vehicleId] = false;
 
-    if (ownerChanged || pkt.ownerId == g_LocalPlayerId.load()) {
+    if (ownerChanged) {
+        memset(&g_RemoteVehicles[pkt.vehicleId], 0, sizeof(g_RemoteVehicles[pkt.vehicleId]));
+        memset(&g_LocalSamples[pkt.vehicleId], 0, sizeof(g_LocalSamples[pkt.vehicleId]));
+        memset(&g_LastSentLocalVehicles[pkt.vehicleId], 0, sizeof(g_LastSentLocalVehicles[pkt.vehicleId]));
+        g_LocalStationarySince[pkt.vehicleId] = 0;
+        g_RemoteStationarySince[pkt.vehicleId] = 0;
+    } else if (pkt.ownerId == g_LocalPlayerId.load()) {
         memset(&g_RemoteVehicles[pkt.vehicleId], 0, sizeof(g_RemoteVehicles[pkt.vehicleId]));
     }
 
@@ -791,13 +890,14 @@ static void HandleVehiclePositionPacket(const VehiclePositionPacket& pkt) {
     const uint8_t localOwner = g_LocalPlayerId.load();
     if (pkt.ownerId == localOwner) return;
 
-    uint8_t authorityOwner = VEHICLE_OWNER_NONE;
+    bool shouldRelease = false;
+    const uint64_t nowMs = GetMonotonicMilliseconds();
+
     {
         std::lock_guard<std::mutex> lock(g_VehicleStateMutex);
-        authorityOwner = g_VehicleAuthority[pkt.vehicleId].ownerId;
+        const uint8_t authorityOwner = g_VehicleAuthority[pkt.vehicleId].ownerId;
 
-        // Position packets are accepted only after the authoritative owner is known.
-        // Authority is assigned by the host through claim arbitration.
+        // Only the current authoritative owner is allowed to update this vehicle.
         if (authorityOwner == VEHICLE_OWNER_NONE) return;
         if (authorityOwner != pkt.ownerId) return;
 
@@ -812,7 +912,32 @@ static void HandleVehiclePositionPacket(const VehiclePositionPacket& pkt) {
         state.angle = pkt.angle;
         state.sequence = pkt.sequence;
         state.appliedSequence = 0;
+        state.moving = (pkt.moving != 0);
+
+        if (pkt.moving != 0) {
+            g_RemoteStationarySince[pkt.vehicleId] = 0;
+        } else if (g_RemoteStationarySince[pkt.vehicleId] == 0) {
+            g_RemoteStationarySince[pkt.vehicleId] = nowMs;
+        }
+
+        if (g_IsHost.load() && pkt.moving == 0 &&
+            g_RemoteStationarySince[pkt.vehicleId] != 0 &&
+            (nowMs - g_RemoteStationarySince[pkt.vehicleId]) >= VEHICLE_STOP_RELEASE_MS) {
+            shouldRelease = true;
+        }
     }
+
+    if (shouldRelease && g_IsHost.load()) {
+        ReleaseVehicleAuthority(pkt.vehicleId, pkt.ownerId, true);
+    }
+}
+
+static void HandleVehicleReleasePacket(const VehicleReleasePacket& pkt) {
+    if (!g_IsHost.load()) return;
+    if (pkt.ownerId >= MAX_PLAYERS) return;
+    if (pkt.vehicleId >= VEHICLE_SLOT_LIMIT) return;
+
+    ReleaseVehicleAuthority(pkt.vehicleId, pkt.ownerId, true);
 }
 
 static void ResetVehicleSyncState() {
@@ -835,6 +960,8 @@ static void ResetVehicleSyncState() {
         g_PendingAuthorityPackets.clear();
         memset(&g_PendingClaimPacket, 0, sizeof(g_PendingClaimPacket));
         g_HasPendingClaimPacket = false;
+        memset(&g_PendingReleasePacket, 0, sizeof(g_PendingReleasePacket));
+        g_HasPendingReleasePacket = false;
     }
 }
 
@@ -1021,6 +1148,33 @@ GLuint LoadTextureFromPNGArray(const unsigned char* png_data, int data_len) {
     return textureID;
 }
 
+// Send the current authority table to a newly connected client.
+static void QueueAllCurrentAuthorities() {
+    if (!g_IsHost.load() || !g_IsConnected.load()) return;
+
+    std::vector<VehicleAuthorityPacket> packets;
+    {
+        std::lock_guard<std::mutex> lock(g_VehicleStateMutex);
+        for (uint16_t vehicleId = 0; vehicleId < VEHICLE_SLOT_LIMIT; ++vehicleId) {
+            const VehicleAuthorityState& auth = g_VehicleAuthority[vehicleId];
+            if (auth.ownerId == VEHICLE_OWNER_NONE) continue;
+
+            VehicleAuthorityPacket pkt;
+            memset(&pkt, 0, sizeof(pkt));
+            pkt.type = PACKET_VEHICLE_AUTHORITY;
+            pkt.ownerId = auth.ownerId;
+            pkt.vehicleId = vehicleId;
+            pkt.generation = auth.generation;
+            packets.push_back(pkt);
+        }
+    }
+
+    if (!packets.empty()) {
+        std::lock_guard<std::mutex> lock(g_VehicleSendMutex);
+        g_PendingAuthorityPackets.insert(g_PendingAuthorityPackets.end(), packets.begin(), packets.end());
+    }
+}
+
 // ========================================================================
 // NETWORK THREADS
 // ========================================================================
@@ -1068,6 +1222,8 @@ void NetworkLoop() {
                 packetSize = sizeof(VehicleClaimPacket);
             } else if (packetType == PACKET_VEHICLE_AUTHORITY) {
                 packetSize = sizeof(VehicleAuthorityPacket);
+            } else if (packetType == PACKET_VEHICLE_RELEASE) {
+                packetSize = sizeof(VehicleReleasePacket);
             } else {
                 g_IsConnected.store(false);
                 break;
@@ -1107,6 +1263,10 @@ void NetworkLoop() {
                 VehicleAuthorityPacket pkt;
                 memcpy(&pkt, recvBuffer, sizeof(pkt));
                 HandleVehicleAuthorityPacket(pkt);
+            } else if (packetType == PACKET_VEHICLE_RELEASE) {
+                VehicleReleasePacket pkt;
+                memcpy(&pkt, recvBuffer, sizeof(pkt));
+                HandleVehicleReleasePacket(pkt);
             }
 
             bufferedBytes -= packetSize;
@@ -1152,6 +1312,26 @@ void NetworkLoop() {
 
             if (hasClaim) {
                 if (!SendAllBytes(g_TcpSocket, &claimPkt, sizeof(claimPkt))) {
+                    g_IsConnected.store(false);
+                    break;
+                }
+            }
+        }
+
+        if (g_IsConnected.load()) {
+            VehicleReleasePacket releasePkt;
+            bool hasRelease = false;
+            {
+                std::lock_guard<std::mutex> lock(g_VehicleSendMutex);
+                if (g_HasPendingReleasePacket) {
+                    releasePkt = g_PendingReleasePacket;
+                    g_HasPendingReleasePacket = false;
+                    hasRelease = true;
+                }
+            }
+
+            if (hasRelease) {
+                if (!SendAllBytes(g_TcpSocket, &releasePkt, sizeof(releasePkt))) {
                     g_IsConnected.store(false);
                     break;
                 }
@@ -1314,6 +1494,7 @@ void TCPHostThread() {
             g_IsConnected = true;
             g_ConnectedStatus = "Client Connected!";
             ShowNativeToast("Client Joined the Room!");
+            QueueAllCurrentAuthorities();
             NetworkLoop();
         }
     }
