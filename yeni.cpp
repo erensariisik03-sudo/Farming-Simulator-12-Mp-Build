@@ -324,7 +324,7 @@ static_assert(sizeof(SessionWelcomePacket) == 4, "SessionWelcomePacket size mism
 static_assert(sizeof(NetworkPacket) == 256, "NetworkPacket size mismatch");
 static_assert(sizeof(VehiclePositionPacket) == 21, "VehiclePositionPacket size mismatch");
 static_assert(sizeof(VehicleSnapshotHeader) == 8, "VehicleSnapshotHeader size mismatch");
-static_assert(sizeof(VehicleSnapshotEntry) == 17, "VehicleSnapshotEntry size mismatch");
+static_assert(sizeof(VehicleSnapshotEntry) == 19, "VehicleSnapshotEntry size mismatch");
 static_assert(sizeof(VehicleClaimPacket) == 8, "VehicleClaimPacket size mismatch");
 static_assert(sizeof(VehicleAuthorityPacket) == 8, "VehicleAuthorityPacket size mismatch");
 static_assert(sizeof(VehicleReleasePacket) == 8, "VehicleReleasePacket size mismatch");
