@@ -23,6 +23,7 @@
 #include <net/if.h>
 #include <cerrno>
 #include <math.h>
+#include <algorithm>
 
 #include "Substrate.h"
 #include "imgui.h"
@@ -46,12 +47,16 @@
 JavaVM* g_GlobalJavaVM = nullptr; 
 
 GLuint g_MultiplayerButtonTexture = 0;
+GLuint g_GameMenuBackgroundTexture = 0;
 bool g_ImGuiInitialized = false;
 bool g_TextureLoaded = false;
+bool g_GameMenuBackgroundLoaded = false;
 bool g_IsMultiplayerMenuActive = false;
 
 int g_ButtonOrigWidth = 0;
 int g_ButtonOrigHeight = 0;
+int g_GameMenuBackgroundWidth = 0;
+int g_GameMenuBackgroundHeight = 0;
 
 std::atomic<float> g_TouchX(0.0f);
 std::atomic<float> g_TouchY(0.0f);
@@ -1307,20 +1312,41 @@ void CloseAndroidKeyboard() {
     }
 }
 
-GLuint LoadTextureFromPNGArray(const unsigned char* png_data, int data_len) {
-    int channels;
-    unsigned char* pixels = stbi_load_from_memory(png_data, data_len, &g_ButtonOrigWidth, &g_ButtonOrigHeight, &channels, 4);
-    if (!pixels) return 0;
-    GLuint textureID;
+GLuint LoadTextureFromPNGArrayEx(const unsigned char* png_data, int data_len, int* outWidth, int* outHeight) {
+    if (!png_data || data_len <= 0) return 0;
+
+    int width = 0;
+    int height = 0;
+    int channels = 0;
+    unsigned char* pixels = stbi_load_from_memory(png_data, data_len, &width, &height, &channels, 4);
+    if (!pixels || width <= 0 || height <= 0) {
+        if (pixels) stbi_image_free(pixels);
+        return 0;
+    }
+
+    GLuint textureID = 0;
     glGenTextures(1, &textureID);
+    if (textureID == 0) {
+        stbi_image_free(pixels);
+        return 0;
+    }
+
     glBindTexture(GL_TEXTURE_2D, textureID);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, g_ButtonOrigWidth, g_ButtonOrigHeight, 0, GL_RGBA, GL_UNSIGNED_BYTE, pixels);
-    stbi_image_free(pixels); 
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, width, height, 0, GL_RGBA, GL_UNSIGNED_BYTE, pixels);
+    glBindTexture(GL_TEXTURE_2D, 0);
+    stbi_image_free(pixels);
+
+    if (outWidth) *outWidth = width;
+    if (outHeight) *outHeight = height;
     return textureID;
+}
+
+GLuint LoadTextureFromPNGArray(const unsigned char* png_data, int data_len) {
+    return LoadTextureFromPNGArrayEx(png_data, data_len, &g_ButtonOrigWidth, &g_ButtonOrigHeight);
 }
 
 // Send the current authority table to a newly connected client.
@@ -1943,276 +1969,419 @@ int32_t my_AInputQueue_getEvent(void* queue, AInputEvent** outEvent) {
     return result; 
 }
 
+// ========================================================================
+// GAME-STYLE MENU UI HELPERS
+// ========================================================================
+static ImTextureID ToImGuiTexture(GLuint texture) {
+    return (ImTextureID)(intptr_t)texture;
+}
+
+static bool DrawGameStyleButton(const char* id, const char* label, ImVec2 size, float textScale = 1.0f) {
+    if (g_MultiplayerButtonTexture == 0) return false;
+
+    ImVec2 pos = ImGui::GetCursorScreenPos();
+    const bool clicked = ImGui::InvisibleButton(id, size);
+    const bool hovered = ImGui::IsItemHovered();
+    const bool active = ImGui::IsItemActive();
+
+    ImDrawList* draw = ImGui::GetWindowDrawList();
+    draw->AddImage(ToImGuiTexture(g_MultiplayerButtonTexture), pos,
+                   ImVec2(pos.x + size.x, pos.y + size.y));
+
+    if (hovered) {
+        draw->AddRectFilled(pos, ImVec2(pos.x + size.x, pos.y + size.y),
+                            IM_COL32(255, 255, 255, active ? 18 : 10), 2.0f);
+    }
+
+    ImVec2 textSize = ImGui::CalcTextSize(label);
+    textSize.x *= textScale;
+    textSize.y *= textScale;
+    ImVec2 textPos(
+        pos.x + (size.x - textSize.x) * 0.5f,
+        pos.y + (size.y - textSize.y) * 0.5f
+    );
+
+    draw->AddText(nullptr, ImGui::GetFontSize() * textScale, textPos,
+                  IM_COL32(245, 245, 245, 255), label);
+    return clicked;
+}
+
+static void DrawGameSectionTitle(const char* title, float width) {
+    ImDrawList* draw = ImGui::GetWindowDrawList();
+    ImVec2 p = ImGui::GetCursorScreenPos();
+    draw->AddText(p, IM_COL32(255, 255, 255, 255), title);
+    const float lineY = p.y + ImGui::GetTextLineHeight() + 7.0f;
+    draw->AddLine(ImVec2(p.x, lineY), ImVec2(p.x + width, lineY),
+                  IM_COL32(255, 255, 255, 85), 1.0f);
+    ImGui::Dummy(ImVec2(width, ImGui::GetTextLineHeight() + 13.0f));
+}
+
+static void DrawGameStatusText(const char* label, const std::string& value, float width) {
+    ImDrawList* draw = ImGui::GetWindowDrawList();
+    ImVec2 p = ImGui::GetCursorScreenPos();
+    draw->AddText(p, IM_COL32(225, 225, 225, 255), label);
+    ImVec2 labelSize = ImGui::CalcTextSize(label);
+    draw->AddText(ImVec2(p.x + labelSize.x + 10.0f, p.y),
+                  IM_COL32(120, 225, 245, 255), value.c_str());
+    ImGui::Dummy(ImVec2(width, ImGui::GetTextLineHeight() + 3.0f));
+}
+
+static void DrawGamePanel(ImVec2 minPos, ImVec2 maxPos, int alpha = 158) {
+    ImDrawList* draw = ImGui::GetWindowDrawList();
+    draw->AddRectFilled(minPos, maxPos, IM_COL32(5, 8, 10, alpha), 3.0f);
+    draw->AddRect(minPos, maxPos, IM_COL32(255, 255, 255, 55), 3.0f, 0, 1.0f);
+}
+
 void DrawImGui() {
     if (!g_ImGuiInitialized) {
         ImGui::CreateContext();
-        ImGui_ImplOpenGL3_Init("#version 100");
         ImGui::StyleColorsDark();
+        ImGui_ImplOpenGL3_Init("#version 100");
         g_ImGuiInitialized = true;
     }
 
-    if (g_ImGuiInitialized) {
-        ImGuiIO& io = ImGui::GetIO();
-        GLint viewport[4];
-        glGetIntegerv(GL_VIEWPORT, viewport);
-        io.DisplaySize = ImVec2((float)viewport[2], (float)viewport[3]);
-        io.DeltaTime = 1.0f / 60.0f;
-        
-        float uiScale = (float)viewport[3] / 400.0f; 
-        if (uiScale < 1.4f) uiScale = 1.4f;
-        if (uiScale > 2.5f) uiScale = 2.5f;
-        io.FontGlobalScale = uiScale;
+    if (!g_ImGuiInitialized) return;
 
-        io.AddMousePosEvent(g_TouchX.load(), g_TouchY.load());
-        io.AddMouseButtonEvent(0, g_TouchDown.load());
-
-        ImGui_ImplOpenGL3_NewFrame();
-        ImGui::NewFrame();
-
-        // MENU TOGGLE BUTTON
-        if (g_CurrentMenu != MENU_INGAME && g_MultiplayerButtonTexture != 0) {
-            float posX = 0.0f, posY = 0.0f;
-            float targetWidth = 100.0f, targetHeight = 50.0f;
-
-            if (g_CurrentMenu == MENU_SETTINGS) {
-                posY = (float)viewport[3] * 0.010f; 
-                targetWidth = (float)viewport[2] * 0.335f; 
-                targetHeight = (float)viewport[3] * 0.2f; 
-            } else if (g_CurrentMenu == MENU_SAVELOAD) {
-                posX = (float)viewport[2] * 0.005f; 
-                posY = (float)viewport[3] * 0.010f; 
-                targetWidth = (float)viewport[2] * 0.220f; 
-                targetHeight = (float)viewport[3] * 0.14f; 
-            }
-
-            ImGui::SetNextWindowPos(ImVec2(posX, posY), ImGuiCond_Always); 
-            ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0, 0));
-            ImGui::Begin("Mod Menu", nullptr, ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoBackground | ImGuiWindowFlags_NoResize | ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoSavedSettings); 
-            
-            ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(0, 0));
-            ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.0f, 0.0f, 0.0f, 0.0f));       
-            ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.0f, 0.0f, 0.0f, 0.0f)); 
-            ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(0.0f, 0.0f, 0.0f, 0.0f));  
-
-            if (ImGui::ImageButton("MP_BTN", (ImTextureID)(intptr_t)g_MultiplayerButtonTexture, ImVec2(targetWidth, targetHeight))) {
-                g_IsMultiplayerMenuActive = !g_IsMultiplayerMenuActive;
-            }
-
-            ImGui::PopStyleColor(3);
-            ImGui::PopStyleVar(2);
-            ImGui::End();
-        }
-
-        if (g_IsMultiplayerMenuActive) {
-            float winWidth = (float)viewport[2] * 0.82f;
-            float winHeight = (float)viewport[3] * 0.88f;
-            
-            ImGui::SetNextWindowPos(ImVec2(((float)viewport[2] - winWidth) * 0.5f, ((float)viewport[3] - winHeight) * 0.5f), ImGuiCond_Always);
-            ImGui::SetNextWindowSize(ImVec2(winWidth, winHeight), ImGuiCond_Always);
-            
-            ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(16.0f, 16.0f));
-            ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(10.0f, 12.0f));
-
-            auto RenderChatUI = [&]() {
-                ImGui::Separator();
-                ImGui::Text("Chat Panel:");
-                
-                float chatBoxHeight = winHeight * 0.33f;
-                ImGui::BeginChild("ChatHistory", ImVec2(-1.0f, chatBoxHeight), true);
-                {
-                    std::lock_guard<std::mutex> lock(g_ChatMutex);
-                    for (const auto& msg : g_ChatMessages) {
-                        ImGui::TextWrapped("%s", msg.c_str());
-                    }
-                    if (ImGui::GetScrollY() >= ImGui::GetScrollMaxY())
-                        ImGui::SetScrollHereY(1.0f);
-                }
-                ImGui::EndChild();
-
-                static char inputBuffer[200] = "";
-                float sendBtnWidth = 110.0f * (uiScale / 1.5f);
-                float inputWidth = ImGui::GetContentRegionAvail().x - sendBtnWidth - 10.0f;
-
-                ImGui::SetNextItemWidth(inputWidth);
-                bool enterPressed = ImGui::InputText("##ChatInput", inputBuffer, IM_ARRAYSIZE(inputBuffer), ImGuiInputTextFlags_EnterReturnsTrue);
-                
-                if (ImGui::IsItemClicked()) {
-                    OpenAndroidKeyboard();
-                }
-
-                ImGui::SameLine();
-                if (ImGui::Button("Send", ImVec2(sendBtnWidth, 42.0f * (uiScale / 1.5f))) || enterPressed) {
-                    if (strlen(inputBuffer) > 0) {
-                        std::string msgStr(inputBuffer);
-                        {
-                            std::lock_guard<std::mutex> lock(g_ChatMutex);
-                            g_ChatMessages.push_back("You: " + msgStr);
-                        }
-                        {
-                            std::lock_guard<std::mutex> lock(g_OutgoingChatMutex);
-                            g_OutgoingChats.push_back(msgStr);
-                        }
-                        memset(inputBuffer, 0, sizeof(inputBuffer)); 
-                    }
-                    CloseAndroidKeyboard(); 
-                }
-            };
-            
-            // MENU_SETTINGS (HOST MENU)
-            if (g_CurrentMenu == MENU_SETTINGS) {
-                ImGui::Begin("Settings Menu", &g_IsMultiplayerMenuActive, ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove);
-                
-                if (g_IsClient && g_IsConnected) {
-                    ImGui::TextColored(ImVec4(0.0f, 0.85f, 1.0f, 1.0f), "Network Status: %s", g_ConnectedStatus.c_str());
-                    ImGui::Separator();
-                    
-                    ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.8f, 0.1f, 0.1f, 1.0f)); 
-                    ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.9f, 0.2f, 0.2f, 1.0f));
-                    ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(0.7f, 0.05f, 0.05f, 1.0f));
-                    
-                    if (ImGui::Button("Leave Room", ImVec2(-1.0f, 60.0f * (uiScale / 1.5f)))) {
-                        ClearChat(); 
-                        g_IsClient = false; 
-                        g_IsConnected = false;
-                        if (g_TcpSocket >= 0) {
-                            shutdown(g_TcpSocket, SHUT_RDWR);
-                            close(g_TcpSocket);
-                            g_TcpSocket = -1;
-                        }
-                        g_ConnectedStatus = "Left the room.";
-                    }
-                    ImGui::PopStyleColor(3);
-
-                    RenderChatUI();
-                } else {
-                    ImGui::Text("Game Status: %s", (g_StartMenuInstance != 0) ? "Game Hooked" : "Waiting for pointer...");
-                    ImGui::TextColored(ImVec4(0.0f, 0.85f, 1.0f, 1.0f), "Network Status: %s", g_ConnectedStatus.c_str());
-                    ImGui::Separator();
-
-                    if (!g_IsHost) {
-                        if (ImGui::Button("Host Room", ImVec2(-1.0f, 80.0f * (uiScale / 1.5f)))) {
-                            ClearChat(); 
-                            g_IsHost = true;
-                            std::thread(TCPHostThread).detach();
-                        }
-                    } else {
-                        if (ImGui::Button("Close Room", ImVec2(-1.0f, 80.0f * (uiScale / 1.5f)))) {
-                            ClearChat(); 
-                            g_IsHost = false; 
-                            g_IsConnected = false;
-                            
-                            if (g_TcpServerFd >= 0) {
-                                shutdown(g_TcpServerFd, SHUT_RDWR); 
-                                close(g_TcpServerFd);
-                                g_TcpServerFd = -1;
-                            }
-                            if (g_TcpSocket >= 0) {
-                                shutdown(g_TcpSocket, SHUT_RDWR);
-                                close(g_TcpSocket);
-                                g_TcpSocket = -1;
-                            }
-                            
-                            g_ConnectedStatus = "Room Closed.";
-                        }
-                    }
-
-                    if (g_IsConnected) {
-                        RenderChatUI();
-                    }
-                }
-                ImGui::End();
-            }
-            // MENU_SAVELOAD (CLIENT JOIN MENU)
-            else if (g_CurrentMenu == MENU_SAVELOAD) {
-                ImGui::Begin("Server Browser (Client)", &g_IsMultiplayerMenuActive, ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove);
-                ImGui::Text("Game Status: %s", (g_MenuInstance != 0) ? "Game Hooked" : "Waiting for pointer...");
-                ImGui::TextColored(ImVec4(0.0f, 0.85f, 1.0f, 1.0f), "Network Status: %s", g_ConnectedStatus.c_str());
-                ImGui::Separator();
-
-                if (!g_IsConnected) {
-                    ImGui::Text("Username:");
-                    ImGui::SetNextItemWidth(-1.0f);
-                    
-                    bool nickEnterPressed = ImGui::InputText("##NicknameInput", g_Nickname, IM_ARRAYSIZE(g_Nickname), ImGuiInputTextFlags_EnterReturnsTrue);
-                    if (ImGui::IsItemClicked()) {
-                        OpenAndroidKeyboard();
-                    }
-                    if (nickEnterPressed) {
-                        CloseAndroidKeyboard(); 
-                    }
-                    
-                    ImGui::Spacing();
-
-                    if (ImGui::Button(g_IsSearching.load() ? "Searching..." : "Scan Networks", ImVec2(-1.0f, 50.0f * (uiScale / 1.5f)))) {
-                        if (!g_IsSearching.load()) {
-                            g_IsSearching.store(true);
-                            std::thread(StartLANDiscoveryThread).detach();
-                        }
-                    }
-                    
-                    ImGui::Separator();
-                    ImGui::Text("Discovered Rooms (Tap to join):");
-                    
-                    {
-                        std::lock_guard<std::mutex> lock(g_PeerMutex);
-                        if (g_DiscoveredPeers.empty()) {
-                            ImGui::TextDisabled("No active rooms found yet.");
-                        } else {
-                            for (size_t i = 0; i < g_DiscoveredPeers.size(); i++) {
-                                std::string label = g_DiscoveredPeers[i].name + " [" + g_DiscoveredPeers[i].ip + "]"; 
-                                if (ImGui::Button(label.c_str(), ImVec2(-1.0f, 48.0f * (uiScale / 1.5f)))) {
-                                    if (!g_IsHost.load() && !g_IsClient.load()) {
-                                        ClearChat(); 
-                                        g_IsClient.store(true);
-                                        std::string targetIP = g_DiscoveredPeers[i].ip;
-                                        std::thread(TCPClientThread, targetIP).detach();
-                                    }
-                                }
-                            }
-                        }
-                    }
-                } else {
-                    ImGui::Spacing();
-                    ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.1f, 0.6f, 0.1f, 1.0f)); 
-                    ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.2f, 0.8f, 0.2f, 1.0f));
-                    ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(0.05f, 0.5f, 0.05f, 1.0f));
-                    if (ImGui::Button("JOIN GAME (START NOW)", ImVec2(-1.0f, 60.0f * (uiScale / 1.5f)))) {
-                        AutoStartGameForClient();
-                    }
-                    ImGui::PopStyleColor(3);
-                    ImGui::Spacing();
-
-                    if (ImGui::Button("Disconnect", ImVec2(-1.0f, 40.0f * (uiScale / 1.5f)))) {
-                        ClearChat(); 
-                        g_IsHost = false; g_IsClient = false; g_IsConnected = false;
-                        if (g_TcpSocket >= 0) {
-                            shutdown(g_TcpSocket, SHUT_RDWR);
-                            close(g_TcpSocket);
-                            g_TcpSocket = -1;
-                        }
-                    }
-                    
-                    RenderChatUI();
-                }
-                ImGui::End();
-            }
-            ImGui::PopStyleVar(2);
-        }
-
-        ImGui::Render();
-        
-        // SAVE AND RESTORE OPENGL STATE
-        GLboolean depthTestEnabled = glIsEnabled(GL_DEPTH_TEST);
-        GLboolean cullFaceEnabled = glIsEnabled(GL_CULL_FACE);
-
-        glDisable(GL_DEPTH_TEST);
-        glDisable(GL_CULL_FACE);
-        
-        ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
-        
-        if (depthTestEnabled) glEnable(GL_DEPTH_TEST);
-        if (cullFaceEnabled) glEnable(GL_CULL_FACE);
+    // Load both embedded textures lazily while a valid GL context is active.
+    if (!g_TextureLoaded) {
+        g_MultiplayerButtonTexture = LoadTextureFromPNGArray(buton_png_data, buton_png_len);
+        g_TextureLoaded = (g_MultiplayerButtonTexture != 0);
     }
+    if (!g_GameMenuBackgroundLoaded) {
+        g_GameMenuBackgroundTexture = LoadTextureFromPNGArrayEx(
+            game_menu_bg_png_data, game_menu_bg_png_len,
+            &g_GameMenuBackgroundWidth, &g_GameMenuBackgroundHeight
+        );
+        g_GameMenuBackgroundLoaded = (g_GameMenuBackgroundTexture != 0);
+    }
+
+    ImGuiIO& io = ImGui::GetIO();
+    GLint viewport[4] = {0, 0, 0, 0};
+    glGetIntegerv(GL_VIEWPORT, viewport);
+    io.DisplaySize = ImVec2((float)viewport[2], (float)viewport[3]);
+    io.DeltaTime = 1.0f / 60.0f;
+
+    const float uiScale = std::max(1.4f, std::min(2.5f, (float)viewport[3] / 400.0f));
+    io.FontGlobalScale = uiScale;
+
+    io.AddMousePosEvent(g_TouchX.load(), g_TouchY.load());
+    io.AddMouseButtonEvent(0, g_TouchDown.load());
+
+    ImGui_ImplOpenGL3_NewFrame();
+    ImGui::NewFrame();
+
+    // Keep the original small entry button when the full multiplayer screen is closed.
+    if (g_CurrentMenu != MENU_INGAME && !g_IsMultiplayerMenuActive && g_MultiplayerButtonTexture != 0) {
+        float posX = 6.0f;
+        float posY = 6.0f;
+        float targetWidth = (float)viewport[2] * 0.22f;
+        float targetHeight = targetWidth / 3.0f;
+
+        if (g_CurrentMenu == MENU_SETTINGS) {
+            targetWidth = (float)viewport[2] * 0.335f;
+            targetHeight = targetWidth / 3.0f;
+        }
+
+        ImGui::SetNextWindowPos(ImVec2(posX, posY), ImGuiCond_Always);
+        ImGui::SetNextWindowSize(ImVec2(targetWidth, targetHeight), ImGuiCond_Always);
+        ImGui::Begin("##MPEntryButton", nullptr,
+                     ImGuiWindowFlags_NoTitleBar |
+                     ImGuiWindowFlags_NoBackground |
+                     ImGuiWindowFlags_NoResize |
+                     ImGuiWindowFlags_NoMove |
+                     ImGuiWindowFlags_NoSavedSettings |
+                     ImGuiWindowFlags_NoScrollbar |
+                     ImGuiWindowFlags_NoScrollWithMouse);
+        if (DrawGameStyleButton("##MPEntry", "MULTIPLAYER", ImVec2(targetWidth, targetHeight))) {
+            g_IsMultiplayerMenuActive = true;
+        }
+        ImGui::End();
+    }
+
+    if (g_IsMultiplayerMenuActive) {
+        const ImVec2 screenSize((float)viewport[2], (float)viewport[3]);
+
+        // Full-screen game title background extracted from genericTitleScreen_PN.p2d.
+        if (g_GameMenuBackgroundTexture != 0) {
+            ImGui::GetBackgroundDrawList()->AddImage(
+                ToImGuiTexture(g_GameMenuBackgroundTexture),
+                ImVec2(0, 0), screenSize
+            );
+            // Darken the artwork very slightly so white game-style controls remain readable.
+            ImGui::GetBackgroundDrawList()->AddRectFilled(
+                ImVec2(0, 0), screenSize, IM_COL32(0, 0, 0, 38)
+            );
+        }
+
+        // One borderless full-screen root window gives the impression of a native game menu.
+        ImGui::SetNextWindowPos(ImVec2(0, 0), ImGuiCond_Always);
+        ImGui::SetNextWindowSize(screenSize, ImGuiCond_Always);
+        ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0, 0));
+        ImGui::Begin("##GameStyleMultiplayerRoot", nullptr,
+                     ImGuiWindowFlags_NoTitleBar |
+                     ImGuiWindowFlags_NoBackground |
+                     ImGuiWindowFlags_NoResize |
+                     ImGuiWindowFlags_NoMove |
+                     ImGuiWindowFlags_NoSavedSettings |
+                     ImGuiWindowFlags_NoScrollbar |
+                     ImGuiWindowFlags_NoScrollWithMouse);
+
+        const float margin = std::max(18.0f, screenSize.y * 0.035f);
+        const float contentWidth = std::min(screenSize.x - margin * 2.0f, 1320.0f);
+        const float left = (screenSize.x - contentWidth) * 0.5f;
+        const float top = margin;
+
+        // Main title, mimicking the game's large menu heading.
+        ImGui::SetCursorPos(ImVec2(left, top));
+        ImGui::PushFont(ImGui::GetIO().Fonts->Fonts[0]);
+        ImGui::TextColored(ImVec4(1, 1, 1, 1), "MULTIPLAYER");
+        ImGui::PopFont();
+        ImGui::SetCursorPos(ImVec2(left, top + ImGui::GetTextLineHeight() + 3.0f));
+        ImGui::TextColored(ImVec4(0.86f, 0.92f, 0.96f, 0.88f),
+                           g_CurrentMenu == MENU_SAVELOAD ? "SERVER BROWSER" : "MULTIPLAYER ROOM");
+
+        // BACK button at top-right.
+        const float backWidth = std::min(250.0f, contentWidth * 0.22f);
+        const float backHeight = backWidth / 3.0f;
+        ImGui::SetCursorPos(ImVec2(left + contentWidth - backWidth, top));
+        if (DrawGameStyleButton("##BackButton", "BACK", ImVec2(backWidth, backHeight))) {
+            g_IsMultiplayerMenuActive = false;
+            CloseAndroidKeyboard();
+        }
+
+        const float panelTop = top + backHeight + 18.0f;
+        const float panelBottom = screenSize.y - margin;
+        const float gap = 18.0f;
+        const float panelWidth = (contentWidth - gap) * 0.5f;
+        const float panelHeight = panelBottom - panelTop;
+
+        const ImVec2 leftPanel(left, panelTop);
+        const ImVec2 leftPanelMax(left + panelWidth, panelBottom);
+        const ImVec2 rightPanel(left + panelWidth + gap, panelTop);
+        const ImVec2 rightPanelMax(left + contentWidth, panelBottom);
+
+        DrawGamePanel(leftPanel, leftPanelMax, 176);
+        DrawGamePanel(rightPanel, rightPanelMax, 170);
+
+        // Layout cursor helper inside panels.
+        auto BeginPanelContent = [&](ImVec2 panelMin) {
+            ImGui::SetCursorPos(ImVec2(panelMin.x + 24.0f, panelMin.y + 22.0f));
+        };
+
+        auto RenderChatUI = [&](float availableWidth) {
+            DrawGameSectionTitle("CHAT", availableWidth);
+            const float chatHeight = std::max(110.0f, panelHeight * 0.29f);
+
+            ImGui::PushStyleVar(ImGuiStyleVar_ChildRounding, 2.0f);
+            ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0.0f, 0.0f, 0.0f, 0.25f));
+            ImGui::BeginChild("##ChatHistory", ImVec2(availableWidth, chatHeight), true,
+                              ImGuiWindowFlags_NoScrollbar);
+            {
+                std::lock_guard<std::mutex> lock(g_ChatMutex);
+                for (const auto& msg : g_ChatMessages) {
+                    ImGui::TextWrapped("%s", msg.c_str());
+                }
+                if (ImGui::GetScrollY() >= ImGui::GetScrollMaxY() - 1.0f) {
+                    ImGui::SetScrollHereY(1.0f);
+                }
+            }
+            ImGui::EndChild();
+            ImGui::PopStyleColor();
+            ImGui::PopStyleVar();
+
+            ImGui::Spacing();
+            static char inputBuffer[200] = "";
+            const float buttonWidth = std::min(220.0f, availableWidth * 0.31f);
+            const float buttonHeight = buttonWidth / 3.0f;
+            const float inputWidth = availableWidth - buttonWidth - 10.0f;
+
+            ImGui::SetNextItemWidth(inputWidth);
+            ImGui::PushStyleColor(ImGuiCol_FrameBg, ImVec4(0.03f, 0.04f, 0.05f, 0.74f));
+            ImGui::PushStyleColor(ImGuiCol_FrameBgHovered, ImVec4(0.06f, 0.08f, 0.10f, 0.82f));
+            ImGui::PushStyleColor(ImGuiCol_FrameBgActive, ImVec4(0.08f, 0.10f, 0.12f, 0.88f));
+            bool enterPressed = ImGui::InputText("##ChatInput", inputBuffer,
+                                                 IM_ARRAYSIZE(inputBuffer),
+                                                 ImGuiInputTextFlags_EnterReturnsTrue);
+            ImGui::PopStyleColor(3);
+
+            if (ImGui::IsItemClicked()) OpenAndroidKeyboard();
+            ImGui::SameLine();
+            if (DrawGameStyleButton("##SendButton", "SEND", ImVec2(buttonWidth, buttonHeight)) || enterPressed) {
+                if (strlen(inputBuffer) > 0) {
+                    const std::string msgStr(inputBuffer);
+                    {
+                        std::lock_guard<std::mutex> lock(g_ChatMutex);
+                        g_ChatMessages.push_back("You: " + msgStr);
+                    }
+                    {
+                        std::lock_guard<std::mutex> lock(g_OutgoingChatMutex);
+                        g_OutgoingChats.push_back(msgStr);
+                    }
+                    memset(inputBuffer, 0, sizeof(inputBuffer));
+                }
+                CloseAndroidKeyboard();
+            }
+        };
+
+        // HOST / SETTINGS SCREEN
+        if (g_CurrentMenu == MENU_SETTINGS) {
+            BeginPanelContent(leftPanel);
+            const float innerWidth = panelWidth - 48.0f;
+            DrawGameSectionTitle("ROOM CONTROL", innerWidth);
+            DrawGameStatusText("STATUS:", g_ConnectedStatus, innerWidth);
+            ImGui::Spacing();
+
+            const float btnWidth = std::min(500.0f, innerWidth);
+            const float btnHeight = btnWidth / 3.0f;
+
+            if (g_IsClient && g_IsConnected) {
+                if (DrawGameStyleButton("##LeaveRoom", "LEAVE ROOM", ImVec2(btnWidth, btnHeight))) {
+                    ClearChat();
+                    g_IsClient = false;
+                    g_IsConnected = false;
+                    if (g_TcpSocket >= 0) {
+                        shutdown(g_TcpSocket, SHUT_RDWR);
+                        close(g_TcpSocket);
+                        g_TcpSocket = -1;
+                    }
+                    g_ConnectedStatus = "Left the room.";
+                }
+            } else if (!g_IsHost) {
+                if (DrawGameStyleButton("##HostRoom", "HOST ROOM", ImVec2(btnWidth, btnHeight))) {
+                    ClearChat();
+                    g_IsHost = true;
+                    std::thread(TCPHostThread).detach();
+                }
+            } else {
+                if (DrawGameStyleButton("##CloseRoom", "CLOSE ROOM", ImVec2(btnWidth, btnHeight))) {
+                    ClearChat();
+                    g_IsHost = false;
+                    g_IsConnected = false;
+                    if (g_TcpServerFd >= 0) {
+                        shutdown(g_TcpServerFd, SHUT_RDWR);
+                        close(g_TcpServerFd);
+                        g_TcpServerFd = -1;
+                    }
+                    if (g_TcpSocket >= 0) {
+                        shutdown(g_TcpSocket, SHUT_RDWR);
+                        close(g_TcpSocket);
+                        g_TcpSocket = -1;
+                    }
+                    g_ConnectedStatus = "Room Closed.";
+                }
+            }
+
+            ImGui::Spacing();
+            DrawGameSectionTitle("ROOM INFO", innerWidth);
+            const uint8_t hostPlayerId = g_LocalPlayerId.load();
+            if (hostPlayerId < MAX_PLAYERS) {
+                ImGui::TextColored(ImVec4(0.88f, 0.94f, 0.96f, 0.96f),
+                                   "Player %u", (unsigned)(hostPlayerId + 1));
+            } else {
+                ImGui::TextColored(ImVec4(0.70f, 0.76f, 0.80f, 0.90f), "Player -");
+            }
+            ImGui::TextColored(ImVec4(0.74f, 0.80f, 0.84f, 0.92f),
+                               "Up to %u players", (unsigned)MAX_PLAYERS);
+
+            BeginPanelContent(rightPanel);
+            const float chatWidth = panelWidth - 48.0f;
+            RenderChatUI(chatWidth);
+        }
+        // CLIENT / SERVER BROWSER SCREEN
+        else if (g_CurrentMenu == MENU_SAVELOAD) {
+            BeginPanelContent(leftPanel);
+            const float innerWidth = panelWidth - 48.0f;
+            DrawGameSectionTitle("PLAYER", innerWidth);
+
+            DrawGameStatusText("NETWORK:", g_ConnectedStatus, innerWidth);
+            ImGui::Text("USERNAME");
+            ImGui::SetNextItemWidth(innerWidth);
+            ImGui::PushStyleColor(ImGuiCol_FrameBg, ImVec4(0.03f, 0.04f, 0.05f, 0.74f));
+            bool nickEnterPressed = ImGui::InputText("##NicknameInput", g_Nickname,
+                                                     IM_ARRAYSIZE(g_Nickname),
+                                                     ImGuiInputTextFlags_EnterReturnsTrue);
+            ImGui::PopStyleColor();
+            if (ImGui::IsItemClicked()) OpenAndroidKeyboard();
+            if (nickEnterPressed) CloseAndroidKeyboard();
+
+            ImGui::Spacing();
+            const float scanWidth = std::min(500.0f, innerWidth);
+            const float scanHeight = scanWidth / 3.0f;
+            if (!g_IsConnected) {
+                if (DrawGameStyleButton("##ScanNetworks", g_IsSearching.load() ? "SEARCHING..." : "SCAN NETWORKS",
+                                        ImVec2(scanWidth, scanHeight))) {
+                    if (!g_IsSearching.load()) {
+                        g_IsSearching.store(true);
+                        std::thread(StartLANDiscoveryThread).detach();
+                    }
+                }
+            }
+
+            ImGui::Spacing();
+            DrawGameSectionTitle("DISCOVERED ROOMS", innerWidth);
+            if (!g_IsConnected) {
+                std::lock_guard<std::mutex> lock(g_PeerMutex);
+                if (g_DiscoveredPeers.empty()) {
+                    ImGui::TextColored(ImVec4(0.72f, 0.76f, 0.80f, 0.92f),
+                                       "No active rooms found yet.");
+                } else {
+                    const float roomButtonHeight = std::min(95.0f, innerWidth / 6.0f);
+                    for (size_t i = 0; i < g_DiscoveredPeers.size(); ++i) {
+                        std::string roomLabel = g_DiscoveredPeers[i].name;
+                        if (roomLabel.empty()) roomLabel = "ROOM";
+                        std::string id = "##Room" + std::to_string(i);
+                        if (DrawGameStyleButton(id.c_str(), roomLabel.c_str(), ImVec2(innerWidth, roomButtonHeight))) {
+                            if (!g_IsHost.load() && !g_IsClient.load()) {
+                                ClearChat();
+                                g_IsClient.store(true);
+                                std::string targetIP = g_DiscoveredPeers[i].ip;
+                                std::thread(TCPClientThread, targetIP).detach();
+                            }
+                        }
+                        ImGui::Spacing();
+                        ImGui::TextColored(ImVec4(0.62f, 0.69f, 0.73f, 0.86f),
+                                           "%s", g_DiscoveredPeers[i].ip.c_str());
+                        ImGui::Spacing();
+                    }
+                }
+            } else {
+                ImGui::TextColored(ImVec4(0.80f, 0.92f, 0.98f, 1.0f),
+                                   "CONNECTED TO ROOM");
+                ImGui::Spacing();
+                if (DrawGameStyleButton("##JoinGame", "JOIN GAME", ImVec2(scanWidth, scanHeight))) {
+                    AutoStartGameForClient();
+                }
+                ImGui::Spacing();
+                if (DrawGameStyleButton("##Disconnect", "DISCONNECT", ImVec2(scanWidth, scanHeight))) {
+                    ClearChat();
+                    g_IsHost = false;
+                    g_IsClient = false;
+                    g_IsConnected = false;
+                    if (g_TcpSocket >= 0) {
+                        shutdown(g_TcpSocket, SHUT_RDWR);
+                        close(g_TcpSocket);
+                        g_TcpSocket = -1;
+                    }
+                }
+            }
+
+            BeginPanelContent(rightPanel);
+            RenderChatUI(panelWidth - 48.0f);
+        }
+
+        ImGui::End();
+        ImGui::PopStyleVar();
+    }
+
+    ImGui::Render();
+
+    GLboolean depthTestEnabled = glIsEnabled(GL_DEPTH_TEST);
+    GLboolean cullFaceEnabled = glIsEnabled(GL_CULL_FACE);
+    glDisable(GL_DEPTH_TEST);
+    glDisable(GL_CULL_FACE);
+    ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
+    if (depthTestEnabled) glEnable(GL_DEPTH_TEST);
+    if (cullFaceEnabled) glEnable(GL_CULL_FACE);
 }
 
 // ========================================================================
@@ -2244,7 +2413,15 @@ void* my_updateGUI(void* thiz, void* p1, void* p2, void* p3, void* p4) {
 
     if (!g_TextureLoaded) {
         g_MultiplayerButtonTexture = LoadTextureFromPNGArray(buton_png_data, buton_png_len);
-        g_TextureLoaded = true;
+        g_TextureLoaded = (g_MultiplayerButtonTexture != 0);
+    }
+
+    if (!g_GameMenuBackgroundLoaded) {
+        g_GameMenuBackgroundTexture = LoadTextureFromPNGArrayEx(
+            game_menu_bg_png_data, game_menu_bg_png_len,
+            &g_GameMenuBackgroundWidth, &g_GameMenuBackgroundHeight
+        );
+        g_GameMenuBackgroundLoaded = (g_GameMenuBackgroundTexture != 0);
     }
     return orig_updateGUI ? orig_updateGUI(thiz, p1, p2, p3, p4) : nullptr;
 }
