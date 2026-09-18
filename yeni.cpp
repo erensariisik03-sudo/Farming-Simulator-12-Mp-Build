@@ -63,6 +63,10 @@ std::atomic<float> g_TouchY(0.0f);
 std::atomic<bool> g_TouchDown(false);
 
 static bool g_IsEatingTouch = false;
+static std::atomic<bool> g_AndroidKeyboardOpen(false);
+
+static ImFont* g_GameUIFont = nullptr;
+static bool g_GameUIFontInitialized = false;
 
 // USER NICKNAME
 char g_Nickname[32] = "Player"; 
@@ -1218,6 +1222,7 @@ bool IsLocalIP(const std::string& ip) {
 
 void OpenAndroidKeyboard() {
     if (g_GlobalJavaVM == nullptr) return;
+    g_AndroidKeyboardOpen.store(true);
 
     JNIEnv* env = nullptr;
     bool attached = false;
@@ -1265,6 +1270,10 @@ void OpenAndroidKeyboard() {
 }
 
 void CloseAndroidKeyboard() {
+    // Do not blindly call toggleSoftInput(): when the keyboard is already hidden,
+    // that API can OPEN it. The old UI used exactly that toggle and made BACK appear
+    // to open the keyboard. We now close only when our UI actually opened it.
+    if (!g_AndroidKeyboardOpen.exchange(false)) return;
     if (g_GlobalJavaVM == nullptr) return;
 
     JNIEnv* env = nullptr;
@@ -1915,6 +1924,19 @@ int32_t my_AInputQueue_getEvent(void* queue, AInputEvent** outEvent) {
 
                 bool shouldEatEvent = false;
 
+                // Android BACK: first close the soft keyboard, otherwise close our MP menu.
+                if (keyCode == AKEYCODE_BACK && action == AKEY_EVENT_ACTION_DOWN &&
+                    g_ImGuiInitialized && ImGui::GetCurrentContext() != nullptr) {
+                    if (g_IsMultiplayerMenuActive) {
+                        if (g_AndroidKeyboardOpen.load()) {
+                            CloseAndroidKeyboard();
+                        } else {
+                            g_IsMultiplayerMenuActive = false;
+                        }
+                        shouldEatEvent = true;
+                    }
+                }
+
                 if (g_ImGuiInitialized && ImGui::GetCurrentContext() != nullptr) {
                     ImGuiIO& io = ImGui::GetIO();
                     bool isDown = (action == AKEY_EVENT_ACTION_DOWN);
@@ -1976,32 +1998,104 @@ static ImTextureID ToImGuiTexture(GLuint texture) {
     return (ImTextureID)(intptr_t)texture;
 }
 
-static bool DrawGameStyleButton(const char* id, const char* label, ImVec2 size, float textScale = 1.0f) {
-    if (g_MultiplayerButtonTexture == 0) return false;
+static void InitGameUIFont() {
+    if (g_GameUIFontInitialized) return;
+    g_GameUIFontInitialized = true;
 
+    ImGuiIO& io = ImGui::GetIO();
+    static const ImWchar gameRanges[] = {
+        0x0020, 0x024F, // Latin + Latin Extended
+        0x00C0, 0x00FF, // Latin-1 supplement (kept explicit for older ImGui builds)
+        0
+    };
+
+    // Farming Simulator's font03_P.p2d is a bitmap atlas. The exact glyph
+    // mapping/metrics are held by the game's FontInfo table, so the raw atlas
+    // cannot be passed directly to ImGui's TTF loader. Use a condensed Android
+    // sans face here; it is visually much closer to the game's UI than a mono
+    // face and does not create the Minecraft-like letter spacing.
+    const char* paths[] = {
+        "/system/fonts/RobotoCondensed-Regular.ttf",
+        "/system/fonts/Roboto-Regular.ttf",
+        "/system/fonts/DroidSans.ttf",
+        "/system/fonts/NotoSans-Regular.ttf"
+    };
+
+    const float fontPx = 27.0f;
+    for (size_t i = 0; i < sizeof(paths) / sizeof(paths[0]); ++i) {
+        if (access(paths[i], R_OK) == 0) {
+            g_GameUIFont = io.Fonts->AddFontFromFileTTF(paths[i], fontPx, nullptr, gameRanges);
+            if (g_GameUIFont != nullptr) break;
+        }
+    }
+
+    if (g_GameUIFont == nullptr) {
+        g_GameUIFont = io.Fonts->AddFontDefault();
+    }
+}
+
+static bool DrawGameStyleButton(const char* id, const char* label, ImVec2 size,
+                                float textScale = 1.0f, bool rightAligned = false) {
     ImVec2 pos = ImGui::GetCursorScreenPos();
     const bool clicked = ImGui::InvisibleButton(id, size);
     const bool hovered = ImGui::IsItemHovered();
     const bool active = ImGui::IsItemActive();
 
     ImDrawList* draw = ImGui::GetWindowDrawList();
-    draw->AddImage(ToImGuiTexture(g_MultiplayerButtonTexture), pos,
-                   ImVec2(pos.x + size.x, pos.y + size.y));
+    const float perspectiveFix = size.y * 0.20f;
 
-    if (hovered) {
+    if (g_MultiplayerButtonTexture != 0) {
+        ImVec2 p0, p1, p2, p3;
+        ImVec2 uv0, uv1, uv2, uv3;
+
+        if (!rightAligned) {
+            // Native texture naturally slopes on its right edge. Extend the
+            // lower-right corner by ~0.20h so the perspective does not leave
+            // a visible triangular gap when the button is packed against the next element.
+            p0 = ImVec2(pos.x, pos.y);
+            p1 = ImVec2(pos.x + size.x, pos.y);
+            p2 = ImVec2(pos.x + size.x - perspectiveFix, pos.y + size.y);
+            p3 = ImVec2(pos.x, pos.y + size.y);
+            uv0 = ImVec2(0.0f, 0.0f);
+            uv1 = ImVec2(1.0f, 0.0f);
+            uv2 = ImVec2(1.0f, 1.0f);
+            uv3 = ImVec2(0.0f, 1.0f);
+        } else {
+            // Right-side controls mirror the perspective so the slanted side
+            // faces inward while the outer edge sits flush against the layout edge.
+            p0 = ImVec2(pos.x + perspectiveFix, pos.y);
+            p1 = ImVec2(pos.x + size.x, pos.y);
+            p2 = ImVec2(pos.x + size.x, pos.y + size.y);
+            p3 = ImVec2(pos.x, pos.y + size.y);
+            uv0 = ImVec2(1.0f, 0.0f);
+            uv1 = ImVec2(0.0f, 0.0f);
+            uv2 = ImVec2(0.0f, 1.0f);
+            uv3 = ImVec2(1.0f, 1.0f);
+        }
+
+        draw->AddImageQuad(ToImGuiTexture(g_MultiplayerButtonTexture),
+                           p0, p1, p2, p3,
+                           uv0, uv1, uv2, uv3);
+
+        if (hovered) {
+            draw->AddRectFilled(pos, ImVec2(pos.x + size.x, pos.y + size.y),
+                                IM_COL32(255, 255, 255, active ? 22 : 10));
+        }
+    } else {
+        // Safe fallback keeps the layout intact if the texture failed to load.
         draw->AddRectFilled(pos, ImVec2(pos.x + size.x, pos.y + size.y),
-                            IM_COL32(255, 255, 255, active ? 18 : 10), 2.0f);
+                            IM_COL32(20, 24, 28, 205), 3.0f);
     }
 
-    ImVec2 textSize = ImGui::CalcTextSize(label);
-    textSize.x *= textScale;
-    textSize.y *= textScale;
+    const float textSizePx = ImGui::GetFontSize() * textScale;
+    ImVec2 measured = ImGui::CalcTextSize(label);
+    measured.x *= textScale;
+    measured.y *= textScale;
     ImVec2 textPos(
-        pos.x + (size.x - textSize.x) * 0.5f,
-        pos.y + (size.y - textSize.y) * 0.5f
+        pos.x + (size.x - measured.x) * 0.5f,
+        pos.y + (size.y - measured.y) * 0.5f - 1.0f
     );
-
-    draw->AddText(nullptr, ImGui::GetFontSize() * textScale, textPos,
+    draw->AddText(g_GameUIFont, textSizePx, textPos,
                   IM_COL32(245, 245, 245, 255), label);
     return clicked;
 }
@@ -2009,40 +2103,55 @@ static bool DrawGameStyleButton(const char* id, const char* label, ImVec2 size, 
 static void DrawGameSectionTitle(const char* title, float width) {
     ImDrawList* draw = ImGui::GetWindowDrawList();
     ImVec2 p = ImGui::GetCursorScreenPos();
-    draw->AddText(p, IM_COL32(255, 255, 255, 255), title);
-    const float lineY = p.y + ImGui::GetTextLineHeight() + 7.0f;
+    draw->AddText(g_GameUIFont, ImGui::GetFontSize() * 1.02f,
+                  p, IM_COL32(255, 255, 255, 255), title);
+    const float lineY = p.y + ImGui::GetTextLineHeight() + 8.0f;
     draw->AddLine(ImVec2(p.x, lineY), ImVec2(p.x + width, lineY),
-                  IM_COL32(255, 255, 255, 85), 1.0f);
-    ImGui::Dummy(ImVec2(width, ImGui::GetTextLineHeight() + 13.0f));
+                  IM_COL32(255, 255, 255, 72), 1.0f);
+    ImGui::Dummy(ImVec2(width, ImGui::GetTextLineHeight() + 14.0f));
 }
 
 static void DrawGameStatusText(const char* label, const std::string& value, float width) {
     ImDrawList* draw = ImGui::GetWindowDrawList();
     ImVec2 p = ImGui::GetCursorScreenPos();
-    draw->AddText(p, IM_COL32(225, 225, 225, 255), label);
+    draw->AddText(g_GameUIFont, ImGui::GetFontSize() * 0.92f,
+                  p, IM_COL32(225, 225, 225, 255), label);
     ImVec2 labelSize = ImGui::CalcTextSize(label);
-    draw->AddText(ImVec2(p.x + labelSize.x + 10.0f, p.y),
-                  IM_COL32(120, 225, 245, 255), value.c_str());
-    ImGui::Dummy(ImVec2(width, ImGui::GetTextLineHeight() + 3.0f));
+    draw->AddText(g_GameUIFont, ImGui::GetFontSize() * 0.92f,
+                  ImVec2(p.x + labelSize.x + 10.0f, p.y),
+                  IM_COL32(110, 225, 245, 255), value.c_str());
+    ImGui::Dummy(ImVec2(width, ImGui::GetTextLineHeight() + 4.0f));
 }
 
-static void DrawGamePanel(ImVec2 minPos, ImVec2 maxPos, int alpha = 158) {
+static void DrawGamePanel(ImVec2 minPos, ImVec2 maxPos, int alpha = 88) {
     ImDrawList* draw = ImGui::GetWindowDrawList();
-    draw->AddRectFilled(minPos, maxPos, IM_COL32(5, 8, 10, alpha), 3.0f);
-    draw->AddRect(minPos, maxPos, IM_COL32(255, 255, 255, 55), 3.0f, 0, 1.0f);
+    draw->AddRectFilled(minPos, maxPos, IM_COL32(3, 7, 10, alpha), 4.0f);
+    draw->AddRect(minPos, maxPos, IM_COL32(255, 255, 255, 40), 4.0f, 0, 1.0f);
 }
 
 void DrawImGui() {
     if (!g_ImGuiInitialized) {
         ImGui::CreateContext();
+        InitGameUIFont();
         ImGui::StyleColorsDark();
+        ImGuiStyle& style = ImGui::GetStyle();
+        style.WindowRounding = 0.0f;
+        style.ChildRounding = 2.0f;
+        style.FrameRounding = 2.0f;
+        style.ScrollbarRounding = 2.0f;
+        style.WindowBorderSize = 0.0f;
+        style.FrameBorderSize = 0.0f;
+        style.ItemSpacing = ImVec2(8.0f, 6.0f);
+        style.ItemInnerSpacing = ImVec2(7.0f, 5.0f);
+        style.FramePadding = ImVec2(8.0f, 5.0f);
         ImGui_ImplOpenGL3_Init("#version 100");
         g_ImGuiInitialized = true;
     }
 
     if (!g_ImGuiInitialized) return;
 
-    // Load both embedded textures lazily while a valid GL context is active.
+    if (!g_GameUIFontInitialized) InitGameUIFont();
+
     if (!g_TextureLoaded) {
         g_MultiplayerButtonTexture = LoadTextureFromPNGArray(buton_png_data, buton_png_len);
         g_TextureLoaded = (g_MultiplayerButtonTexture != 0);
@@ -2058,11 +2167,10 @@ void DrawImGui() {
     ImGuiIO& io = ImGui::GetIO();
     GLint viewport[4] = {0, 0, 0, 0};
     glGetIntegerv(GL_VIEWPORT, viewport);
-    io.DisplaySize = ImVec2((float)viewport[2], (float)viewport[3]);
+    const ImVec2 screen((float)viewport[2], (float)viewport[3]);
+    io.DisplaySize = screen;
     io.DeltaTime = 1.0f / 60.0f;
-
-    const float uiScale = std::max(1.4f, std::min(2.5f, (float)viewport[3] / 400.0f));
-    io.FontGlobalScale = uiScale;
+    io.FontGlobalScale = std::max(0.82f, std::min(1.08f, screen.y / 1080.0f));
 
     io.AddMousePosEvent(g_TouchX.load(), g_TouchY.load());
     io.AddMouseButtonEvent(0, g_TouchDown.load());
@@ -2070,112 +2178,94 @@ void DrawImGui() {
     ImGui_ImplOpenGL3_NewFrame();
     ImGui::NewFrame();
 
-    // Keep the original small entry button when the full multiplayer screen is closed.
+    // Small entry point while the custom MP page is closed.
     if (g_CurrentMenu != MENU_INGAME && !g_IsMultiplayerMenuActive && g_MultiplayerButtonTexture != 0) {
-        float posX = 6.0f;
-        float posY = 6.0f;
-        float targetWidth = (float)viewport[2] * 0.22f;
-        float targetHeight = targetWidth / 3.0f;
-
-        if (g_CurrentMenu == MENU_SETTINGS) {
-            targetWidth = (float)viewport[2] * 0.335f;
-            targetHeight = targetWidth / 3.0f;
-        }
-
-        ImGui::SetNextWindowPos(ImVec2(posX, posY), ImGuiCond_Always);
-        ImGui::SetNextWindowSize(ImVec2(targetWidth, targetHeight), ImGuiCond_Always);
+        const float entryW = std::min(430.0f, screen.x * 0.235f);
+        const float entryH = std::max(58.0f, entryW / 3.0f);
+        ImGui::SetNextWindowPos(ImVec2(10.0f, 10.0f), ImGuiCond_Always);
+        ImGui::SetNextWindowSize(ImVec2(entryW, entryH), ImGuiCond_Always);
         ImGui::Begin("##MPEntryButton", nullptr,
-                     ImGuiWindowFlags_NoTitleBar |
-                     ImGuiWindowFlags_NoBackground |
-                     ImGuiWindowFlags_NoResize |
-                     ImGuiWindowFlags_NoMove |
-                     ImGuiWindowFlags_NoSavedSettings |
-                     ImGuiWindowFlags_NoScrollbar |
+                     ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoBackground |
+                     ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove |
+                     ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoScrollbar |
                      ImGuiWindowFlags_NoScrollWithMouse);
-        if (DrawGameStyleButton("##MPEntry", "MULTIPLAYER", ImVec2(targetWidth, targetHeight))) {
+        if (DrawGameStyleButton("##MPEntry", "MULTIPLAYER", ImVec2(entryW, entryH), 1.0f, false)) {
             g_IsMultiplayerMenuActive = true;
         }
         ImGui::End();
     }
 
     if (g_IsMultiplayerMenuActive) {
-        const ImVec2 screenSize((float)viewport[2], (float)viewport[3]);
+        ImDrawList* bg = ImGui::GetBackgroundDrawList();
 
-        // Full-screen game title background extracted from genericTitleScreen_PN.p2d.
+        // The original 1024x1024 artwork reserves its top ~24.5% as plain sky fill.
+        // Cropping that band reproduces the actual title-screen composition instead of
+        // producing the flat-blue strip seen in the previous build.
         if (g_GameMenuBackgroundTexture != 0) {
-            ImGui::GetBackgroundDrawList()->AddImage(
-                ToImGuiTexture(g_GameMenuBackgroundTexture),
-                ImVec2(0, 0), screenSize
-            );
-            // Darken the artwork very slightly so white game-style controls remain readable.
-            ImGui::GetBackgroundDrawList()->AddRectFilled(
-                ImVec2(0, 0), screenSize, IM_COL32(0, 0, 0, 38)
-            );
+            const float backgroundTopUV = 0.245f;
+            bg->AddImage(ToImGuiTexture(g_GameMenuBackgroundTexture),
+                         ImVec2(0, 0), screen,
+                         ImVec2(0.0f, backgroundTopUV), ImVec2(1.0f, 1.0f));
+            bg->AddRectFilled(ImVec2(0, 0), screen, IM_COL32(0, 0, 0, 12));
         }
 
-        // One borderless full-screen root window gives the impression of a native game menu.
+        const float marginX = std::max(22.0f, screen.x * 0.045f);
+        const float top = std::max(20.0f, screen.y * 0.045f);
+        const float contentW = screen.x - marginX * 2.0f;
+        const float backW = std::min(330.0f, contentW * 0.20f);
+        const float backH = std::max(56.0f, backW / 3.0f);
+
         ImGui::SetNextWindowPos(ImVec2(0, 0), ImGuiCond_Always);
-        ImGui::SetNextWindowSize(screenSize, ImGuiCond_Always);
+        ImGui::SetNextWindowSize(screen, ImGuiCond_Always);
         ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0, 0));
         ImGui::Begin("##GameStyleMultiplayerRoot", nullptr,
-                     ImGuiWindowFlags_NoTitleBar |
-                     ImGuiWindowFlags_NoBackground |
-                     ImGuiWindowFlags_NoResize |
-                     ImGuiWindowFlags_NoMove |
-                     ImGuiWindowFlags_NoSavedSettings |
-                     ImGuiWindowFlags_NoScrollbar |
+                     ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoBackground |
+                     ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove |
+                     ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoScrollbar |
                      ImGuiWindowFlags_NoScrollWithMouse);
 
-        const float margin = std::max(18.0f, screenSize.y * 0.035f);
-        const float contentWidth = std::min(screenSize.x - margin * 2.0f, 1320.0f);
-        const float left = (screenSize.x - contentWidth) * 0.5f;
-        const float top = margin;
+        ImGui::PushFont(g_GameUIFont);
 
-        // Main title, mimicking the game's large menu heading.
-        ImGui::SetCursorPos(ImVec2(left, top));
-        ImGui::PushFont(ImGui::GetIO().Fonts->Fonts[0]);
-        ImGui::TextColored(ImVec4(1, 1, 1, 1), "MULTIPLAYER");
-        ImGui::PopFont();
-        ImGui::SetCursorPos(ImVec2(left, top + ImGui::GetTextLineHeight() + 3.0f));
-        ImGui::TextColored(ImVec4(0.86f, 0.92f, 0.96f, 0.88f),
+        // Header
+        ImGui::SetCursorPos(ImVec2(marginX, top));
+        ImGui::Text("MULTIPLAYER");
+        ImGui::SetCursorPos(ImVec2(marginX, top + ImGui::GetTextLineHeight() + 2.0f));
+        ImGui::TextColored(ImVec4(0.92f, 0.96f, 1.0f, 0.92f),
                            g_CurrentMenu == MENU_SAVELOAD ? "SERVER BROWSER" : "MULTIPLAYER ROOM");
 
-        // BACK button at top-right.
-        const float backWidth = std::min(250.0f, contentWidth * 0.22f);
-        const float backHeight = backWidth / 3.0f;
-        ImGui::SetCursorPos(ImVec2(left + contentWidth - backWidth, top));
-        if (DrawGameStyleButton("##BackButton", "BACK", ImVec2(backWidth, backHeight))) {
+        ImGui::SetCursorPos(ImVec2(screen.x - marginX - backW, top));
+        if (DrawGameStyleButton("##BackButton", "BACK", ImVec2(backW, backH), 0.98f, true)) {
             g_IsMultiplayerMenuActive = false;
             CloseAndroidKeyboard();
         }
 
-        const float panelTop = top + backHeight + 18.0f;
-        const float panelBottom = screenSize.y - margin;
-        const float gap = 18.0f;
-        const float panelWidth = (contentWidth - gap) * 0.5f;
-        const float panelHeight = panelBottom - panelTop;
+        const float bodyTop = top + backH + 22.0f;
+        const float bodyBottom = screen.y - std::max(22.0f, screen.y * 0.045f);
+        const float gap = std::max(14.0f, screen.x * 0.018f);
+        const float leftW = contentW * 0.57f;
+        const float rightW = contentW - leftW - gap;
+        const ImVec2 leftMin(marginX, bodyTop);
+        const ImVec2 leftMax(marginX + leftW, bodyBottom);
+        const ImVec2 rightMin(marginX + leftW + gap, bodyTop);
+        const ImVec2 rightMax(rightMin.x + rightW, bodyBottom);
 
-        const ImVec2 leftPanel(left, panelTop);
-        const ImVec2 leftPanelMax(left + panelWidth, panelBottom);
-        const ImVec2 rightPanel(left + panelWidth + gap, panelTop);
-        const ImVec2 rightPanelMax(left + contentWidth, panelBottom);
+        DrawGamePanel(leftMin, leftMax, 72);
+        DrawGamePanel(rightMin, rightMax, 68);
 
-        DrawGamePanel(leftPanel, leftPanelMax, 176);
-        DrawGamePanel(rightPanel, rightPanelMax, 170);
-
-        // Layout cursor helper inside panels.
-        auto BeginPanelContent = [&](ImVec2 panelMin) {
-            ImGui::SetCursorPos(ImVec2(panelMin.x + 24.0f, panelMin.y + 22.0f));
+        auto BeginPanel = [](ImVec2 p) {
+            ImGui::SetCursorPos(p);
         };
 
-        auto RenderChatUI = [&](float availableWidth) {
-            DrawGameSectionTitle("CHAT", availableWidth);
-            const float chatHeight = std::max(110.0f, panelHeight * 0.29f);
+        auto RenderChatUI = [&](ImVec2 pmin, float width, float height) {
+            BeginPanel(ImVec2(pmin.x + 20.0f, pmin.y + 18.0f));
+            DrawGameSectionTitle("CHAT", width - 40.0f);
 
-            ImGui::PushStyleVar(ImGuiStyleVar_ChildRounding, 2.0f);
-            ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0.0f, 0.0f, 0.0f, 0.25f));
-            ImGui::BeginChild("##ChatHistory", ImVec2(availableWidth, chatHeight), true,
-                              ImGuiWindowFlags_NoScrollbar);
+            const float inputH = std::max(48.0f, ImGui::GetTextLineHeight() + 20.0f);
+            const float sendW = std::min(180.0f, width * 0.28f);
+            const float historyH = std::max(120.0f, height - inputH - 92.0f);
+
+            ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0, 0, 0, 0.20f));
+            ImGui::BeginChild("##ChatHistory", ImVec2(width - 40.0f, historyH), true);
             {
                 std::lock_guard<std::mutex> lock(g_ChatMutex);
                 for (const auto& msg : g_ChatMessages) {
@@ -2187,26 +2277,23 @@ void DrawImGui() {
             }
             ImGui::EndChild();
             ImGui::PopStyleColor();
-            ImGui::PopStyleVar();
 
             ImGui::Spacing();
             static char inputBuffer[200] = "";
-            const float buttonWidth = std::min(220.0f, availableWidth * 0.31f);
-            const float buttonHeight = buttonWidth / 3.0f;
-            const float inputWidth = availableWidth - buttonWidth - 10.0f;
-
-            ImGui::SetNextItemWidth(inputWidth);
-            ImGui::PushStyleColor(ImGuiCol_FrameBg, ImVec4(0.03f, 0.04f, 0.05f, 0.74f));
-            ImGui::PushStyleColor(ImGuiCol_FrameBgHovered, ImVec4(0.06f, 0.08f, 0.10f, 0.82f));
-            ImGui::PushStyleColor(ImGuiCol_FrameBgActive, ImVec4(0.08f, 0.10f, 0.12f, 0.88f));
+            const float fullW = width - 40.0f;
+            const float inputW = fullW - sendW - 10.0f;
+            ImGui::SetNextItemWidth(inputW);
+            ImGui::PushStyleColor(ImGuiCol_FrameBg, ImVec4(0.01f, 0.02f, 0.03f, 0.68f));
+            ImGui::PushStyleColor(ImGuiCol_FrameBgHovered, ImVec4(0.03f, 0.05f, 0.07f, 0.78f));
+            ImGui::PushStyleColor(ImGuiCol_FrameBgActive, ImVec4(0.04f, 0.07f, 0.09f, 0.84f));
             bool enterPressed = ImGui::InputText("##ChatInput", inputBuffer,
                                                  IM_ARRAYSIZE(inputBuffer),
                                                  ImGuiInputTextFlags_EnterReturnsTrue);
             ImGui::PopStyleColor(3);
-
             if (ImGui::IsItemClicked()) OpenAndroidKeyboard();
+
             ImGui::SameLine();
-            if (DrawGameStyleButton("##SendButton", "SEND", ImVec2(buttonWidth, buttonHeight)) || enterPressed) {
+            if (DrawGameStyleButton("##SendButton", "SEND", ImVec2(sendW, inputH), 0.96f, true) || enterPressed) {
                 if (strlen(inputBuffer) > 0) {
                     const std::string msgStr(inputBuffer);
                     {
@@ -2223,19 +2310,18 @@ void DrawImGui() {
             }
         };
 
-        // HOST / SETTINGS SCREEN
         if (g_CurrentMenu == MENU_SETTINGS) {
-            BeginPanelContent(leftPanel);
-            const float innerWidth = panelWidth - 48.0f;
-            DrawGameSectionTitle("ROOM CONTROL", innerWidth);
-            DrawGameStatusText("STATUS:", g_ConnectedStatus, innerWidth);
-            ImGui::Spacing();
+            // HOST / ROOM CONTROL
+            BeginPanel(ImVec2(leftMin.x + 20.0f, leftMin.y + 18.0f));
+            const float innerW = leftW - 40.0f;
+            DrawGameSectionTitle("ROOM CONTROL", innerW);
+            DrawGameStatusText("STATUS:", g_ConnectedStatus, innerW);
 
-            const float btnWidth = std::min(500.0f, innerWidth);
-            const float btnHeight = btnWidth / 3.0f;
+            const float actionW = std::min(470.0f, innerW);
+            const float actionH = std::max(58.0f, actionW / 4.8f);
 
             if (g_IsClient && g_IsConnected) {
-                if (DrawGameStyleButton("##LeaveRoom", "LEAVE ROOM", ImVec2(btnWidth, btnHeight))) {
+                if (DrawGameStyleButton("##LeaveRoom", "LEAVE ROOM", ImVec2(actionW, actionH))) {
                     ClearChat();
                     g_IsClient = false;
                     g_IsConnected = false;
@@ -2247,13 +2333,13 @@ void DrawImGui() {
                     g_ConnectedStatus = "Left the room.";
                 }
             } else if (!g_IsHost) {
-                if (DrawGameStyleButton("##HostRoom", "HOST ROOM", ImVec2(btnWidth, btnHeight))) {
+                if (DrawGameStyleButton("##HostRoom", "HOST ROOM", ImVec2(actionW, actionH))) {
                     ClearChat();
                     g_IsHost = true;
                     std::thread(TCPHostThread).detach();
                 }
             } else {
-                if (DrawGameStyleButton("##CloseRoom", "CLOSE ROOM", ImVec2(btnWidth, btnHeight))) {
+                if (DrawGameStyleButton("##CloseRoom", "CLOSE ROOM", ImVec2(actionW, actionH))) {
                     ClearChat();
                     g_IsHost = false;
                     g_IsConnected = false;
@@ -2271,32 +2357,27 @@ void DrawImGui() {
                 }
             }
 
-            ImGui::Spacing();
-            DrawGameSectionTitle("ROOM INFO", innerWidth);
+            ImGui::Dummy(ImVec2(1, 10));
+            DrawGameSectionTitle("ROOM INFO", innerW);
             const uint8_t hostPlayerId = g_LocalPlayerId.load();
             if (hostPlayerId < MAX_PLAYERS) {
-                ImGui::TextColored(ImVec4(0.88f, 0.94f, 0.96f, 0.96f),
-                                   "Player %u", (unsigned)(hostPlayerId + 1));
+                ImGui::Text("Player %u", (unsigned)(hostPlayerId + 1));
             } else {
-                ImGui::TextColored(ImVec4(0.70f, 0.76f, 0.80f, 0.90f), "Player -");
+                ImGui::TextDisabled("Player -");
             }
-            ImGui::TextColored(ImVec4(0.74f, 0.80f, 0.84f, 0.92f),
-                               "Up to %u players", (unsigned)MAX_PLAYERS);
+            ImGui::TextDisabled("Up to %u players", (unsigned)MAX_PLAYERS);
 
-            BeginPanelContent(rightPanel);
-            const float chatWidth = panelWidth - 48.0f;
-            RenderChatUI(chatWidth);
-        }
-        // CLIENT / SERVER BROWSER SCREEN
-        else if (g_CurrentMenu == MENU_SAVELOAD) {
-            BeginPanelContent(leftPanel);
-            const float innerWidth = panelWidth - 48.0f;
-            DrawGameSectionTitle("PLAYER", innerWidth);
+            RenderChatUI(rightMin, rightW, bodyBottom - bodyTop);
+        } else if (g_CurrentMenu == MENU_SAVELOAD) {
+            // CLIENT / SERVER BROWSER
+            BeginPanel(ImVec2(leftMin.x + 20.0f, leftMin.y + 18.0f));
+            const float innerW = leftW - 40.0f;
+            DrawGameSectionTitle("PLAYER", innerW);
+            DrawGameStatusText("NETWORK:", g_ConnectedStatus, innerW);
 
-            DrawGameStatusText("NETWORK:", g_ConnectedStatus, innerWidth);
             ImGui::Text("USERNAME");
-            ImGui::SetNextItemWidth(innerWidth);
-            ImGui::PushStyleColor(ImGuiCol_FrameBg, ImVec4(0.03f, 0.04f, 0.05f, 0.74f));
+            ImGui::SetNextItemWidth(innerW);
+            ImGui::PushStyleColor(ImGuiCol_FrameBg, ImVec4(0.01f, 0.02f, 0.03f, 0.68f));
             bool nickEnterPressed = ImGui::InputText("##NicknameInput", g_Nickname,
                                                      IM_ARRAYSIZE(g_Nickname),
                                                      ImGuiInputTextFlags_EnterReturnsTrue);
@@ -2305,11 +2386,11 @@ void DrawImGui() {
             if (nickEnterPressed) CloseAndroidKeyboard();
 
             ImGui::Spacing();
-            const float scanWidth = std::min(500.0f, innerWidth);
-            const float scanHeight = scanWidth / 3.0f;
+            const float scanH = std::max(58.0f, std::min(100.0f, innerW * 0.12f));
             if (!g_IsConnected) {
-                if (DrawGameStyleButton("##ScanNetworks", g_IsSearching.load() ? "SEARCHING..." : "SCAN NETWORKS",
-                                        ImVec2(scanWidth, scanHeight))) {
+                if (DrawGameStyleButton("##ScanNetworks",
+                                        g_IsSearching.load() ? "SEARCHING..." : "SCAN NETWORKS",
+                                        ImVec2(innerW, scanH))) {
                     if (!g_IsSearching.load()) {
                         g_IsSearching.store(true);
                         std::thread(StartLANDiscoveryThread).detach();
@@ -2318,21 +2399,22 @@ void DrawImGui() {
             }
 
             ImGui::Spacing();
-            DrawGameSectionTitle("DISCOVERED ROOMS", innerWidth);
+            DrawGameSectionTitle("DISCOVERED ROOMS", innerW);
+            const float listH = std::max(120.0f, bodyBottom - ImGui::GetCursorScreenPos().y - 24.0f);
+            ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0, 0, 0, 0.08f));
+            ImGui::BeginChild("##RoomsList", ImVec2(innerW, listH), true);
             if (!g_IsConnected) {
                 std::lock_guard<std::mutex> lock(g_PeerMutex);
                 if (g_DiscoveredPeers.empty()) {
-                    ImGui::TextColored(ImVec4(0.72f, 0.76f, 0.80f, 0.92f),
-                                       "No active rooms found yet.");
+                    ImGui::TextDisabled("No active rooms found yet.");
                 } else {
-                    const float roomButtonHeight = std::min(95.0f, innerWidth / 6.0f);
+                    const float roomH = std::max(54.0f, std::min(82.0f, innerW * 0.12f));
                     for (size_t i = 0; i < g_DiscoveredPeers.size(); ++i) {
                         std::string roomLabel = g_DiscoveredPeers[i].name;
                         if (roomLabel.empty()) roomLabel = "ROOM";
                         char roomId[32];
                         snprintf(roomId, sizeof(roomId), "##Room%u", static_cast<unsigned int>(i));
-                        std::string id = std::string(roomId);
-                        if (DrawGameStyleButton(id.c_str(), roomLabel.c_str(), ImVec2(innerWidth, roomButtonHeight))) {
+                        if (DrawGameStyleButton(roomId, roomLabel.c_str(), ImVec2(innerW - 2.0f, roomH))) {
                             if (!g_IsHost.load() && !g_IsClient.load()) {
                                 ClearChat();
                                 g_IsClient.store(true);
@@ -2340,21 +2422,18 @@ void DrawImGui() {
                                 std::thread(TCPClientThread, targetIP).detach();
                             }
                         }
-                        ImGui::Spacing();
-                        ImGui::TextColored(ImVec4(0.62f, 0.69f, 0.73f, 0.86f),
-                                           "%s", g_DiscoveredPeers[i].ip.c_str());
+                        ImGui::TextDisabled("%s", g_DiscoveredPeers[i].ip.c_str());
                         ImGui::Spacing();
                     }
                 }
             } else {
-                ImGui::TextColored(ImVec4(0.80f, 0.92f, 0.98f, 1.0f),
-                                   "CONNECTED TO ROOM");
+                ImGui::Text("CONNECTED TO ROOM");
                 ImGui::Spacing();
-                if (DrawGameStyleButton("##JoinGame", "JOIN GAME", ImVec2(scanWidth, scanHeight))) {
+                if (DrawGameStyleButton("##JoinGame", "JOIN GAME", ImVec2(std::min(390.0f, innerW), scanH))) {
                     AutoStartGameForClient();
                 }
                 ImGui::Spacing();
-                if (DrawGameStyleButton("##Disconnect", "DISCONNECT", ImVec2(scanWidth, scanHeight))) {
+                if (DrawGameStyleButton("##Disconnect", "DISCONNECT", ImVec2(std::min(390.0f, innerW), scanH))) {
                     ClearChat();
                     g_IsHost = false;
                     g_IsClient = false;
@@ -2366,11 +2445,13 @@ void DrawImGui() {
                     }
                 }
             }
+            ImGui::EndChild();
+            ImGui::PopStyleColor();
 
-            BeginPanelContent(rightPanel);
-            RenderChatUI(panelWidth - 48.0f);
+            RenderChatUI(rightMin, rightW, bodyBottom - bodyTop);
         }
 
+        ImGui::PopFont();
         ImGui::End();
         ImGui::PopStyleVar();
     }
