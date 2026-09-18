@@ -2115,20 +2115,88 @@ static bool DrawGameStyleButton(const char* id, const char* label, ImVec2 size,
     return clicked;
 }
 
+static bool DrawCenteredMirroredGameButton(const char* id, const char* label,
+                                           float totalW, float h, float textScale = 1.34f) {
+    ImDrawList* draw = ImGui::GetWindowDrawList();
+    const ImVec2 start = ImGui::GetCursorScreenPos();
+
+    // Two original game buttons meet in the middle: the right copy is mirrored,
+    // so the outer corners keep matching diagonal/perspective edges. A small
+    // overlap hides the join without changing the original texture artwork.
+    const float overlap = std::min(42.0f, totalW * 0.055f);
+    const float halfW = (totalW + overlap) * 0.5f;
+    const float actualTotal = halfW * 2.0f - overlap;
+
+    const float paintTop = 0.245f;
+    const float paintBottom = 0.765f;
+    const float hitH = std::max(1.0f, h * (paintBottom - paintTop));
+    const ImVec2 hitStart(start.x, start.y + h * paintTop);
+    ImGui::SetCursorScreenPos(hitStart);
+    ImGui::InvisibleButton(id, ImVec2(actualTotal, hitH));
+    bool clicked = ImGui::IsItemClicked(ImGuiMouseButton_Left);
+
+    // Restrict clicks to the actual painted union of the two trapezoids.
+    if (clicked) {
+        const ImVec2 mouse = ImGui::GetIO().MousePos;
+        const float relX = mouse.x - start.x;
+        const float relY = mouse.y - start.y;
+        bool inVisible = false;
+        for (int side = 0; side < 2; ++side) {
+            const float localX = side == 0 ? relX : (actualTotal - relX);
+            if (localX < 0.0f || localX > halfW) continue;
+            const float u = localX / std::max(1.0f, halfW);
+            const float v = relY / std::max(1.0f, h);
+            if (v >= paintTop && v <= paintBottom) {
+                const float t = (v - paintTop) / (paintBottom - paintTop);
+                const float right = 0.990f - 0.080f * t;
+                if (u >= 0.006f && u <= right) {
+                    inVisible = true;
+                    break;
+                }
+            }
+        }
+        clicked = inVisible;
+    }
+
+    ImGui::SetCursorScreenPos(start);
+    ImGui::Dummy(ImVec2(actualTotal, h));
+
+    if (g_MultiplayerButtonTexture != 0) {
+        draw->AddImage(ToImGuiTexture(g_MultiplayerButtonTexture),
+                       start, ImVec2(start.x + halfW, start.y + h),
+                       ImVec2(0.0f, 0.0f), ImVec2(1.0f, 1.0f));
+        draw->AddImage(ToImGuiTexture(g_MultiplayerButtonTexture),
+                       ImVec2(start.x + halfW - overlap, start.y),
+                       ImVec2(start.x + actualTotal, start.y + h),
+                       ImVec2(1.0f, 0.0f), ImVec2(0.0f, 1.0f));
+    }
+
+    ImFont* font = g_GameUIFont ? g_GameUIFont : ImGui::GetFont();
+    const float textSizePx = std::max(31.0f, 36.0f * textScale *
+                                             std::max(0.90f, std::min(1.12f, ImGui::GetIO().DisplaySize.y / 1080.0f)));
+    ImVec2 measured = font->CalcTextSizeA(textSizePx, FLT_MAX, 0.0f, label);
+    draw->AddText(font, textSizePx,
+                  ImVec2(start.x + (actualTotal - measured.x) * 0.5f,
+                         start.y + (h - measured.y) * 0.5f - 1.0f),
+                  IM_COL32(245,245,245,255), label);
+    return clicked;
+}
+
 static void DrawFadingHeaderLine(float startX, float y, float endX) {
     ImDrawList* draw = ImGui::GetWindowDrawList();
     const float width = std::max(60.0f, endX - startX);
-    // Make the divider visibly taller/thicker without reintroducing vertical seams.
+    // Keep the requested thickness, but restore a long, soft left-to-right fade.
     const float thick = std::max(5.5f, ImGui::GetIO().DisplaySize.y * 0.0050f);
-    const float fade = std::min(width * 0.34f, 240.0f);
+    const float fade = std::min(width * 0.48f, 360.0f);
     const float solidEnd = std::max(startX, endX - fade);
     draw->AddRectFilled(ImVec2(startX, y - thick * 0.5f),
                         ImVec2(solidEnd, y + thick * 0.5f),
-                        IM_COL32(255,255,255,225));
+                        IM_COL32(255,255,255,222));
+    // One continuous gradient quad: no seams and a clearly visible transition.
     draw->AddRectFilledMultiColor(
         ImVec2(solidEnd, y - thick * 0.5f), ImVec2(endX, y + thick * 0.5f),
-        IM_COL32(255,255,255,225), IM_COL32(255,255,255,0),
-        IM_COL32(255,255,255,225), IM_COL32(255,255,255,0));
+        IM_COL32(255,255,255,222), IM_COL32(255,255,255,0),
+        IM_COL32(255,255,255,222), IM_COL32(255,255,255,0));
 }
 
 static void DrawGameSectionTitle(const char* title, float width) {
@@ -2137,7 +2205,7 @@ static void DrawGameSectionTitle(const char* title, float width) {
     draw->AddText(g_GameUIFont, 30.0f, p, IM_COL32(255, 255, 255, 255), title);
     const float lineY = p.y + 36.0f;
     DrawFadingHeaderLine(p.x, lineY, p.x + width);
-    ImGui::Dummy(ImVec2(width, 48.0f));
+    ImGui::Dummy(ImVec2(width, 46.0f));
 }
 
 static void DrawGameStatusText(const char* label, const std::string& value, float width) {
@@ -2224,12 +2292,14 @@ void DrawImGui() {
         const bool isSettings = (g_CurrentMenu == MENU_SETTINGS);
         const char* entryLabel = isSettings ? "Create Room" : "Join Room";
         float entryW = isSettings
-                         ? std::min(620.0f, std::max(390.0f, screen.x * 0.29f))
-                         : std::min(660.0f, std::max(410.0f, screen.x * 0.32f));
-        float entryH = isSettings ? entryW / 2.65f : entryW / 2.50f;
-        const float entryX = -10.0f;
+                         ? std::min(680.0f, std::max(440.0f, screen.x * 0.36f))
+                         : std::min(620.0f, std::max(420.0f, screen.x * 0.32f));
+        float entryH = isSettings ? entryW / 5.80f : entryW / 2.72f;
+        const float entryX = isSettings
+                             ? (screen.x - entryW) * 0.5f
+                             : -10.0f;
         const float entryY = isSettings
-                             ? std::max(2.0f, screen.y * 0.003f)
+                             ? std::max(8.0f, screen.y - entryH - screen.y * 0.075f)
                              : std::max(3.0f, screen.y * 0.005f);
 
         ImGui::SetNextWindowPos(ImVec2(entryX, entryY), ImGuiCond_Always);
@@ -2240,7 +2310,10 @@ void DrawImGui() {
                      ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove |
                      ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoScrollbar |
                      ImGuiWindowFlags_NoScrollWithMouse);
-        if (DrawGameStyleButton("##RoomEntry", entryLabel, ImVec2(entryW, entryH), 1.34f, false)) {
+        const bool entryClicked = isSettings
+            ? DrawCenteredMirroredGameButton("##RoomEntryCreate", entryLabel, entryW, entryH, 1.36f)
+            : DrawGameStyleButton("##RoomEntryJoin", entryLabel, ImVec2(entryW, entryH), 1.34f, false);
+        if (entryClicked) {
             g_CurrentMenu = isSettings ? MENU_SETTINGS : MENU_SAVELOAD;
             g_IsMultiplayerMenuActive = true;
         }
@@ -2319,8 +2392,8 @@ void DrawImGui() {
         const float chatX = screen.x * 0.50f;
         const float chatW = screen.x - chatX;
         const float controlW = chatX;
-        DrawGamePanel(ImVec2(0.0f, bodyTop), ImVec2(controlW, bodyBottom), 98);
-        DrawGamePanel(ImVec2(chatX, bodyTop), ImVec2(screen.x, bodyBottom), 98);
+        DrawGamePanel(ImVec2(0.0f, bodyTop), ImVec2(controlW, bodyBottom), 112);
+        DrawGamePanel(ImVec2(chatX, bodyTop), ImVec2(screen.x, bodyBottom), 112);
 
         auto RenderChatUI = [&](float x, float y, float width, float height) {
             const float inner = 14.0f;
@@ -2328,13 +2401,15 @@ void DrawImGui() {
             DrawGameSectionTitle("Chat", width - inner * 2.0f);
 
             const float inputH = std::max(54.0f, std::min(78.0f, commonButtonH * 0.30f));
-            const float sendW = std::min(150.0f, width * 0.25f);
-            const float historyH = std::max(90.0f, height - 110.0f);
+            const float sendW = std::min(122.0f, width * 0.21f);
+            const float sendH = inputH;
+            const float historyH = std::max(90.0f, height - inputH - 72.0f);
             const float historyW = width - inner * 2.0f;
 
-            ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0, 0, 0, 0.18f));
-            ImGui::BeginChild("##ChatHistory", ImVec2(historyW, historyH), true,
-                              ImGuiWindowFlags_NoScrollbar);
+            ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0, 0, 0, 0.0f));
+            ImGui::PushStyleVar(ImGuiStyleVar_ChildBorderSize, 0.0f);
+            ImGui::BeginChild("##ChatHistory", ImVec2(historyW, historyH), false,
+                              ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoBackground);
             {
                 std::lock_guard<std::mutex> lock(g_ChatMutex);
                 for (const auto& msg : g_ChatMessages) {
@@ -2344,14 +2419,16 @@ void DrawImGui() {
                     ImGui::SetScrollHereY(1.0f);
             }
             ImGui::EndChild();
+            ImGui::PopStyleVar();
             ImGui::PopStyleColor();
 
-            ImGui::SetCursorPos(ImVec2(x + inner, y + height - inputH - 10.0f));
+            const float inputY = y + height - inputH - 10.0f;
+            ImGui::SetCursorPos(ImVec2(x + inner, inputY));
             ImGui::PushStyleColor(ImGuiCol_FrameBg, ImVec4(0.015f, 0.022f, 0.028f, 0.82f));
             ImGui::PushStyleColor(ImGuiCol_FrameBgHovered, ImVec4(0.025f, 0.040f, 0.050f, 0.90f));
             ImGui::PushStyleColor(ImGuiCol_FrameBgActive, ImVec4(0.035f, 0.060f, 0.070f, 0.95f));
             ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1, 1, 1, 1));
-            ImGui::SetNextItemWidth(std::max(180.0f, width - 28.0f - sendW - 8.0f));
+            ImGui::SetNextItemWidth(std::max(180.0f, width - inner * 2.0f - sendW - 8.0f));
             static char inputBuffer[200] = "";
             const bool chatConnected = g_IsConnected.load();
             if (!chatConnected) ImGui::BeginDisabled(true);
@@ -2363,10 +2440,10 @@ void DrawImGui() {
             if (!chatConnected) ImGui::EndDisabled();
             ImGui::PopStyleColor(4);
 
-            const float sendX = x + edgeBleed;
-            ImGui::SetCursorPos(ImVec2(sendX, y + height - commonButtonH - 2.0f));
+            const float sendX = x + width - sendW + edgeBleed;
+            ImGui::SetCursorPos(ImVec2(sendX, inputY));
             if (!chatConnected) ImGui::BeginDisabled(true);
-            const bool sendClicked = DrawGameStyleButton("##SendButton", "Send", ImVec2(sendW, commonButtonH * 0.82f), 1.12f, true);
+            const bool sendClicked = DrawGameStyleButton("##SendButton", "Send", ImVec2(sendW, sendH), 1.10f, true);
             if (!chatConnected) ImGui::EndDisabled();
             if (chatConnected && (sendClicked || enterPressed)) {
                 if (strlen(inputBuffer) > 0) {
@@ -2478,7 +2555,7 @@ void DrawImGui() {
             const float listH = std::max(100.0f, bodyBottom - ImGui::GetCursorScreenPos().y - 12.0f);
             ImGui::PushStyleVar(ImGuiStyleVar_ChildBorderSize, 0.0f);
             ImGui::BeginChild("##RoomsList", ImVec2(infoW, listH), false,
-                              ImGuiWindowFlags_NoBackground);
+                              ImGuiWindowFlags_NoBackground | ImGuiWindowFlags_NoScrollbar);
             if (!g_IsConnected) {
                 std::lock_guard<std::mutex> lock(g_PeerMutex);
                 if (g_DiscoveredPeers.empty()) {
