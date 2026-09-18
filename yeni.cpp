@@ -2059,13 +2059,26 @@ static bool IsInsideGameButtonTexture(ImVec2 pos, ImVec2 size, bool rightAligned
 static bool DrawGameStyleButton(const char* id, const char* label, ImVec2 size,
                                 float textScale = 1.0f, bool rightAligned = false) {
     ImVec2 pos = ImGui::GetCursorScreenPos();
-    // Keep the ImGui item large enough for the image, but only accept clicks
-    // inside the painted button portion of the texture.
-    ImGui::InvisibleButton(id, size);
+
+    // The PNG has transparent padding above/below the painted trapezoid.
+    // Make the ImGui hit item cover only that painted vertical band so touch
+    // capture never leaks into the transparent area. The polygon test below
+    // still rejects the sloped/transparent side pixels.
+    const float paintTop = 0.245f;
+    const float paintBottom = 0.765f;
+    const float paintH = size.y * (paintBottom - paintTop);
+    const ImVec2 hitPos(pos.x, pos.y + size.y * paintTop);
+    ImGui::SetCursorScreenPos(hitPos);
+    ImGui::InvisibleButton(id, ImVec2(size.x, std::max(1.0f, paintH)));
     const bool hovered = ImGui::IsItemHovered() && IsInsideGameButtonTexture(pos, size, rightAligned);
     const bool active = hovered && ImGui::IsItemActive();
     const bool clicked = ImGui::IsItemClicked(ImGuiMouseButton_Left) &&
                          IsInsideGameButtonTexture(pos, size, rightAligned);
+
+    // Restore full widget advance for the caller without expanding the touch
+    // capture region beyond the visible button.
+    ImGui::SetCursorScreenPos(pos);
+    ImGui::Dummy(size);
 
     ImDrawList* draw = ImGui::GetWindowDrawList();
 
@@ -2145,9 +2158,9 @@ static void DrawHeaderDarkening(const ImVec2& screen) {
     // the vertical seams produced by the old segmented overlay.
     draw->AddRectFilledMultiColor(
         ImVec2(0.0f, 0.0f), ImVec2(screen.x, bandH),
-        IM_COL32(0,0,0,68), IM_COL32(0,0,0,68),
+        IM_COL32(0,0,0,76), IM_COL32(0,0,0,76),
         IM_COL32(0,0,0,0), IM_COL32(0,0,0,0));
-    draw->AddRectFilled(ImVec2(0.0f, 0.0f), screen, IM_COL32(0,0,0,12));
+    draw->AddRectFilled(ImVec2(0.0f, 0.0f), screen, IM_COL32(0,0,0,18));
 }
 
 void DrawImGui() {
@@ -2275,10 +2288,10 @@ void DrawImGui() {
 
         // Back / Host / Scan share one physical size. Negative bleed removes the
         // transparent padding so the painted edge touches the screen edge.
-        const float commonButtonW = std::min(700.0f, std::max(570.0f, screen.x * 0.36f));
-        const float commonButtonH = commonButtonW / 3.0f;
+        const float commonButtonW = std::min(600.0f, std::max(480.0f, screen.x * 0.32f));
+        const float commonButtonH = commonButtonW / 3.05f;
         const float backX = screen.x - commonButtonW - edgeBleed;
-        const float backY = std::max(5.0f, screen.y * 0.007f);
+        const float backY = std::max(12.0f, screen.y * 0.012f);
         ImGui::SetCursorPos(ImVec2(backX, backY));
         if (DrawGameStyleButton("##BackButton", "Back", ImVec2(commonButtonW, commonButtonH), 1.30f, true)) {
             if (g_AndroidKeyboardOpen.load()) CloseAndroidKeyboard();
@@ -2286,25 +2299,25 @@ void DrawImGui() {
         }
 
         const float headerBottom = titleY + titleSize + 28.0f;
-        const float actionY = std::max(headerBottom + 5.0f, 72.0f);
+        const float actionY = std::max(headerBottom - 1.0f, 66.0f);
         const float bottomMargin = std::max(18.0f, screen.y * 0.03f);
         const float bodyTop = actionY + commonButtonH + 10.0f;
         const float bodyBottom = screen.y - bottomMargin;
 
         // Left = every room/player/network control. Right = chat only.
-        const float chatX = screen.x * 0.56f;
+        const float chatX = screen.x * 0.50f;
         const float chatW = screen.x - chatX;
         const float controlW = chatX;
-        DrawGamePanel(ImVec2(0.0f, bodyTop), ImVec2(controlW, bodyBottom), 76);
-        DrawGamePanel(ImVec2(chatX, bodyTop), ImVec2(screen.x, bodyBottom), 76);
+        DrawGamePanel(ImVec2(0.0f, bodyTop), ImVec2(controlW, bodyBottom), 84);
+        DrawGamePanel(ImVec2(chatX, bodyTop), ImVec2(screen.x, bodyBottom), 84);
 
         auto RenderChatUI = [&](float x, float y, float width, float height) {
             const float inner = 14.0f;
             ImGui::SetCursorPos(ImVec2(x + inner, y + 12.0f));
             DrawGameSectionTitle("Chat", width - inner * 2.0f);
 
-            const float inputH = std::max(60.0f, std::min(88.0f, commonButtonH * 0.34f));
-            const float sendW = std::min(commonButtonW, width * 0.82f);
+            const float inputH = std::max(54.0f, std::min(78.0f, commonButtonH * 0.30f));
+            const float sendW = std::min(190.0f, width * 0.34f);
             const float historyH = std::max(90.0f, height - 110.0f);
             const float historyW = width - inner * 2.0f;
 
@@ -2327,18 +2340,21 @@ void DrawImGui() {
             ImGui::PushStyleColor(ImGuiCol_FrameBgHovered, ImVec4(0.025f, 0.040f, 0.050f, 0.90f));
             ImGui::PushStyleColor(ImGuiCol_FrameBgActive, ImVec4(0.035f, 0.060f, 0.070f, 0.95f));
             ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1, 1, 1, 1));
-            ImGui::SetNextItemWidth(std::max(160.0f, width - 36.0f - sendW - 12.0f));
+            ImGui::SetNextItemWidth(std::max(180.0f, width - 28.0f - sendW - 8.0f));
             static char inputBuffer[200] = "";
+            const bool chatConnected = g_IsConnected.load();
+            if (!chatConnected) ImGui::BeginDisabled(true);
             bool enterPressed = ImGui::InputText("##ChatInput", inputBuffer,
                                                  IM_ARRAYSIZE(inputBuffer),
                                                  ImGuiInputTextFlags_EnterReturnsTrue);
-            if (ImGui::IsItemClicked()) OpenAndroidKeyboard();
-            const bool chatInputActive = ImGui::IsItemActive();
+            if (chatConnected && ImGui::IsItemClicked()) OpenAndroidKeyboard();
+            const bool chatInputActive = chatConnected && ImGui::IsItemActive();
+            if (!chatConnected) ImGui::EndDisabled();
             ImGui::PopStyleColor(4);
 
             const float sendX = x + edgeBleed;
             ImGui::SetCursorPos(ImVec2(sendX, y + height - commonButtonH - 2.0f));
-            if (DrawGameStyleButton("##SendButton", "Send", ImVec2(sendW, commonButtonH), 1.24f, false) || enterPressed) {
+            if (chatConnected && (DrawGameStyleButton("##SendButton", "Send", ImVec2(sendW, commonButtonH * 0.82f), 1.12f, true) || enterPressed)) {
                 if (strlen(inputBuffer) > 0) {
                     const std::string msgStr(inputBuffer);
                     {
@@ -2357,7 +2373,7 @@ void DrawImGui() {
 
         if (g_CurrentMenu == MENU_SETTINGS) {
             // Host Room / Close Room / Leave Room always starts at the left edge.
-            ImGui::SetCursorPos(ImVec2(edgeBleed, actionY - 6.0f));
+            ImGui::SetCursorPos(ImVec2(edgeBleed, actionY - 10.0f));
             const float innerButtonW = commonButtonW;
             const float innerButtonH = commonButtonH;
             if (g_IsClient && g_IsConnected) {
@@ -2415,7 +2431,7 @@ void DrawImGui() {
             RenderChatUI(chatX, bodyTop, chatW, bodyBottom - bodyTop);
         } else if (g_CurrentMenu == MENU_SAVELOAD) {
             // Scan Networks is exactly the same size as Host Room and Back.
-            ImGui::SetCursorPos(ImVec2(edgeBleed, actionY - 6.0f));
+            ImGui::SetCursorPos(ImVec2(edgeBleed, actionY - 10.0f));
             if (DrawGameStyleButton("##ScanNetworks",
                                     g_IsSearching.load() ? "Searching..." : "Scan Networks",
                                     ImVec2(commonButtonW, commonButtonH), 1.30f, false)) {
@@ -2431,7 +2447,7 @@ void DrawImGui() {
             DrawGameSectionTitle("Player", infoW);
             DrawGameStatusText("Network:", g_ConnectedStatus, infoW);
             ImGui::Text("Username");
-            ImGui::SetNextItemWidth(infoW);
+            ImGui::SetNextItemWidth(std::max(180.0f, infoW * 0.56f));
             ImGui::PushStyleColor(ImGuiCol_FrameBg, ImVec4(0.015f, 0.022f, 0.028f, 0.82f));
             ImGui::PushStyleColor(ImGuiCol_Border, ImVec4(0.72f, 0.82f, 0.88f, 0.34f));
             ImGui::PushStyleVar(ImGuiStyleVar_FrameBorderSize, 1.0f);
@@ -2446,8 +2462,9 @@ void DrawImGui() {
             ImGui::SetCursorPos(ImVec2(infoX, actionY + commonButtonH + 152.0f));
             DrawGameSectionTitle("Discovered Rooms", infoW);
             const float listH = std::max(100.0f, bodyBottom - ImGui::GetCursorScreenPos().y - 12.0f);
-            ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0, 0, 0, 0.10f));
-            ImGui::BeginChild("##RoomsList", ImVec2(infoW, listH), true);
+            ImGui::PushStyleVar(ImGuiStyleVar_ChildBorderSize, 0.0f);
+            ImGui::BeginChild("##RoomsList", ImVec2(infoW, listH), false,
+                              ImGuiWindowFlags_NoBackground);
             if (!g_IsConnected) {
                 std::lock_guard<std::mutex> lock(g_PeerMutex);
                 if (g_DiscoveredPeers.empty()) {
@@ -2495,7 +2512,7 @@ void DrawImGui() {
                 }
             }
             ImGui::EndChild();
-            ImGui::PopStyleColor();
+            ImGui::PopStyleVar();
 
             RenderChatUI(chatX, bodyTop, chatW, bodyBottom - bodyTop);
         }
