@@ -31,7 +31,6 @@
 
 // Button Texture Data
 #include "buton_texture.h"
-#include "menu_background_texture.h"
 
 #define STB_IMAGE_IMPLEMENTATION
 #include "stb_image.h"
@@ -2235,8 +2234,8 @@ void DrawImGui() {
 
     if (!g_MenuBackgroundLoaded) {
         g_MenuBackgroundTexture = LoadTextureFromPNGArray(
-            fs12_menu_background_png,
-            (int)fs12_menu_background_png_len);
+            game_menu_bg_png_data,
+            (int)game_menu_bg_png_len);
         g_MenuBackgroundLoaded = (g_MenuBackgroundTexture != 0);
     }
 
