@@ -16,7 +16,6 @@
 #include <chrono>
 #include <sys/socket.h>
 #include <netinet/in.h>
-#include <netinet/tcp.h>
 #include <arpa/inet.h>
 #include <unistd.h>
 #include <fcntl.h>
@@ -24,6 +23,7 @@
 #include <net/if.h>
 #include <cerrno>
 #include <math.h>
+#include <algorithm>
 
 #include "Substrate.h"
 #include "imgui.h"
@@ -47,20 +47,24 @@
 JavaVM* g_GlobalJavaVM = nullptr; 
 
 GLuint g_MultiplayerButtonTexture = 0;
+GLuint g_GameMenuBackgroundTexture = 0;
 bool g_ImGuiInitialized = false;
 bool g_TextureLoaded = false;
+bool g_GameMenuBackgroundLoaded = false;
 bool g_IsMultiplayerMenuActive = false;
-bool g_MenuBackgroundLoaded = false;
-GLuint g_MenuBackgroundTexture = 0;
 
 int g_ButtonOrigWidth = 0;
 int g_ButtonOrigHeight = 0;
+int g_GameMenuBackgroundWidth = 0;
+int g_GameMenuBackgroundHeight = 0;
 
 std::atomic<float> g_TouchX(0.0f);
 std::atomic<float> g_TouchY(0.0f);
 std::atomic<bool> g_TouchDown(false);
 
 static bool g_IsEatingTouch = false;
+static std::atomic<bool> g_AndroidKeyboardOpen(false);
+
 static ImFont* g_GameUIFont = nullptr;
 static bool g_GameUIFontInitialized = false;
 
@@ -233,17 +237,20 @@ static const uint8_t PACKET_VEHICLE_POSITION = 3;
 static const uint8_t PACKET_VEHICLE_CLAIM = 4;
 static const uint8_t PACKET_VEHICLE_AUTHORITY = 5;
 static const uint8_t PACKET_VEHICLE_RELEASE = 6;
+static const uint8_t PACKET_VEHICLE_SNAPSHOT = 7;
 
 static const uint8_t MAX_PLAYERS = 4;
 static const uint16_t VEHICLE_ID_INVALID = 0xFFFF;
 static const uint16_t VEHICLE_SLOT_LIMIT = 512;
 static const uint8_t VEHICLE_OWNER_NONE = 0xFF;
 
-// Network snapshots are sent at 5 Hz; local interpolation keeps remote motion smooth.
-// Send one vehicle snapshot every 200 ms (5 snapshots per second).
-static const uint32_t VEHICLE_SYNC_INTERVAL_MS = 200;
-static const uint32_t VEHICLE_INTERPOLATION_MS = 190;
+// Local vehicle sampling target: 120 Hz.
+// The actual callback frequency still follows the game's own update/vsync loop.
+// Network vehicle snapshots are deliberately limited to 10 snapshots/sec.
+static const uint32_t VEHICLE_LOCAL_SAMPLE_INTERVAL_US = 8333;
+static const uint32_t VEHICLE_NETWORK_INTERVAL_MS = 100;
 static const uint32_t VEHICLE_STOP_RELEASE_MS = 1000;
+static const uint8_t VEHICLE_SNAPSHOT_MAX_COUNT = 64;
 static const float POSITION_EPSILON = 0.02f;
 static const float ANGLE_EPSILON = 0.005f;
 static const float CLAIM_POSITION_EPSILON = 0.05f;
@@ -275,16 +282,24 @@ struct VehiclePositionPacket {
     uint8_t moving;
 };
 
-// One network snapshot contains up to 12 vehicle states.
-// 4-byte header + (12 * 21-byte states) = exactly 256 bytes.
-static const uint8_t VEHICLE_BATCH_MAX = 12;
-
-struct VehiclePositionBatchPacket {
+// One TCP message can carry the newest state of many vehicles.
+// This keeps vehicle traffic at ~10 network messages/sec regardless of
+// how many local vehicles are being sampled.
+struct VehicleSnapshotHeader {
     uint8_t type;
     uint8_t ownerId;
     uint8_t count;
     uint8_t reserved;
-    VehiclePositionPacket states[VEHICLE_BATCH_MAX];
+    uint32_t sequence;
+};
+
+struct VehicleSnapshotEntry {
+    uint16_t vehicleId;
+    float x;
+    float y;
+    float angle;
+    uint32_t sequence;
+    uint8_t moving;
 };
 
 // Client -> host. The host decides which player gets authority first.
@@ -317,7 +332,8 @@ struct VehicleReleasePacket {
 static_assert(sizeof(SessionWelcomePacket) == 4, "SessionWelcomePacket size mismatch");
 static_assert(sizeof(NetworkPacket) == 256, "NetworkPacket size mismatch");
 static_assert(sizeof(VehiclePositionPacket) == 21, "VehiclePositionPacket size mismatch");
-static_assert(sizeof(VehiclePositionBatchPacket) == 256, "VehiclePositionBatchPacket size mismatch");
+static_assert(sizeof(VehicleSnapshotHeader) == 8, "VehicleSnapshotHeader size mismatch");
+static_assert(sizeof(VehicleSnapshotEntry) == 19, "VehicleSnapshotEntry size mismatch");
 static_assert(sizeof(VehicleClaimPacket) == 8, "VehicleClaimPacket size mismatch");
 static_assert(sizeof(VehicleAuthorityPacket) == 8, "VehicleAuthorityPacket size mismatch");
 static_assert(sizeof(VehicleReleasePacket) == 8, "VehicleReleasePacket size mismatch");
@@ -338,19 +354,13 @@ struct VehicleRemoteState {
     float x;
     float y;
     float angle;
+    float vx;
+    float vy;
+    float angularVelocity;
     uint32_t sequence;
     uint32_t appliedSequence;
+    uint64_t lastReceiveMs;
     bool moving;
-
-    // Smooth the 5 Hz network snapshots locally at the game frame rate.
-    float smoothX;
-    float smoothY;
-    float smoothAngle;
-    float interpolationStartX;
-    float interpolationStartY;
-    float interpolationStartAngle;
-    uint64_t interpolationStartMs;
-    bool interpolationActive;
 };
 
 struct VehicleSampleState {
@@ -372,8 +382,12 @@ static uint64_t g_RemoteStationarySince[VEHICLE_SLOT_LIMIT];
 static uint32_t g_LastKnownVehicleCount = 0;
 static std::mutex g_VehicleStateMutex;
 
-// Each pending item is a complete 256-byte snapshot containing up to 12 vehicles.
-static std::vector<VehiclePositionBatchPacket> g_PendingVehicleBatches;
+// Network transport keeps only the newest sample for each vehicle.
+// The network thread packs all valid samples into one snapshot every 100 ms.
+static VehiclePositionPacket g_LatestOutgoingVehicles[VEHICLE_SLOT_LIMIT];
+static bool g_HasLatestOutgoingVehicle[VEHICLE_SLOT_LIMIT];
+static uint64_t g_LastVehicleNetworkSendMs = 0;
+
 static VehicleClaimPacket g_PendingClaimPacket;
 static bool g_HasPendingClaimPacket = false;
 static VehicleReleasePacket g_PendingReleasePacket;
@@ -440,15 +454,15 @@ static float GetAngleDelta(float a, float b) {
     return fabsf(delta);
 }
 
-static float LerpAngleShortest(float a, float b, float t) {
-    float delta = b - a;
+static float GetSignedAngleDelta(float from, float to) {
+    float delta = to - from;
     const float pi = 3.14159265359f;
     const float twoPi = 6.28318530718f;
 
     while (delta > pi) delta -= twoPi;
     while (delta < -pi) delta += twoPi;
 
-    return a + delta * t;
+    return delta;
 }
 
 static void ClearVehicleStateSlot(uint16_t vehicleId) {
@@ -511,21 +525,16 @@ static bool GetVehicleOwner(uint16_t vehicleId, uint8_t* outOwner) {
     return true;
 }
 
-static bool BuildVehiclePositionState(uint16_t vehicleId, float x, float y, float angle, bool moving,
-                                       VehiclePositionPacket* outPacket) {
-    if (!outPacket) return false;
-    if (vehicleId >= VEHICLE_SLOT_LIMIT) return false;
+static void QueueVehiclePosition(uint16_t vehicleId, float x, float y, float angle, bool moving) {
+    if (!g_IsConnected.load()) return;
 
     const uint8_t ownerId = g_LocalPlayerId.load();
-    if (ownerId == VEHICLE_OWNER_NONE || ownerId >= MAX_PLAYERS) return false;
-
-    {
-        std::lock_guard<std::mutex> lock(g_VehicleStateMutex);
-        if (g_VehicleAuthority[vehicleId].ownerId != ownerId) return false;
-    }
+    if (ownerId == VEHICLE_OWNER_NONE || ownerId >= MAX_PLAYERS) return;
+    if (vehicleId >= VEHICLE_SLOT_LIMIT) return;
 
     VehiclePositionPacket pkt;
     memset(&pkt, 0, sizeof(pkt));
+
     pkt.type = PACKET_VEHICLE_POSITION;
     pkt.ownerId = ownerId;
     pkt.vehicleId = vehicleId;
@@ -535,87 +544,11 @@ static bool BuildVehiclePositionState(uint16_t vehicleId, float x, float y, floa
     pkt.sequence = g_LocalVehicleSequence.fetch_add(1) + 1;
     pkt.moving = moving ? 1 : 0;
 
-    *outPacket = pkt;
-    return true;
-}
-
-static void QueueVehiclePositionBatches(const std::vector<VehiclePositionPacket>& states) {
-    if (!g_IsConnected.load()) return;
-    if (states.empty()) return;
-
-    const uint8_t localOwner = g_LocalPlayerId.load();
-    if (localOwner == VEHICLE_OWNER_NONE || localOwner >= MAX_PLAYERS) return;
-
-    size_t offset = 0;
-    std::vector<VehiclePositionBatchPacket> batches;
-
-    while (offset < states.size()) {
-        VehiclePositionBatchPacket batch;
-        memset(&batch, 0, sizeof(batch));
-        batch.type = PACKET_VEHICLE_POSITION;
-        batch.ownerId = localOwner;
-
-        const size_t remaining = states.size() - offset;
-        const size_t count = (remaining > VEHICLE_BATCH_MAX) ? VEHICLE_BATCH_MAX : remaining;
-        batch.count = (uint8_t)count;
-
-        for (size_t i = 0; i < count; ++i) {
-            batch.states[i] = states[offset + i];
-        }
-
-        batches.push_back(batch);
-        offset += count;
+    {
+        std::lock_guard<std::mutex> lock(g_VehicleSendMutex);
+        g_LatestOutgoingVehicles[vehicleId] = pkt;
+        g_HasLatestOutgoingVehicle[vehicleId] = true;
     }
-
-    std::lock_guard<std::mutex> lock(g_VehicleSendMutex);
-    for (size_t i = 0; i < batches.size(); ++i) {
-        if (g_PendingVehicleBatches.size() >= 16) {
-            g_PendingVehicleBatches.erase(g_PendingVehicleBatches.begin());
-        }
-        g_PendingVehicleBatches.push_back(batches[i]);
-    }
-}
-
-// Relay validated client vehicle states from the host back to the client.
-// The original ownerId is preserved so each side knows which player owns the vehicle.
-static void QueueRelayedVehiclePositionBatch(const std::vector<VehiclePositionPacket>& states, uint8_t ownerId) {
-    if (!g_IsConnected.load() || !g_IsHost.load()) return;
-    if (states.empty() || ownerId >= MAX_PLAYERS) return;
-
-    size_t offset = 0;
-    while (offset < states.size()) {
-        VehiclePositionBatchPacket batch;
-        memset(&batch, 0, sizeof(batch));
-        batch.type = PACKET_VEHICLE_POSITION;
-        batch.ownerId = ownerId;
-
-        const size_t remaining = states.size() - offset;
-        const size_t count = (remaining > VEHICLE_BATCH_MAX) ? VEHICLE_BATCH_MAX : remaining;
-        batch.count = (uint8_t)count;
-
-        for (size_t i = 0; i < count; ++i) {
-            batch.states[i] = states[offset + i];
-            batch.states[i].type = PACKET_VEHICLE_POSITION;
-            batch.states[i].ownerId = ownerId;
-        }
-
-        {
-            std::lock_guard<std::mutex> lock(g_VehicleSendMutex);
-            if (g_PendingVehicleBatches.size() >= 16) {
-                g_PendingVehicleBatches.erase(g_PendingVehicleBatches.begin());
-            }
-            g_PendingVehicleBatches.push_back(batch);
-        }
-
-        offset += count;
-    }
-}
-
-static void ConfigureTcpSocket(int socketFd) {
-    if (socketFd < 0) return;
-
-    int noDelay = 1;
-    setsockopt(socketFd, IPPROTO_TCP, TCP_NODELAY, &noDelay, sizeof(noDelay));
 }
 
 static void QueueVehicleClaim(uint16_t vehicleId) {
@@ -787,16 +720,20 @@ static void CaptureAndQueueLocalVehicleState(uintptr_t game) {
     if (!g_VehicleGetPosition || !g_VehicleGetOrientation) return;
 
     const std::chrono::steady_clock::time_point now = std::chrono::steady_clock::now();
-    const uint64_t elapsedMs = (uint64_t)std::chrono::duration_cast<std::chrono::milliseconds>(
-        now - g_LastVehicleSync).count();
-    if (elapsedMs < VEHICLE_SYNC_INTERVAL_MS) return;
+    const uint64_t elapsedUs =
+        (uint64_t)std::chrono::duration_cast<std::chrono::microseconds>(
+            now - g_LastVehicleSync).count();
+
+    if (elapsedUs < VEHICLE_LOCAL_SAMPLE_INTERVAL_US) return;
     g_LastVehicleSync = now;
 
     RefreshVehicleTopology(game);
 
     const uint32_t rawVehicleCount = *(uint32_t*)(game + 0xA4);
-    const uint32_t vehicleCount = (rawVehicleCount > VEHICLE_SLOT_LIMIT)
-        ? VEHICLE_SLOT_LIMIT : rawVehicleCount;
+    const uint32_t vehicleCount =
+        (rawVehicleCount > VEHICLE_SLOT_LIMIT)
+            ? VEHICLE_SLOT_LIMIT
+            : rawVehicleCount;
 
     uint16_t activeVehicleId = VEHICLE_ID_INVALID;
     GetActiveVehicleFromGame(game, &activeVehicleId);
@@ -805,8 +742,6 @@ static void CaptureAndQueueLocalVehicleState(uintptr_t game) {
     if (localOwner == VEHICLE_OWNER_NONE || localOwner >= MAX_PLAYERS) return;
 
     const uint64_t nowMs = GetMonotonicMilliseconds();
-    std::vector<VehiclePositionPacket> snapshotStates;
-    snapshotStates.reserve(VEHICLE_BATCH_MAX);
 
     for (uint16_t vehicleId = 0; vehicleId < vehicleCount; ++vehicleId) {
         uintptr_t vehicle = GetVehicleFromIndex(game, vehicleId);
@@ -815,6 +750,7 @@ static void CaptureAndQueueLocalVehicleState(uintptr_t game) {
         float x = 0.0f;
         float y = 0.0f;
         float angle = 0.0f;
+
         g_VehicleGetPosition((void*)vehicle, &x, &y);
         angle = g_VehicleGetOrientation((void*)vehicle);
 
@@ -827,9 +763,13 @@ static void CaptureAndQueueLocalVehicleState(uintptr_t game) {
             VehicleSampleState& sample = g_LocalSamples[vehicleId];
 
             if (sample.valid) {
-                moved = fabsf(x - sample.x) > CLAIM_POSITION_EPSILON ||
-                        fabsf(y - sample.y) > CLAIM_POSITION_EPSILON;
-                rotated = GetAngleDelta(angle, sample.angle) > CLAIM_ANGLE_EPSILON;
+                moved =
+                    fabsf(x - sample.x) > CLAIM_POSITION_EPSILON ||
+                    fabsf(y - sample.y) > CLAIM_POSITION_EPSILON;
+
+                rotated =
+                    GetAngleDelta(angle, sample.angle) >
+                    CLAIM_ANGLE_EPSILON;
             }
 
             sample.valid = true;
@@ -840,17 +780,16 @@ static void CaptureAndQueueLocalVehicleState(uintptr_t game) {
             ownerId = g_VehicleAuthority[vehicleId].ownerId;
         }
 
-        // An unowned vehicle is claimed only by the player who is currently using
-        // it and actually starts moving or turning it. Standing in a vehicle does
-        // not win ownership by itself.
-        if (ownerId == VEHICLE_OWNER_NONE && vehicleId == activeVehicleId && (moved || rotated)) {
-            TryClaimLocalVehicle(vehicleId);
-            continue;
-        }
-
-        if (ownerId != localOwner) continue;
-
         const bool moving = moved || rotated;
+
+        // Ask the host for authority when appropriate, but do not make
+        // network publication depend on the authority handshake. This is
+        // what allows Player A to drive the harvester while Player B drives
+        // the tractor on a different vehicle slot.
+        if (vehicleId == activeVehicleId && moving &&
+            ownerId == VEHICLE_OWNER_NONE) {
+            TryClaimLocalVehicle(vehicleId);
+        }
 
         if (moving) {
             g_LocalStationarySince[vehicleId] = 0;
@@ -858,31 +797,43 @@ static void CaptureAndQueueLocalVehicleState(uintptr_t game) {
             g_LocalStationarySince[vehicleId] = nowMs;
         }
 
-        // Keep broadcasting the owner state even when the vehicle is stationary.
-        // This prevents the remote copy from appearing to stop receiving data.
         const bool stoppedLongEnough =
             g_LocalStationarySince[vehicleId] != 0 &&
             (nowMs - g_LocalStationarySince[vehicleId]) >= VEHICLE_STOP_RELEASE_MS;
 
-        if (stoppedLongEnough) {
+        if (stoppedLongEnough && ownerId == localOwner) {
             if (g_IsHost.load()) {
                 ReleaseVehicleAuthority(vehicleId, localOwner, true);
             } else {
                 QueueVehicleRelease(vehicleId);
+
                 std::lock_guard<std::mutex> lock(g_VehicleStateMutex);
                 g_ClaimPending[vehicleId] = true;
             }
-            continue;
         }
 
-        VehiclePositionPacket packet;
-        if (BuildVehiclePositionState(vehicleId, x, y, angle, moving, &packet)) {
-            snapshotStates.push_back(packet);
+        // Publish:
+        //   - the currently driven vehicle even if it is still contested;
+        //   - vehicles for which this device already has authority.
+        //
+        // Therefore different vehicles can travel simultaneously, while the
+        // same vehicle can still exhibit the expected tug-of-war/tremble.
+        const bool publishActiveVehicle =
+            (vehicleId == activeVehicleId);
+
+        const bool publishOwnedVehicle =
+            (ownerId == localOwner);
+
+        if (publishActiveVehicle || publishOwnedVehicle) {
+            QueueVehiclePosition(
+                vehicleId,
+                x,
+                y,
+                angle,
+                moving
+            );
         }
     }
-
-    // Send all locally-owned vehicle states as a single 256-byte snapshot.
-    QueueVehiclePositionBatches(snapshotStates);
 }
 
 static void ApplyRemoteVehicleStates(uintptr_t game) {
@@ -892,33 +843,47 @@ static void ApplyRemoteVehicleStates(uintptr_t game) {
     RefreshVehicleTopology(game);
 
     const uint32_t rawVehicleCount = *(uint32_t*)(game + 0xA4);
-    const uint32_t vehicleCount = (rawVehicleCount > VEHICLE_SLOT_LIMIT)
-        ? VEHICLE_SLOT_LIMIT : rawVehicleCount;
+    const uint32_t vehicleCount =
+        (rawVehicleCount > VEHICLE_SLOT_LIMIT)
+            ? VEHICLE_SLOT_LIMIT
+            : rawVehicleCount;
 
     const uint8_t localOwner = g_LocalPlayerId.load();
+    if (localOwner == VEHICLE_OWNER_NONE || localOwner >= MAX_PLAYERS) return;
+
     const uint64_t nowMs = GetMonotonicMilliseconds();
 
     for (uint16_t vehicleId = 0; vehicleId < vehicleCount; ++vehicleId) {
         VehicleRemoteState state;
-        memset(&state, 0, sizeof(state));
-
         uint8_t authorityOwner = VEHICLE_OWNER_NONE;
-        bool shouldApply = false;
 
         {
             std::lock_guard<std::mutex> lock(g_VehicleStateMutex);
+
+            // A snapshot may arrive before the host's authority packet.
+            // Keep buffering it, but NEVER apply it until this vehicle is
+            // explicitly owned by that remote player. This is the critical
+            // separation between network reception and local physics control.
             authorityOwner = g_VehicleAuthority[vehicleId].ownerId;
 
-            if (g_RemoteVehicles[vehicleId].valid) {
-                state = g_RemoteVehicles[vehicleId];
-                shouldApply = state.interpolationActive || state.sequence != state.appliedSequence;
+            if (authorityOwner == VEHICLE_OWNER_NONE) {
+                continue;
             }
+
+            if (authorityOwner == localOwner) {
+                continue;
+            }
+
+            if (!g_RemoteVehicles[vehicleId].valid) {
+                continue;
+            }
+
+            state = g_RemoteVehicles[vehicleId];
         }
 
-        // Never allow a remote packet to touch a locally-owned vehicle.
-        if (authorityOwner == VEHICLE_OWNER_NONE || authorityOwner == localOwner) continue;
-        if (!shouldApply) continue;
-        if (!state.valid || state.ownerId != authorityOwner) continue;
+        // A remote snapshot is valid only when its sender is the current
+        // authoritative owner for this exact vehicle slot.
+        if (state.ownerId != authorityOwner) continue;
         if (state.vehicleId != vehicleId) continue;
 
         uintptr_t vehicle = GetVehicleFromIndex(game, vehicleId);
@@ -927,51 +892,35 @@ static void ApplyRemoteVehicleStates(uintptr_t game) {
         uintptr_t body = *(uintptr_t*)(vehicle + 0x528);
         if (body == 0) continue;
 
-        float applyX = state.x;
-        float applyY = state.y;
-        float applyAngle = state.angle;
-        bool interpolationFinished = true;
+        float predictedX = state.x;
+        float predictedY = state.y;
+        float predictedAngle = state.angle;
 
-        if (state.interpolationActive) {
-            uint64_t elapsedMs = 0;
-            if (nowMs >= state.interpolationStartMs) {
-                elapsedMs = nowMs - state.interpolationStartMs;
+        if (state.moving && state.lastReceiveMs != 0) {
+            float elapsedSec =
+                (float)(nowMs - state.lastReceiveMs) / 1000.0f;
+
+            // Never extrapolate too far past the newest snapshot.
+            if (elapsedSec > 0.12f) {
+                elapsedSec = 0.12f;
             }
 
-            float t = (float)elapsedMs / (float)VEHICLE_INTERPOLATION_MS;
-            if (t < 0.0f) t = 0.0f;
-            if (t > 1.0f) t = 1.0f;
-
-            applyX = state.interpolationStartX +
-                     (state.x - state.interpolationStartX) * t;
-            applyY = state.interpolationStartY +
-                     (state.y - state.interpolationStartY) * t;
-            applyAngle = LerpAngleShortest(state.interpolationStartAngle, state.angle, t);
-            interpolationFinished = (t >= 1.0f);
+            predictedX += state.vx * elapsedSec;
+            predictedY += state.vy * elapsedSec;
+            predictedAngle += state.angularVelocity * elapsedSec;
         }
 
         TestB2Vec2 position;
-        position.x = applyX;
-        position.y = applyY;
+        position.x = predictedX;
+        position.y = predictedY;
 
-        g_b2BodySetTransform((void*)body, &position, applyAngle);
-
-        std::lock_guard<std::mutex> lock(g_VehicleStateMutex);
-        VehicleRemoteState& liveState = g_RemoteVehicles[vehicleId];
-        if (liveState.valid && liveState.sequence == state.sequence &&
-            liveState.ownerId == authorityOwner) {
-            liveState.smoothX = applyX;
-            liveState.smoothY = applyY;
-            liveState.smoothAngle = applyAngle;
-
-            if (interpolationFinished) {
-                liveState.smoothX = liveState.x;
-                liveState.smoothY = liveState.y;
-                liveState.smoothAngle = liveState.angle;
-                liveState.interpolationActive = false;
-                liveState.appliedSequence = liveState.sequence;
-            }
-        }
+        // This call is intentionally restricted to remotely-authoritative
+        // vehicles. The local driver's physics is left completely intact.
+        g_b2BodySetTransform(
+            (void*)body,
+            &position,
+            predictedAngle
+        );
     }
 }
 
@@ -1046,71 +995,112 @@ static void HandleVehicleAuthorityPacket(const VehicleAuthorityPacket& pkt) {
          (unsigned)pkt.generation);
 }
 
-static bool HandleVehiclePositionPacket(const VehiclePositionPacket& pkt) {
-    if (pkt.ownerId >= MAX_PLAYERS) return false;
-    if (pkt.vehicleId >= VEHICLE_SLOT_LIMIT) return false;
+static void StoreRemoteVehicleState(
+    uint8_t ownerId,
+    uint16_t vehicleId,
+    float x,
+    float y,
+    float angle,
+    uint32_t sequence,
+    bool moving
+) {
+    if (ownerId >= MAX_PLAYERS) return;
+    if (vehicleId >= VEHICLE_SLOT_LIMIT) return;
 
     const uint8_t localOwner = g_LocalPlayerId.load();
-    if (pkt.ownerId == localOwner) return false;
+    if (ownerId == localOwner) return;
 
-    bool shouldRelease = false;
     const uint64_t nowMs = GetMonotonicMilliseconds();
 
-    {
-        std::lock_guard<std::mutex> lock(g_VehicleStateMutex);
-        const uint8_t authorityOwner = g_VehicleAuthority[pkt.vehicleId].ownerId;
+    std::lock_guard<std::mutex> lock(g_VehicleStateMutex);
 
-        // Only the current authoritative owner is allowed to update this vehicle.
-        if (authorityOwner == VEHICLE_OWNER_NONE) return false;
-        if (authorityOwner != pkt.ownerId) return false;
+    VehicleRemoteState& state = g_RemoteVehicles[vehicleId];
 
-        VehicleRemoteState& state = g_RemoteVehicles[pkt.vehicleId];
-        if (state.valid && state.ownerId == pkt.ownerId && pkt.sequence <= state.sequence) return false;
-
-        if (!state.valid) {
-            state.smoothX = pkt.x;
-            state.smoothY = pkt.y;
-            state.smoothAngle = pkt.angle;
-            state.interpolationStartX = pkt.x;
-            state.interpolationStartY = pkt.y;
-            state.interpolationStartAngle = pkt.angle;
-            state.interpolationActive = false;
-        } else {
-            state.interpolationStartX = state.smoothX;
-            state.interpolationStartY = state.smoothY;
-            state.interpolationStartAngle = state.smoothAngle;
-            state.interpolationStartMs = nowMs;
-            state.interpolationActive = true;
-        }
-
-        state.valid = true;
-        state.ownerId = pkt.ownerId;
-        state.vehicleId = pkt.vehicleId;
-        state.x = pkt.x;
-        state.y = pkt.y;
-        state.angle = pkt.angle;
-        state.sequence = pkt.sequence;
-        state.appliedSequence = 0;
-        state.moving = (pkt.moving != 0);
-
-        if (pkt.moving != 0) {
-            g_RemoteStationarySince[pkt.vehicleId] = 0;
-        } else if (g_RemoteStationarySince[pkt.vehicleId] == 0) {
-            g_RemoteStationarySince[pkt.vehicleId] = nowMs;
-        }
-
-        if (g_IsHost.load() && pkt.moving == 0 &&
-            g_RemoteStationarySince[pkt.vehicleId] != 0 &&
-            (nowMs - g_RemoteStationarySince[pkt.vehicleId]) >= VEHICLE_STOP_RELEASE_MS) {
-            shouldRelease = true;
-        }
+    // Receiving is deliberately independent from authority. The state is
+    // buffered here; ApplyRemoteVehicleStates() is the only place allowed to
+    // touch the physics body, and it checks authority before doing so.
+    if (state.valid &&
+        state.ownerId == ownerId &&
+        sequence <= state.sequence) {
+        return;
     }
 
-    if (shouldRelease && g_IsHost.load()) {
-        ReleaseVehicleAuthority(pkt.vehicleId, pkt.ownerId, true);
+    if (state.valid &&
+        state.ownerId == ownerId &&
+        state.lastReceiveMs != 0) {
+
+        uint64_t deltaMs = nowMs - state.lastReceiveMs;
+
+        if (deltaMs >= 10 && deltaMs <= 500) {
+            float dt = (float)deltaMs / 1000.0f;
+
+            state.vx = (x - state.x) / dt;
+            state.vy = (y - state.y) / dt;
+
+            const float angleDelta =
+                GetSignedAngleDelta(state.angle, angle);
+
+            state.angularVelocity =
+                angleDelta / dt;
+        }
+    } else {
+        state.vx = 0.0f;
+        state.vy = 0.0f;
+        state.angularVelocity = 0.0f;
     }
 
-    return true;
+    state.valid = true;
+    state.ownerId = ownerId;
+    state.vehicleId = vehicleId;
+    state.x = x;
+    state.y = y;
+    state.angle = angle;
+    state.sequence = sequence;
+    state.appliedSequence = 0;
+    state.lastReceiveMs = nowMs;
+    state.moving = moving;
+}
+
+static void HandleVehiclePositionPacket(
+    const VehiclePositionPacket& pkt
+) {
+    StoreRemoteVehicleState(
+        pkt.ownerId,
+        pkt.vehicleId,
+        pkt.x,
+        pkt.y,
+        pkt.angle,
+        pkt.sequence,
+        pkt.moving != 0
+    );
+}
+
+static void HandleVehicleSnapshotPacket(
+    const VehicleSnapshotHeader& header,
+    const uint8_t* payload
+) {
+    if (header.ownerId >= MAX_PLAYERS) return;
+    if (header.count > VEHICLE_SNAPSHOT_MAX_COUNT) return;
+    if (payload == nullptr && header.count != 0) return;
+
+    for (uint8_t i = 0; i < header.count; ++i) {
+        VehicleSnapshotEntry entry;
+        memcpy(
+            &entry,
+            payload + ((size_t)i * sizeof(VehicleSnapshotEntry)),
+            sizeof(entry)
+        );
+
+        StoreRemoteVehicleState(
+            header.ownerId,
+            entry.vehicleId,
+            entry.x,
+            entry.y,
+            entry.angle,
+            entry.sequence,
+            entry.moving != 0
+        );
+    }
 }
 
 static void HandleVehicleReleasePacket(const VehicleReleasePacket& pkt) {
@@ -1137,7 +1127,20 @@ static void ResetVehicleSyncState() {
 
     {
         std::lock_guard<std::mutex> lock(g_VehicleSendMutex);
-        g_PendingVehicleBatches.clear();
+
+        memset(
+            g_LatestOutgoingVehicles,
+            0,
+            sizeof(g_LatestOutgoingVehicles)
+        );
+
+        memset(
+            g_HasLatestOutgoingVehicle,
+            0,
+            sizeof(g_HasLatestOutgoingVehicle)
+        );
+
+        g_LastVehicleNetworkSendMs = 0;
         g_PendingAuthorityPackets.clear();
         memset(&g_PendingClaimPacket, 0, sizeof(g_PendingClaimPacket));
         g_HasPendingClaimPacket = false;
@@ -1219,6 +1222,7 @@ bool IsLocalIP(const std::string& ip) {
 
 void OpenAndroidKeyboard() {
     if (g_GlobalJavaVM == nullptr) return;
+    g_AndroidKeyboardOpen.store(true);
 
     JNIEnv* env = nullptr;
     bool attached = false;
@@ -1266,6 +1270,10 @@ void OpenAndroidKeyboard() {
 }
 
 void CloseAndroidKeyboard() {
+    // Do not blindly call toggleSoftInput(): when the keyboard is already hidden,
+    // that API can OPEN it. The old UI used exactly that toggle and made BACK appear
+    // to open the keyboard. We now close only when our UI actually opened it.
+    if (!g_AndroidKeyboardOpen.exchange(false)) return;
     if (g_GlobalJavaVM == nullptr) return;
 
     JNIEnv* env = nullptr;
@@ -1313,20 +1321,41 @@ void CloseAndroidKeyboard() {
     }
 }
 
-GLuint LoadTextureFromPNGArray(const unsigned char* png_data, int data_len) {
-    int channels;
-    unsigned char* pixels = stbi_load_from_memory(png_data, data_len, &g_ButtonOrigWidth, &g_ButtonOrigHeight, &channels, 4);
-    if (!pixels) return 0;
-    GLuint textureID;
+GLuint LoadTextureFromPNGArrayEx(const unsigned char* png_data, int data_len, int* outWidth, int* outHeight) {
+    if (!png_data || data_len <= 0) return 0;
+
+    int width = 0;
+    int height = 0;
+    int channels = 0;
+    unsigned char* pixels = stbi_load_from_memory(png_data, data_len, &width, &height, &channels, 4);
+    if (!pixels || width <= 0 || height <= 0) {
+        if (pixels) stbi_image_free(pixels);
+        return 0;
+    }
+
+    GLuint textureID = 0;
     glGenTextures(1, &textureID);
+    if (textureID == 0) {
+        stbi_image_free(pixels);
+        return 0;
+    }
+
     glBindTexture(GL_TEXTURE_2D, textureID);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, g_ButtonOrigWidth, g_ButtonOrigHeight, 0, GL_RGBA, GL_UNSIGNED_BYTE, pixels);
-    stbi_image_free(pixels); 
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, width, height, 0, GL_RGBA, GL_UNSIGNED_BYTE, pixels);
+    glBindTexture(GL_TEXTURE_2D, 0);
+    stbi_image_free(pixels);
+
+    if (outWidth) *outWidth = width;
+    if (outHeight) *outHeight = height;
     return textureID;
+}
+
+GLuint LoadTextureFromPNGArray(const unsigned char* png_data, int data_len) {
+    return LoadTextureFromPNGArrayEx(png_data, data_len, &g_ButtonOrigWidth, &g_ButtonOrigHeight);
 }
 
 // Send the current authority table to a newly connected client.
@@ -1398,13 +1427,33 @@ void NetworkLoop() {
             } else if (packetType == PACKET_CHAT) {
                 packetSize = sizeof(NetworkPacket);
             } else if (packetType == PACKET_VEHICLE_POSITION) {
-                packetSize = sizeof(VehiclePositionBatchPacket);
+                packetSize = sizeof(VehiclePositionPacket);
             } else if (packetType == PACKET_VEHICLE_CLAIM) {
                 packetSize = sizeof(VehicleClaimPacket);
             } else if (packetType == PACKET_VEHICLE_AUTHORITY) {
                 packetSize = sizeof(VehicleAuthorityPacket);
             } else if (packetType == PACKET_VEHICLE_RELEASE) {
                 packetSize = sizeof(VehicleReleasePacket);
+            } else if (packetType == PACKET_VEHICLE_SNAPSHOT) {
+                if (bufferedBytes < sizeof(VehicleSnapshotHeader)) {
+                    break;
+                }
+
+                VehicleSnapshotHeader header;
+                memcpy(
+                    &header,
+                    recvBuffer,
+                    sizeof(header)
+                );
+
+                if (header.count > VEHICLE_SNAPSHOT_MAX_COUNT) {
+                    g_IsConnected.store(false);
+                    break;
+                }
+
+                packetSize =
+                    sizeof(VehicleSnapshotHeader) +
+                    ((size_t)header.count * sizeof(VehicleSnapshotEntry));
             } else {
                 g_IsConnected.store(false);
                 break;
@@ -1433,35 +1482,21 @@ void NetworkLoop() {
 
                 ShowNativeToast(formattedMsg);
             } else if (packetType == PACKET_VEHICLE_POSITION) {
-                VehiclePositionBatchPacket batch;
-                memcpy(&batch, recvBuffer, sizeof(batch));
+                VehiclePositionPacket pkt;
+                memcpy(&pkt, recvBuffer, sizeof(pkt));
+                HandleVehiclePositionPacket(pkt);
+            } else if (packetType == PACKET_VEHICLE_SNAPSHOT) {
+                VehicleSnapshotHeader header;
+                memcpy(
+                    &header,
+                    recvBuffer,
+                    sizeof(header)
+                );
 
-                const uint8_t count = (batch.count > VEHICLE_BATCH_MAX)
-                    ? VEHICLE_BATCH_MAX : batch.count;
-
-                // On the host, the client snapshot is first validated against the
-                // authority table and applied to the host game. Every accepted
-                // state is then relayed to the client using the original owner ID.
-                // This is what enables two players to drive different vehicles
-                // simultaneously (for example a tractor and a harvester).
-                std::vector<VehiclePositionPacket> acceptedStates;
-                acceptedStates.reserve(count);
-
-                for (uint8_t i = 0; i < count; ++i) {
-                    VehiclePositionPacket state = batch.states[i];
-
-                    // The batch header is authoritative for packet type/owner.
-                    state.type = PACKET_VEHICLE_POSITION;
-                    state.ownerId = batch.ownerId;
-
-                    if (HandleVehiclePositionPacket(state)) {
-                        acceptedStates.push_back(state);
-                    }
-                }
-
-                if (g_IsHost.load() && !acceptedStates.empty()) {
-                    QueueRelayedVehiclePositionBatch(acceptedStates, batch.ownerId);
-                }
+                HandleVehicleSnapshotPacket(
+                    header,
+                    recvBuffer + sizeof(header)
+                );
             } else if (packetType == PACKET_VEHICLE_CLAIM) {
                 VehicleClaimPacket pkt;
                 memcpy(&pkt, recvBuffer, sizeof(pkt));
@@ -1560,24 +1595,90 @@ void NetworkLoop() {
             }
         }
 
+        // Vehicle network traffic is intentionally capped at 10 snapshots/sec.
+        // All currently-known local vehicle states are packed into one TCP message.
         if (g_IsConnected.load()) {
-            // The queue can contain local snapshots or host-relayed snapshots.
-            // Relayed batches keep the remote player's owner ID intact.
-            std::vector<VehiclePositionBatchPacket> vehicleBatches;
-            {
-                std::lock_guard<std::mutex> lock(g_VehicleSendMutex);
-                vehicleBatches.swap(g_PendingVehicleBatches);
-            }
+            const uint64_t nowMs = GetMonotonicMilliseconds();
 
-            for (size_t i = 0; i < vehicleBatches.size() && g_IsConnected.load(); ++i) {
-                if (!SendAllBytes(g_TcpSocket, &vehicleBatches[i], sizeof(vehicleBatches[i]))) {
-                    g_IsConnected.store(false);
-                    break;
+            if (g_LastVehicleNetworkSendMs == 0 ||
+                (nowMs - g_LastVehicleNetworkSendMs) >= VEHICLE_NETWORK_INTERVAL_MS) {
+
+                std::vector<VehicleSnapshotEntry> entries;
+                entries.reserve(VEHICLE_SNAPSHOT_MAX_COUNT);
+
+                {
+                    std::lock_guard<std::mutex> lock(g_VehicleSendMutex);
+
+                    for (uint16_t vehicleId = 0;
+                         vehicleId < VEHICLE_SLOT_LIMIT &&
+                         entries.size() < VEHICLE_SNAPSHOT_MAX_COUNT;
+                         ++vehicleId) {
+
+                        if (!g_HasLatestOutgoingVehicle[vehicleId]) {
+                            continue;
+                        }
+
+                        const VehiclePositionPacket& srcPkt =
+                            g_LatestOutgoingVehicles[vehicleId];
+
+                        VehicleSnapshotEntry entry;
+                        memset(&entry, 0, sizeof(entry));
+
+                        entry.vehicleId = srcPkt.vehicleId;
+                        entry.x = srcPkt.x;
+                        entry.y = srcPkt.y;
+                        entry.angle = srcPkt.angle;
+                        entry.sequence = srcPkt.sequence;
+                        entry.moving = srcPkt.moving;
+
+                        entries.push_back(entry);
+                    }
                 }
+
+                if (!entries.empty()) {
+                    VehicleSnapshotHeader header;
+                    memset(&header, 0, sizeof(header));
+
+                    header.type = PACKET_VEHICLE_SNAPSHOT;
+                    header.ownerId = g_LocalPlayerId.load();
+                    header.count = (uint8_t)entries.size();
+                    header.sequence =
+                        g_LocalVehicleSequence.load();
+
+                    std::vector<uint8_t> snapshotBuffer;
+                    snapshotBuffer.resize(
+                        sizeof(header) +
+                        (entries.size() * sizeof(VehicleSnapshotEntry))
+                    );
+
+                    memcpy(
+                        snapshotBuffer.data(),
+                        &header,
+                        sizeof(header)
+                    );
+
+                    memcpy(
+                        snapshotBuffer.data() + sizeof(header),
+                        entries.data(),
+                        entries.size() * sizeof(VehicleSnapshotEntry)
+                    );
+
+                    if (!SendAllBytes(
+                            g_TcpSocket,
+                            snapshotBuffer.data(),
+                            snapshotBuffer.size()
+                        )) {
+
+                        g_IsConnected.store(false);
+                        break;
+                    }
+                }
+
+                g_LastVehicleNetworkSendMs = nowMs;
             }
         }
 
-        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
     }
 }
 
@@ -1690,8 +1791,6 @@ void TCPHostThread() {
     g_TcpSocket = accept(g_TcpServerFd, (struct sockaddr*)&address, (socklen_t*)&addrlen);
     
     if (g_TcpSocket >= 0 && g_IsHost) {
-        ConfigureTcpSocket(g_TcpSocket);
-
         SessionWelcomePacket welcome;
         memset(&welcome, 0, sizeof(welcome));
         welcome.type = PACKET_SESSION_WELCOME;
@@ -1744,7 +1843,6 @@ void TCPClientThread(std::string hostIP) {
     ShowNativeToast("Connecting to room: " + hostIP);
 
     if (connect(g_TcpSocket, (struct sockaddr*)&serv_addr, sizeof(serv_addr)) >= 0) {
-        ConfigureTcpSocket(g_TcpSocket);
         g_IsConnected = true;
         g_ConnectedStatus = "Connected to Host!";
         ShowNativeToast("Successfully Joined Room!"); 
@@ -1826,6 +1924,19 @@ int32_t my_AInputQueue_getEvent(void* queue, AInputEvent** outEvent) {
 
                 bool shouldEatEvent = false;
 
+                // Android BACK: first close the soft keyboard, otherwise close our MP menu.
+                if (keyCode == AKEYCODE_BACK && action == AKEY_EVENT_ACTION_DOWN &&
+                    g_ImGuiInitialized && ImGui::GetCurrentContext() != nullptr) {
+                    if (g_IsMultiplayerMenuActive) {
+                        if (g_AndroidKeyboardOpen.load()) {
+                            CloseAndroidKeyboard();
+                        } else {
+                            g_IsMultiplayerMenuActive = false;
+                        }
+                        shouldEatEvent = true;
+                    }
+                }
+
                 if (g_ImGuiInitialized && ImGui::GetCurrentContext() != nullptr) {
                     ImGuiIO& io = ImGui::GetIO();
                     bool isDown = (action == AKEY_EVENT_ACTION_DOWN);
@@ -1880,6 +1991,9 @@ int32_t my_AInputQueue_getEvent(void* queue, AInputEvent** outEvent) {
     return result; 
 }
 
+// ========================================================================
+// GAME-STYLE MENU UI HELPERS
+// ========================================================================
 static ImTextureID ToImGuiTexture(GLuint texture) {
     return (ImTextureID)(intptr_t)texture;
 }
@@ -1889,16 +2003,27 @@ static void InitGameUIFont() {
     g_GameUIFontInitialized = true;
 
     ImGuiIO& io = ImGui::GetIO();
-
-    const char* fontPaths[] = {
-        "/system/fonts/RobotoCondensed-Regular.ttf",
-        "/system/fonts/Roboto-Regular.ttf",
-        "/system/fonts/DroidSans.ttf"
+    static const ImWchar gameRanges[] = {
+        0x0020, 0x024F, // Latin + Latin Extended
+        0x00C0, 0x00FF, // Latin-1 supplement (kept explicit for older ImGui builds)
+        0
     };
 
-    for (size_t i = 0; i < sizeof(fontPaths) / sizeof(fontPaths[0]); ++i) {
-        if (access(fontPaths[i], R_OK) == 0) {
-            g_GameUIFont = io.Fonts->AddFontFromFileTTF(fontPaths[i], 30.0f);
+    // The game's font03_P.p2d is a bitmap atlas. The engine loads it through
+    // GLESHandheldRenderDevice::initFont together with a FontInfo metrics table.
+    // Without that table the raw atlas cannot be fed to ImGui as a TTF, so use
+    // a condensed Android face rather than the old mono-looking default.
+    const char* paths[] = {
+        "/system/fonts/RobotoCondensed-Regular.ttf",
+        "/system/fonts/Roboto-Regular.ttf",
+        "/system/fonts/DroidSans.ttf",
+        "/system/fonts/NotoSans-Regular.ttf"
+    };
+
+    const float fontPx = 31.0f;
+    for (size_t i = 0; i < sizeof(paths) / sizeof(paths[0]); ++i) {
+        if (access(paths[i], R_OK) == 0) {
+            g_GameUIFont = io.Fonts->AddFontFromFileTTF(paths[i], fontPx, nullptr, gameRanges);
             if (g_GameUIFont != nullptr) break;
         }
     }
@@ -1908,316 +2033,148 @@ static void InitGameUIFont() {
     }
 }
 
-static float UiScaleForScreen(float screenW, float screenH) {
-    float scale = screenH / 540.0f;
-    if (scale < 1.0f) scale = 1.0f;
-    if (scale > 2.4f) scale = 2.4f;
-
-    if (screenW > screenH * 2.0f) {
-        scale *= 0.92f;
+// The source button is a 600x200 RGBA image. Its visible painted area occupies
+// roughly y=49..151 and its right edge slopes inward. Keep that original artwork
+// intact; only scale it uniformly. The hit test follows the painted trapezoid so
+// transparent padding around the image is not clickable.
+static bool IsInsideGameButtonTexture(ImVec2 pos, ImVec2 size, bool rightAligned) {
+    const ImVec2 mouse = ImGui::GetIO().MousePos;
+    if (mouse.x < pos.x || mouse.x > pos.x + size.x ||
+        mouse.y < pos.y || mouse.y > pos.y + size.y) {
+        return false;
     }
 
-    return scale;
+    float u = (mouse.x - pos.x) / std::max(1.0f, size.x);
+    float v = (mouse.y - pos.y) / std::max(1.0f, size.y);
+    if (rightAligned) u = 1.0f - u;
+
+    // Matches the actual alpha contour of button_textless_clean.png.
+    if (v < 0.245f || v > 0.765f) return false;
+    const float t = (v - 0.245f) / (0.765f - 0.245f);
+    const float left = 0.006f;
+    const float right = 0.990f - 0.080f * t;
+    return u >= left && u <= right;
 }
 
-static ImVec4 MenuButtonColor(bool hovered, bool active) {
-    if (active) return ImVec4(0.055f, 0.16f, 0.29f, 0.98f);
-    if (hovered) return ImVec4(0.12f, 0.31f, 0.54f, 0.98f);
-    return ImVec4(0.07f, 0.22f, 0.40f, 0.96f);
-}
-
-static bool DrawGameMenuButton(
-    const char* id,
-    const char* label,
-    const ImVec2& topLeft,
-    const ImVec2& size,
-    float textSize)
-{
-    ImGui::SetCursorScreenPos(topLeft);
-    const bool clicked = ImGui::InvisibleButton(id, size);
-    const bool hovered = ImGui::IsItemHovered();
-    const bool active = ImGui::IsItemActive();
+static bool DrawGameStyleButton(const char* id, const char* label, ImVec2 size,
+                                float textScale = 1.0f, bool rightAligned = false) {
+    ImVec2 pos = ImGui::GetCursorScreenPos();
+    // Keep the ImGui item large enough for the image, but only accept clicks
+    // inside the painted button portion of the texture.
+    ImGui::InvisibleButton(id, size);
+    const bool hovered = ImGui::IsItemHovered() && IsInsideGameButtonTexture(pos, size, rightAligned);
+    const bool active = hovered && ImGui::IsItemActive();
+    const bool clicked = ImGui::IsItemClicked(ImGuiMouseButton_Left) &&
+                         IsInsideGameButtonTexture(pos, size, rightAligned);
 
     ImDrawList* draw = ImGui::GetWindowDrawList();
-    const ImVec2 p0 = topLeft;
-    const ImVec2 p1(topLeft.x + size.x, topLeft.y + size.y);
 
-    const ImU32 topColor = hovered
-        ? IM_COL32(45, 105, 175, 255)
-        : IM_COL32(28, 78, 137, 255);
-    const ImU32 bottomColor = active
-        ? IM_COL32(12, 36, 63, 255)
-        : IM_COL32(18, 55, 98, 255);
+    if (g_MultiplayerButtonTexture != 0) {
+        if (!rightAligned) {
+            draw->AddImage(ToImGuiTexture(g_MultiplayerButtonTexture),
+                           pos, ImVec2(pos.x + size.x, pos.y + size.y),
+                           ImVec2(0.0f, 0.0f), ImVec2(1.0f, 1.0f));
+        } else {
+            draw->AddImage(ToImGuiTexture(g_MultiplayerButtonTexture),
+                           pos, ImVec2(pos.x + size.x, pos.y + size.y),
+                           ImVec2(1.0f, 0.0f), ImVec2(0.0f, 1.0f));
+        }
 
-    draw->AddRectFilledMultiColor(
-        p0, p1, topColor, topColor, bottomColor, bottomColor);
-
-    draw->AddRect(
-        p0, p1,
-        hovered ? IM_COL32(220, 235, 250, 220) : IM_COL32(170, 190, 210, 150),
-        1.0f,
-        0,
-        1.0f);
-
-    if (hovered) {
-        draw->AddRectFilled(
-            ImVec2(p0.x + 1.0f, p0.y + 1.0f),
-            ImVec2(p1.x - 1.0f, p1.y + 1.0f + size.y * 0.12f),
-            IM_COL32(255, 255, 255, active ? 12 : 20));
+        if (hovered) {
+            draw->AddRectFilled(pos, ImVec2(pos.x + size.x, pos.y + size.y),
+                                IM_COL32(255, 255, 255, active ? 26 : 12));
+        }
+    } else {
+        draw->AddRectFilled(pos, ImVec2(pos.x + size.x, pos.y + size.y),
+                            IM_COL32(20, 24, 28, 205), 2.0f);
     }
 
     ImFont* font = g_GameUIFont ? g_GameUIFont : ImGui::GetFont();
-    ImVec2 textSizeMeasured = font->CalcTextSizeA(
-        textSize, 10000.0f, 0.0f, label);
-
-    const ImVec2 textPos(
-        p0.x + (size.x - textSizeMeasured.x) * 0.5f,
-        p0.y + (size.y - textSizeMeasured.y) * 0.5f - 1.0f);
-
-    draw->AddText(
-        font,
-        textSize,
-        textPos,
-        IM_COL32(248, 248, 248, 255),
-        label);
-
+    const float textSizePx = std::max(27.0f, 31.0f * textScale *
+                                             std::max(0.90f, std::min(1.12f, ImGui::GetIO().DisplaySize.y / 1080.0f)));
+    ImVec2 measured = font->CalcTextSizeA(textSizePx, FLT_MAX, 0.0f, label);
+    ImVec2 textPos(
+        pos.x + (size.x - measured.x) * 0.5f,
+        pos.y + (size.y - measured.y) * 0.5f - 1.0f
+    );
+    draw->AddText(font, textSizePx, textPos,
+                  IM_COL32(245, 245, 245, 255), label);
     return clicked;
 }
 
-static void DrawHeaderFade(
-    ImDrawList* draw,
-    const char* title,
-    const char* subtitle,
-    float left,
-    float top,
-    float width,
-    float titleSize,
-    float subtitleSize)
-{
-    const float titleRight = left + width * 0.60f;
-    const float darkBottom = top + titleSize + subtitleSize + 34.0f;
-
-    // A soft dark field keeps the title readable without covering the whole artwork.
-    draw->AddRectFilled(
-        ImVec2(0.0f, 0.0f),
-        ImVec2(titleRight + 36.0f, darkBottom),
-        IM_COL32(0, 0, 0, 92));
-
-    draw->AddText(
-        g_GameUIFont,
-        titleSize,
-        ImVec2(left, top),
-        IM_COL32(255, 255, 255, 255),
-        title);
-
-    if (subtitle != nullptr && subtitle[0] != '\0') {
-        draw->AddText(
-            g_GameUIFont,
-            subtitleSize,
-            ImVec2(left, top + titleSize + 3.0f),
-            IM_COL32(224, 232, 240, 230),
-            subtitle);
-    }
-
-    const float lineY = top + titleSize + subtitleSize + 13.0f;
-    const float lineEnd = left + width * 0.56f;
-
-    // The line starts bright and fades toward the center of the screen.
-    draw->AddRectFilledMultiColor(
-        ImVec2(left, lineY),
-        ImVec2(lineEnd, lineY + 1.5f),
-        IM_COL32(255, 255, 255, 210),
-        IM_COL32(255, 255, 255, 35),
-        IM_COL32(255, 255, 255, 35),
-        IM_COL32(255, 255, 255, 210));
-}
-
-static void DrawDarkPanel(
-    ImDrawList* draw,
-    const ImVec2& minPos,
-    const ImVec2& maxPos,
-    int alpha)
-{
-    draw->AddRectFilled(
-        minPos,
-        maxPos,
-        IM_COL32(2, 4, 7, alpha));
-
-    draw->AddRect(
-        minPos,
-        maxPos,
-        IM_COL32(215, 225, 235, 48),
-        0.0f,
-        0,
-        1.0f);
-}
-
-static bool DrawTextInput(
-    const char* label,
-    char* buffer,
-    size_t bufferSize,
-    const ImVec2& topLeft,
-    float width,
-    float height)
-{
-    ImGui::SetCursorScreenPos(topLeft);
-    ImGui::SetNextItemWidth(width);
-
-    const bool enterPressed = ImGui::InputText(
-        label,
-        buffer,
-        bufferSize,
-        ImGuiInputTextFlags_EnterReturnsTrue);
-
-    if (ImGui::IsItemClicked()) {
-        OpenAndroidKeyboard();
-    }
-
-    if (enterPressed) {
-        CloseAndroidKeyboard();
-    }
-
-    return enterPressed;
-}
-
-static void RenderChatPanel(
-    float panelX,
-    float panelY,
-    float panelW,
-    float panelH,
-    float uiScale)
-{
+static void DrawFadingHeaderLine(float startX, float y, float endX) {
     ImDrawList* draw = ImGui::GetWindowDrawList();
-
-    const float pad = 18.0f * uiScale;
-    const float titleSize = 28.0f * uiScale;
-    const float inputH = 54.0f * uiScale;
-    const float sendW = 150.0f * uiScale;
-
-    draw->AddText(
-        g_GameUIFont,
-        titleSize,
-        ImVec2(panelX + pad, panelY + pad),
-        IM_COL32(245, 245, 245, 255),
-        "Chat");
-
-    const float historyY = panelY + pad + titleSize + 10.0f;
-    const float historyH = std::max(
-        100.0f * uiScale,
-        panelH - (historyY - panelY) - inputH - pad * 2.0f - 8.0f);
-
-    ImGui::SetCursorScreenPos(ImVec2(panelX + pad, historyY));
-
-    ImGui::PushStyleColor(
-        ImGuiCol_ChildBg,
-        ImVec4(0.015f, 0.02f, 0.025f, 0.54f));
-    ImGui::PushStyleVar(
-        ImGuiStyleVar_ChildRounding,
-        1.0f);
-
-    ImGui::BeginChild(
-        "##ChatHistory",
-        ImVec2(panelW - pad * 2.0f, historyH),
-        true,
-        ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
-
-    {
-        std::lock_guard<std::mutex> lock(g_ChatMutex);
-        for (size_t i = 0; i < g_ChatMessages.size(); ++i) {
-            ImGui::PushTextWrapPos(0.0f);
-            ImGui::TextWrapped("%s", g_ChatMessages[i].c_str());
-            ImGui::PopTextWrapPos();
-        }
-
-        if (ImGui::GetScrollY() >= ImGui::GetScrollMaxY() - 2.0f) {
-            ImGui::SetScrollHereY(1.0f);
-        }
+    const int segments = 14;
+    const float width = std::max(40.0f, endX - startX);
+    const float segW = width / (float)segments;
+    for (int i = 0; i < segments; ++i) {
+        const float fade = 1.0f - ((float)i / (float)segments);
+        const int alpha = (int)(220.0f * fade);
+        const float x0 = startX + segW * i;
+        const float x1 = x0 + segW + 0.5f;
+        ImGui::GetWindowDrawList()->AddLine(ImVec2(x0, y), ImVec2(x1, y),
+                                            IM_COL32(255, 255, 255, alpha), 1.0f);
     }
+}
 
-    ImGui::EndChild();
-    ImGui::PopStyleVar();
-    ImGui::PopStyleColor();
+static void DrawGameSectionTitle(const char* title, float width) {
+    ImDrawList* draw = ImGui::GetWindowDrawList();
+    ImVec2 p = ImGui::GetCursorScreenPos();
+    draw->AddText(g_GameUIFont, 30.0f, p, IM_COL32(255, 255, 255, 255), title);
+    const float lineY = p.y + 36.0f;
+    DrawFadingHeaderLine(p.x, lineY, p.x + width);
+    ImGui::Dummy(ImVec2(width, 48.0f));
+}
 
-    const float inputY = panelY + panelH - pad - inputH;
-    const float inputW = panelW - pad * 2.0f - sendW - 10.0f;
+static void DrawGameStatusText(const char* label, const std::string& value, float width) {
+    ImDrawList* draw = ImGui::GetWindowDrawList();
+    ImVec2 p = ImGui::GetCursorScreenPos();
+    draw->AddText(g_GameUIFont, 25.0f, p, IM_COL32(225, 225, 225, 255), label);
+    ImVec2 labelSize = ImGui::CalcTextSize(label);
+    draw->AddText(g_GameUIFont, 25.0f,
+                  ImVec2(p.x + labelSize.x + 10.0f, p.y),
+                  IM_COL32(130, 225, 245, 255), value.c_str());
+    ImGui::Dummy(ImVec2(width, 34.0f));
+}
 
-    ImGui::SetCursorScreenPos(ImVec2(panelX + pad, inputY));
-    ImGui::PushStyleColor(
-        ImGuiCol_FrameBg,
-        ImVec4(0.04f, 0.07f, 0.10f, 0.84f));
-    ImGui::PushStyleColor(
-        ImGuiCol_FrameBgHovered,
-        ImVec4(0.08f, 0.13f, 0.18f, 0.92f));
-    ImGui::PushStyleColor(
-        ImGuiCol_FrameBgActive,
-        ImVec4(0.10f, 0.16f, 0.22f, 0.96f));
-    ImGui::PushStyleVar(
-        ImGuiStyleVar_FramePadding,
-        ImVec2(12.0f * uiScale, 6.0f * uiScale));
+static void DrawGamePanel(ImVec2 minPos, ImVec2 maxPos, int alpha = 88) {
+    ImDrawList* draw = ImGui::GetWindowDrawList();
+    draw->AddRectFilled(minPos, maxPos, IM_COL32(3, 7, 10, alpha), 3.0f);
+    draw->AddRect(minPos, maxPos, IM_COL32(255, 255, 255, 28), 3.0f, 0, 1.0f);
+}
 
-    static char inputBuffer[200] = "";
-
-    ImGui::SetNextItemWidth(inputW);
-    const bool enterPressed = ImGui::InputText(
-        "##ChatInput",
-        inputBuffer,
-        IM_ARRAYSIZE(inputBuffer),
-        ImGuiInputTextFlags_EnterReturnsTrue);
-
-    if (ImGui::IsItemClicked()) {
-        OpenAndroidKeyboard();
+static void DrawHeaderDarkening(const ImVec2& screen) {
+    ImDrawList* draw = ImGui::GetBackgroundDrawList();
+    // Existing game menus also darken the artwork behind their white header text.
+    // Use a soft band instead of a full opaque layer so the farm artwork remains visible.
+    const float bandH = std::min(145.0f, screen.y * 0.18f);
+    const int segments = 18;
+    const float segW = screen.x * 0.52f / (float)segments;
+    for (int i = 0; i < segments; ++i) {
+        const float t = (float)i / (float)segments;
+        const int alpha = (int)(82.0f * (1.0f - t));
+        draw->AddRectFilled(ImVec2(segW * i, 0.0f),
+                            ImVec2(segW * (i + 1) + 1.0f, bandH),
+                            IM_COL32(0, 0, 0, alpha));
     }
-
-    ImGui::PopStyleVar();
-    ImGui::PopStyleColor(3);
-
-    ImGui::SetCursorScreenPos(
-        ImVec2(panelX + pad + inputW + 10.0f, inputY));
-
-    const bool sendPressed = DrawGameMenuButton(
-        "##SendButton",
-        "Send",
-        ImGui::GetCursorScreenPos(),
-        ImVec2(sendW, inputH),
-        27.0f * uiScale);
-
-    if (sendPressed || enterPressed) {
-        if (strlen(inputBuffer) > 0) {
-            const std::string msgStr(inputBuffer);
-
-            {
-                std::lock_guard<std::mutex> lock(g_ChatMutex);
-                g_ChatMessages.push_back("You: " + msgStr);
-            }
-
-            {
-                std::lock_guard<std::mutex> lock(g_OutgoingChatMutex);
-                g_OutgoingChats.push_back(msgStr);
-            }
-
-            memset(inputBuffer, 0, sizeof(inputBuffer));
-        }
-
-        CloseAndroidKeyboard();
-    }
+    draw->AddRectFilled(ImVec2(0.0f, 0.0f), screen, IM_COL32(0, 0, 0, 22));
 }
 
 void DrawImGui() {
     if (!g_ImGuiInitialized) {
         ImGui::CreateContext();
-        ImGui::StyleColorsDark();
         InitGameUIFont();
-
+        ImGui::StyleColorsDark();
         ImGuiStyle& style = ImGui::GetStyle();
         style.WindowRounding = 0.0f;
-        style.ChildRounding = 1.0f;
-        style.FrameRounding = 1.0f;
+        style.ChildRounding = 2.0f;
+        style.FrameRounding = 2.0f;
+        style.ScrollbarRounding = 2.0f;
         style.WindowBorderSize = 0.0f;
         style.FrameBorderSize = 0.0f;
-        style.ItemSpacing = ImVec2(8.0f, 8.0f);
-        style.ItemInnerSpacing = ImVec2(8.0f, 6.0f);
-        style.FramePadding = ImVec2(8.0f, 5.0f);
-
+        style.ItemSpacing = ImVec2(7.0f, 5.0f);
+        style.ItemInnerSpacing = ImVec2(6.0f, 5.0f);
+        style.FramePadding = ImVec2(10.0f, 8.0f);
         ImGui_ImplOpenGL3_Init("#version 100");
         g_ImGuiInitialized = true;
     }
@@ -2226,31 +2183,22 @@ void DrawImGui() {
     if (!g_GameUIFontInitialized) InitGameUIFont();
 
     if (!g_TextureLoaded) {
-        g_MultiplayerButtonTexture = LoadTextureFromPNGArray(
-            buton_png_data,
-            buton_png_len);
+        g_MultiplayerButtonTexture = LoadTextureFromPNGArray(buton_png_data, buton_png_len);
         g_TextureLoaded = (g_MultiplayerButtonTexture != 0);
     }
-
-    if (!g_MenuBackgroundLoaded) {
-        g_MenuBackgroundTexture = LoadTextureFromPNGArray(
-            game_menu_bg_png_data,
-            (int)game_menu_bg_png_len);
-        g_MenuBackgroundLoaded = (g_MenuBackgroundTexture != 0);
+    if (!g_GameMenuBackgroundLoaded) {
+        g_GameMenuBackgroundTexture = LoadTextureFromPNGArrayEx(
+            game_menu_bg_png_data, game_menu_bg_png_len,
+            &g_GameMenuBackgroundWidth, &g_GameMenuBackgroundHeight);
+        g_GameMenuBackgroundLoaded = (g_GameMenuBackgroundTexture != 0);
     }
 
     ImGuiIO& io = ImGui::GetIO();
-
     GLint viewport[4] = {0, 0, 0, 0};
     glGetIntegerv(GL_VIEWPORT, viewport);
-
-    const float screenW = (float)viewport[2];
-    const float screenH = (float)viewport[3];
-
-    io.DisplaySize = ImVec2(screenW, screenH);
+    const ImVec2 screen((float)viewport[2], (float)viewport[3]);
+    io.DisplaySize = screen;
     io.DeltaTime = 1.0f / 60.0f;
-
-    const float uiScale = UiScaleForScreen(screenW, screenH);
     io.FontGlobalScale = 1.0f;
 
     io.AddMousePosEvent(g_TouchX.load(), g_TouchY.load());
@@ -2259,513 +2207,312 @@ void DrawImGui() {
     ImGui_ImplOpenGL3_NewFrame();
     ImGui::NewFrame();
 
-    // The small entry point exists only in the native game menu.
-    // Settings -> Create room, Save/Load -> Join room.
-    if (g_CurrentMenu != MENU_INGAME &&
-        !g_IsMultiplayerMenuActive &&
-        g_MultiplayerButtonTexture != 0)
-    {
-        const float entryW = std::min(screenW * 0.26f, 360.0f * uiScale);
-        float entryH = std::max(54.0f * uiScale, screenH * 0.095f);
-        if (g_ButtonOrigWidth > 0 && g_ButtonOrigHeight > 0) {
-            entryH = entryW * ((float)g_ButtonOrigHeight / (float)g_ButtonOrigWidth);
-            if (entryH > screenH * 0.15f) entryH = screenH * 0.15f;
-        }
-        const float entryX = 0.0f;
-        const float entryY = std::max(10.0f * uiScale, screenH * 0.012f);
+    if (g_CurrentMenu != MENU_INGAME && !g_IsMultiplayerMenuActive && g_MultiplayerButtonTexture != 0) {
+        // The two entry points are tied to the actual game menu: Start/Settings gets
+        // Create Room, while Save/Load/Server Browser gets Join Room. Never show both.
+        const bool isSettings = (g_CurrentMenu == MENU_SETTINGS);
+        const char* entryLabel = isSettings ? "Create Room" : "Join Room";
+        const float entryW = std::min(780.0f, std::max(520.0f, screen.x * 0.43f));
+        const float entryH = entryW / 3.0f;
+        const float entryX = -10.0f;                 // flush to left edge; no gap
+        const float entryY = std::max(6.0f, screen.y * 0.012f); // slightly higher
 
-        ImGui::SetNextWindowPos(ImVec2(0.0f, 0.0f), ImGuiCond_Always);
-        ImGui::SetNextWindowSize(ImVec2(screenW, screenH), ImGuiCond_Always);
+        ImGui::SetNextWindowPos(ImVec2(entryX, entryY), ImGuiCond_Always);
+        ImGui::SetNextWindowSize(ImVec2(entryW, entryH), ImGuiCond_Always);
         ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0, 0));
-
-        ImGui::Begin(
-            "##MPEntryRoot",
-            nullptr,
-            ImGuiWindowFlags_NoDecoration |
-            ImGuiWindowFlags_NoBackground |
-            ImGuiWindowFlags_NoMove |
-            ImGuiWindowFlags_NoResize |
-            ImGuiWindowFlags_NoSavedSettings |
-            ImGuiWindowFlags_NoScrollbar |
-            ImGuiWindowFlags_NoScrollWithMouse);
-
-        const char* entryLabel =
-            (g_CurrentMenu == MENU_SETTINGS) ? "Create room" : "Join room";
-
-        ImGui::SetCursorScreenPos(ImVec2(entryX, entryY));
-        const bool entryClicked = ImGui::InvisibleButton(
-            "##MPEntryTextureButton",
-            ImVec2(entryW, entryH));
-
-        const bool entryHovered = ImGui::IsItemHovered();
-        ImDrawList* entryDraw = ImGui::GetWindowDrawList();
-
-        // Keep the supplied button artwork. The clickable area is exactly
-        // the visible texture rectangle; there is no invisible padding.
-        entryDraw->AddImage(
-            ToImGuiTexture(g_MultiplayerButtonTexture),
-            ImVec2(entryX, entryY),
-            ImVec2(entryX + entryW, entryY + entryH),
-            ImVec2(0.0f, 0.0f),
-            ImVec2(1.0f, 1.0f));
-
-        // Cover the old baked-in word only inside its text band, then redraw
-        // the new label with ImGui. The artwork itself is never geometrically
-        // stretched or skewed beyond the requested rectangle.
-        entryDraw->AddRectFilled(
-            ImVec2(entryX + entryW * 0.15f, entryY + entryH * 0.22f),
-            ImVec2(entryX + entryW * 0.92f, entryY + entryH * 0.78f),
-            IM_COL32(15, 35, 58, 165));
-
-        ImFont* entryFont = g_GameUIFont ? g_GameUIFont : ImGui::GetFont();
-        const float entryTextSize = 29.0f * uiScale;
-        const ImVec2 measured = entryFont->CalcTextSizeA(
-            entryTextSize, 10000.0f, 0.0f, entryLabel);
-
-        entryDraw->AddText(
-            entryFont,
-            entryTextSize,
-            ImVec2(
-                entryX + (entryW - measured.x) * 0.5f,
-                entryY + (entryH - measured.y) * 0.5f - 1.0f),
-            IM_COL32(250, 250, 250, 255),
-            entryLabel);
-
-        if (entryHovered) {
-            entryDraw->AddRectFilled(
-                ImVec2(entryX, entryY),
-                ImVec2(entryX + entryW, entryY + entryH),
-                IM_COL32(255, 255, 255, g_TouchDown.load() ? 18 : 10));
-        }
-
-        if (entryClicked) {
+        ImGui::Begin("##MPEntryButton", nullptr,
+                     ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoBackground |
+                     ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove |
+                     ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoScrollbar |
+                     ImGuiWindowFlags_NoScrollWithMouse);
+        if (DrawGameStyleButton("##RoomEntry", entryLabel, ImVec2(entryW, entryH), 1.14f, false)) {
+            g_CurrentMenu = isSettings ? MENU_SETTINGS : MENU_SAVELOAD;
             g_IsMultiplayerMenuActive = true;
         }
-
         ImGui::End();
         ImGui::PopStyleVar();
     }
 
     if (g_IsMultiplayerMenuActive) {
-        // Full-screen background with a uniform dark veil.
-        ImDrawList* backgroundDraw = ImGui::GetBackgroundDrawList();
-
-        if (g_MenuBackgroundTexture != 0) {
-            const float srcW = 1024.0f;
-            const float srcH = 1024.0f;
-            const float scale = std::max(screenW / srcW, screenH / srcH);
-            const float drawW = srcW * scale;
-            const float drawH = srcH * scale;
-            const float drawX = (screenW - drawW) * 0.5f;
-            const float drawY = screenH - drawH;
-
-            backgroundDraw->AddImage(
-                ToImGuiTexture(g_MenuBackgroundTexture),
-                ImVec2(drawX, drawY),
-                ImVec2(drawX + drawW, drawY + drawH),
-                ImVec2(0.0f, 0.0f),
-                ImVec2(1.0f, 1.0f));
-        } else {
-            backgroundDraw->AddRectFilled(
-                ImVec2(0, 0),
-                ImVec2(screenW, screenH),
-                IM_COL32(8, 12, 16, 255));
+        ImDrawList* bg = ImGui::GetBackgroundDrawList();
+        if (g_GameMenuBackgroundTexture != 0 &&
+            g_GameMenuBackgroundWidth > 0 && g_GameMenuBackgroundHeight > 0) {
+            // Keep source aspect exactly 1:1. Pin the lower corners to the viewport;
+            // on the usual landscape devices this means screen width is the scale
+            // driver, so the visible sky at the top is naturally decided by device ratio.
+            float scale = screen.x / (float)g_GameMenuBackgroundWidth;
+            const float drawW = g_GameMenuBackgroundWidth * scale;
+            const float drawH = g_GameMenuBackgroundHeight * scale;
+            float drawY = screen.y - drawH;
+            if (drawY > 0.0f) drawY = 0.0f;
+            bg->AddImage(ToImGuiTexture(g_GameMenuBackgroundTexture),
+                         ImVec2(0.0f, drawY), ImVec2(drawW, drawY + drawH),
+                         ImVec2(0.0f, 0.0f), ImVec2(1.0f, 1.0f));
+            DrawHeaderDarkening(screen);
         }
 
-        backgroundDraw->AddRectFilled(
-            ImVec2(0, 0),
-            ImVec2(screenW, screenH),
-            IM_COL32(0, 0, 0, 72));
+        ImGui::SetNextWindowPos(ImVec2(0, 0), ImGuiCond_Always);
+        ImGui::SetNextWindowSize(screen, ImGuiCond_Always);
+        ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0, 0));
+        ImGui::Begin("##GameStyleMultiplayerRoot", nullptr,
+                     ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoBackground |
+                     ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove |
+                     ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoScrollbar |
+                     ImGuiWindowFlags_NoScrollWithMouse);
 
-        ImGui::SetNextWindowPos(ImVec2(0.0f, 0.0f), ImGuiCond_Always);
-        ImGui::SetNextWindowSize(ImVec2(screenW, screenH), ImGuiCond_Always);
+        ImGui::PushFont(g_GameUIFont);
 
-        ImGui::PushStyleVar(
-            ImGuiStyleVar_WindowPadding,
-            ImVec2(0, 0));
-
-        ImGui::Begin(
-            "##FS12MultiplayerRoot",
-            nullptr,
-            ImGuiWindowFlags_NoDecoration |
-            ImGuiWindowFlags_NoMove |
-            ImGuiWindowFlags_NoResize |
-            ImGuiWindowFlags_NoSavedSettings |
-            ImGuiWindowFlags_NoScrollbar |
-            ImGuiWindowFlags_NoScrollWithMouse);
-
+        const float edgeBleed = -8.0f;
+        const float titleX = 12.0f;
+        const float titleY = 12.0f;
+        const char* title = (g_CurrentMenu == MENU_SAVELOAD)
+                                ? "Multiplayer Server Browser"
+                                : "Multiplayer Room";
+        const float titleSize = std::max(38.0f, std::min(46.0f, screen.y * 0.045f));
         ImDrawList* draw = ImGui::GetWindowDrawList();
+        draw->AddText(g_GameUIFont, titleSize, ImVec2(titleX, titleY),
+                      IM_COL32(255, 255, 255, 255), title);
+        const float titleWidth = g_GameUIFont->CalcTextSizeA(titleSize, FLT_MAX, 0.0f, title).x;
+        DrawFadingHeaderLine(titleX, titleY + titleSize + 7.0f,
+                             std::min(screen.x * 0.54f, titleX + titleWidth + 430.0f));
 
-        const float margin = 24.0f * uiScale;
-        const float top = 14.0f * uiScale;
+        // Keep Back the same physical size as Host Room / Scan Networks and pin it
+        // completely to the right edge. The small negative bleed cancels transparent texture padding.
+        const float commonButtonW = std::min(720.0f, std::max(560.0f, screen.x * 0.38f));
+        const float commonButtonH = commonButtonW / 3.0f;
+        const float backX = screen.x - commonButtonW - edgeBleed;
+        const float backY = 5.0f;
+        ImGui::SetCursorPos(ImVec2(backX, backY));
+        if (DrawGameStyleButton("##BackButton", "Back", ImVec2(commonButtonW, commonButtonH), 1.14f, true)) {
+            if (g_AndroidKeyboardOpen.load()) CloseAndroidKeyboard();
+            g_IsMultiplayerMenuActive = false;
+        }
 
-        const float titleSize = 42.0f * uiScale;
-        const float subtitleSize = 26.0f * uiScale;
+        const float headerBottom = titleY + titleSize + 28.0f;
+        const float actionY = std::max(headerBottom + 16.0f, 90.0f);
+        const float bottomMargin = std::max(18.0f, screen.y * 0.035f);
+        const float chatTop = actionY + commonButtonH + 18.0f;
+        const float bodyBottom = screen.y - bottomMargin;
+        const float chatW = std::max(620.0f, screen.x * 0.56f);
+        const float controlX = chatW + 14.0f;
+        const float controlW = std::max(320.0f, screen.x - controlX - 4.0f);
 
-        const char* headerTitle =
-            (g_CurrentMenu == MENU_SAVELOAD)
-                ? "Multiplayer Server Browser"
-                : "Multiplayer";
+        // Chat is deliberately the left-most block, starting at x=0 just like the game's panels.
+        const ImVec2 chatMin(0.0f, chatTop);
+        const ImVec2 chatMax(chatW, bodyBottom);
+        DrawGamePanel(chatMin, chatMax, 82);
+        DrawGamePanel(ImVec2(controlX, chatTop), ImVec2(screen.x, bodyBottom), 74);
 
-        const char* headerSubtitle =
-            (g_CurrentMenu == MENU_SAVELOAD)
-                ? "Join room"
-                : "Host room";
+        auto RenderChatUI = [&](float x, float y, float width, float height) {
+            ImGui::SetCursorPos(ImVec2(x + 18.0f, y + 12.0f));
+            DrawGameSectionTitle("Chat", width - 36.0f);
 
-        DrawHeaderFade(
-            draw,
-            headerTitle,
-            headerSubtitle,
-            margin,
-            top,
-            screenW,
-            titleSize,
-            subtitleSize);
+            const float inputH = std::max(62.0f, std::min(94.0f, commonButtonH * 0.38f));
+            const float sendW = commonButtonW;
+            const float historyH = std::max(90.0f, height - 118.0f);
+            const float historyW = width - 36.0f;
 
-        const float buttonW = std::min(
-            screenW * 0.24f,
-            350.0f * uiScale);
-        const float buttonH = std::max(
-            54.0f * uiScale,
-            screenH * 0.082f);
+            ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0, 0, 0, 0.18f));
+            ImGui::BeginChild("##ChatHistory", ImVec2(historyW, historyH), true,
+                              ImGuiWindowFlags_NoScrollbar);
+            {
+                std::lock_guard<std::mutex> lock(g_ChatMutex);
+                for (const auto& msg : g_ChatMessages) {
+                    ImGui::TextWrapped("%s", msg.c_str());
+                }
+                if (ImGui::GetScrollY() >= ImGui::GetScrollMaxY() - 1.0f)
+                    ImGui::SetScrollHereY(1.0f);
+            }
+            ImGui::EndChild();
+            ImGui::PopStyleColor();
 
-        // Back is exactly flush with the right side.
-        const ImVec2 backPos(
-            screenW - buttonW,
-            top + 2.0f * uiScale);
+            ImGui::SetCursorPos(ImVec2(x + 18.0f, y + height - inputH - 16.0f));
+            ImGui::PushStyleColor(ImGuiCol_FrameBg, ImVec4(0.015f, 0.022f, 0.028f, 0.82f));
+            ImGui::PushStyleColor(ImGuiCol_FrameBgHovered, ImVec4(0.025f, 0.040f, 0.050f, 0.90f));
+            ImGui::PushStyleColor(ImGuiCol_FrameBgActive, ImVec4(0.035f, 0.060f, 0.070f, 0.95f));
+            ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1, 1, 1, 1));
+            ImGui::SetNextItemWidth(std::max(160.0f, width - 36.0f - sendW - 12.0f));
+            static char inputBuffer[200] = "";
+            bool enterPressed = ImGui::InputText("##ChatInput", inputBuffer,
+                                                 IM_ARRAYSIZE(inputBuffer),
+                                                 ImGuiInputTextFlags_EnterReturnsTrue);
+            if (ImGui::IsItemClicked()) OpenAndroidKeyboard();
+            const bool chatInputActive = ImGui::IsItemActive();
+            ImGui::PopStyleColor(4);
 
-        DrawGameMenuButton(
-            "##BackButton",
-            "Back",
-            backPos,
-            ImVec2(buttonW, buttonH),
-            29.0f * uiScale);
-
-        const float contentTop =
-            top + titleSize + subtitleSize + 34.0f * uiScale;
-
-        const float contentBottom =
-            screenH - 14.0f * uiScale;
-
-        const float gap = 14.0f * uiScale;
-        const float leftW = screenW * 0.56f;
-        const float rightX = leftW + gap;
-        const float rightW = screenW - rightX;
-
-        const ImVec2 leftPanelMin(0.0f, contentTop);
-        const ImVec2 leftPanelMax(leftW, contentBottom);
-        const ImVec2 rightPanelMin(rightX, contentTop);
-        const ImVec2 rightPanelMax(screenW, contentBottom);
-
-        DrawDarkPanel(draw, leftPanelMin, leftPanelMax, 112);
-        DrawDarkPanel(draw, rightPanelMin, rightPanelMax, 105);
-
-        const float panelPad = 18.0f * uiScale;
+            const float sendX = x + width - sendW - 18.0f;
+            ImGui::SetCursorPos(ImVec2(sendX, y + height - inputH - 16.0f));
+            if (DrawGameStyleButton("##SendButton", "Send", ImVec2(sendW, commonButtonH), 1.06f, true) || enterPressed) {
+                if (strlen(inputBuffer) > 0) {
+                    const std::string msgStr(inputBuffer);
+                    {
+                        std::lock_guard<std::mutex> lock(g_ChatMutex);
+                        g_ChatMessages.push_back("You: " + msgStr);
+                    }
+                    {
+                        std::lock_guard<std::mutex> lock(g_OutgoingChatMutex);
+                        g_OutgoingChats.push_back(msgStr);
+                    }
+                    memset(inputBuffer, 0, sizeof(inputBuffer));
+                }
+                if (chatInputActive || g_AndroidKeyboardOpen.load()) CloseAndroidKeyboard();
+            }
+        };
 
         if (g_CurrentMenu == MENU_SETTINGS) {
-            // Host/settings screen: Host room lives at the upper-left only.
-            const float innerX = 0.0f;
-            const float innerY = contentTop + panelPad;
-            const float statusY = innerY + buttonH + 8.0f * uiScale;
-
-            draw->AddText(
-                g_GameUIFont,
-                28.0f * uiScale,
-                ImVec2(innerX + panelPad, innerY),
-                IM_COL32(240, 245, 250, 255),
-                "Room control");
-
-            if (DrawGameMenuButton(
-                    "##HostRoomAction",
-                    g_IsHost ? "Close room" : "Host room",
-                    ImVec2(0.0f, innerY + 34.0f * uiScale),
-                    ImVec2(buttonW, buttonH),
-                    31.0f * uiScale))
-            {
-                if (!g_IsHost) {
+            // Host Room / Close Room / Leave Room always starts at the left edge.
+            ImGui::SetCursorPos(ImVec2(edgeBleed, actionY));
+            const float innerButtonW = commonButtonW;
+            const float innerButtonH = commonButtonH;
+            if (g_IsClient && g_IsConnected) {
+                if (DrawGameStyleButton("##LeaveRoom", "Leave Room",
+                                        ImVec2(innerButtonW, innerButtonH), 1.12f, false)) {
+                    ClearChat();
+                    g_IsClient = false;
+                    g_IsConnected = false;
+                    if (g_TcpSocket >= 0) {
+                        shutdown(g_TcpSocket, SHUT_RDWR);
+                        close(g_TcpSocket);
+                        g_TcpSocket = -1;
+                    }
+                    g_ConnectedStatus = "Left the room.";
+                }
+            } else if (!g_IsHost) {
+                if (DrawGameStyleButton("##HostRoom", "Host Room",
+                                        ImVec2(innerButtonW, innerButtonH), 1.12f, false)) {
                     ClearChat();
                     g_IsHost = true;
                     std::thread(TCPHostThread).detach();
-                } else {
-                    ImGui::OpenPopup("ConfirmCloseRoom");
                 }
-            }
-
-            draw->AddText(
-                g_GameUIFont,
-                23.0f * uiScale,
-                ImVec2(panelPad, statusY + 10.0f * uiScale),
-                IM_COL32(215, 225, 235, 255),
-                "Network:");
-
-            draw->AddText(
-                g_GameUIFont,
-                23.0f * uiScale,
-                ImVec2(
-                    panelPad + 130.0f * uiScale,
-                    statusY + 10.0f * uiScale),
-                IM_COL32(110, 225, 245, 255),
-                g_ConnectedStatus.c_str());
-
-            if (ImGui::BeginPopupModal(
-                    "ConfirmCloseRoom",
-                    nullptr,
-                    ImGuiWindowFlags_AlwaysAutoResize))
-            {
-                ImGui::TextUnformatted("Close the room?");
-                ImGui::Spacing();
-
-                if (ImGui::Button(
-                        "Yes",
-                        ImVec2(100.0f * uiScale, 46.0f * uiScale)))
-                {
+            } else {
+                if (DrawGameStyleButton("##CloseRoom", "Close Room",
+                                        ImVec2(innerButtonW, innerButtonH), 1.12f, false)) {
                     ClearChat();
                     g_IsHost = false;
                     g_IsConnected = false;
-
                     if (g_TcpServerFd >= 0) {
                         shutdown(g_TcpServerFd, SHUT_RDWR);
                         close(g_TcpServerFd);
                         g_TcpServerFd = -1;
                     }
-
                     if (g_TcpSocket >= 0) {
                         shutdown(g_TcpSocket, SHUT_RDWR);
                         close(g_TcpSocket);
                         g_TcpSocket = -1;
                     }
-
                     g_ConnectedStatus = "Room Closed.";
-                    ImGui::CloseCurrentPopup();
                 }
-
-                ImGui::SameLine();
-
-                if (ImGui::Button(
-                        "No",
-                        ImVec2(100.0f * uiScale, 46.0f * uiScale)))
-                {
-                    ImGui::CloseCurrentPopup();
-                }
-
-                ImGui::EndPopup();
             }
 
-            if (g_IsConnected) {
-                RenderChatPanel(
-                    rightPanelMin.x,
-                    rightPanelMin.y,
-                    rightW,
-                    rightPanelMax.y - rightPanelMin.y,
-                    uiScale);
-            } else {
-                draw->AddText(
-                    g_GameUIFont,
-                    24.0f * uiScale,
-                    ImVec2(
-                        rightPanelMin.x + panelPad,
-                        rightPanelMin.y + panelPad),
-                    IM_COL32(210, 220, 230, 220),
-                    "Waiting for a client...");
-            }
+            // Right-side information/control area.
+            ImGui::SetCursorPos(ImVec2(controlX + 18.0f, actionY - 2.0f));
+            DrawGameSectionTitle("Room Info", controlW - 36.0f);
+            DrawGameStatusText("Status:", g_ConnectedStatus, controlW - 36.0f);
+            const uint8_t hostPlayerId = g_LocalPlayerId.load();
+            if (hostPlayerId < MAX_PLAYERS) ImGui::Text("Player %u", (unsigned)(hostPlayerId + 1));
+            else ImGui::TextDisabled("Player -");
+            ImGui::TextDisabled("Up to %u players", (unsigned)MAX_PLAYERS);
+
+            RenderChatUI(0.0f, chatTop, chatW, bodyBottom - chatTop);
         } else if (g_CurrentMenu == MENU_SAVELOAD) {
-            // Server-browser screen: Scan Networks lives at the upper-left only.
-            const float scanY = contentTop + panelPad;
-            const float usernameY = scanY + buttonH + 24.0f * uiScale;
+            // Scan Networks is in exactly the same size/position family as Host Room and Back.
+            ImGui::SetCursorPos(ImVec2(edgeBleed, actionY));
+            if (DrawGameStyleButton("##ScanNetworks",
+                                    g_IsSearching.load() ? "Searching..." : "Scan Networks",
+                                    ImVec2(commonButtonW, commonButtonH), 1.12f, false)) {
+                if (!g_IsSearching.load()) {
+                    g_IsSearching.store(true);
+                    std::thread(StartLANDiscoveryThread).detach();
+                }
+            }
 
+            // Name field gets its own open area on the right; it is never covered by a panel overlay.
+            ImGui::SetCursorPos(ImVec2(controlX + 18.0f, actionY - 2.0f));
+            DrawGameSectionTitle("Player", controlW - 36.0f);
+            DrawGameStatusText("Network:", g_ConnectedStatus, controlW - 36.0f);
+            ImGui::Text("Username");
+            ImGui::SetNextItemWidth(std::max(180.0f, controlW - 36.0f));
+            ImGui::PushStyleColor(ImGuiCol_FrameBg, ImVec4(0.015f, 0.022f, 0.028f, 0.82f));
+            ImGui::PushStyleColor(ImGuiCol_Border, ImVec4(0.72f, 0.82f, 0.88f, 0.34f));
+            ImGui::PushStyleVar(ImGuiStyleVar_FrameBorderSize, 1.0f);
+            bool nickEnterPressed = ImGui::InputText("##NicknameInput", g_Nickname,
+                                                     IM_ARRAYSIZE(g_Nickname),
+                                                     ImGuiInputTextFlags_EnterReturnsTrue);
+            if (ImGui::IsItemClicked()) OpenAndroidKeyboard();
+            if (nickEnterPressed && g_AndroidKeyboardOpen.load()) CloseAndroidKeyboard();
+            ImGui::PopStyleVar();
+            ImGui::PopStyleColor(2);
+
+            // Discovered rooms / Join / Disconnect stay in the same right-side area.
+            ImGui::SetCursorPos(ImVec2(controlX + 18.0f, actionY + 170.0f));
+            DrawGameSectionTitle("Discovered Rooms", controlW - 36.0f);
+            const float listH = std::max(100.0f, bodyBottom - ImGui::GetCursorScreenPos().y - 12.0f);
+            ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0, 0, 0, 0.10f));
+            ImGui::BeginChild("##RoomsList", ImVec2(controlW - 36.0f, listH), true);
             if (!g_IsConnected) {
-                if (DrawGameMenuButton(
-                        "##ScanNetworks",
-                        g_IsSearching.load() ? "Searching..." : "Scan networks",
-                        ImVec2(0.0f, scanY),
-                        ImVec2(buttonW, buttonH),
-                        29.0f * uiScale))
-                {
-                    if (!g_IsSearching.load()) {
-                        g_IsSearching.store(true);
-                        std::thread(StartLANDiscoveryThread).detach();
-                    }
-                }
-
-                draw->AddText(
-                    g_GameUIFont,
-                    23.0f * uiScale,
-                    ImVec2(panelPad, usernameY),
-                    IM_COL32(230, 235, 240, 255),
-                    "Username");
-
-                const float inputWidth = std::min(
-                    leftW - panelPad * 2.0f,
-                    560.0f * uiScale);
-
-                ImGui::SetCursorScreenPos(
-                    ImVec2(panelPad, usernameY + 32.0f * uiScale));
-
-                ImGui::PushStyleColor(
-                    ImGuiCol_FrameBg,
-                    ImVec4(0.04f, 0.07f, 0.10f, 0.90f));
-                ImGui::PushStyleColor(
-                    ImGuiCol_FrameBgHovered,
-                    ImVec4(0.08f, 0.13f, 0.18f, 0.95f));
-                ImGui::PushStyleColor(
-                    ImGuiCol_FrameBgActive,
-                    ImVec4(0.10f, 0.16f, 0.22f, 0.98f));
-                ImGui::PushStyleColor(
-                    ImGuiCol_Border,
-                    ImVec4(0.65f, 0.76f, 0.88f, 0.85f));
-                ImGui::PushStyleVar(
-                    ImGuiStyleVar_FrameBorderSize,
-                    1.0f);
-
-                ImGui::SetNextItemWidth(inputWidth);
-
-                const bool nickEnterPressed = ImGui::InputText(
-                    "##NicknameInput",
-                    g_Nickname,
-                    IM_ARRAYSIZE(g_Nickname),
-                    ImGuiInputTextFlags_EnterReturnsTrue);
-
-                if (ImGui::IsItemClicked()) {
-                    OpenAndroidKeyboard();
-                }
-
-                if (nickEnterPressed) {
-                    CloseAndroidKeyboard();
-                }
-
-                ImGui::PopStyleVar();
-                ImGui::PopStyleColor(4);
-
-                const float roomsY =
-                    usernameY + 32.0f * uiScale + 54.0f * uiScale + 24.0f * uiScale;
-
-                draw->AddText(
-                    g_GameUIFont,
-                    25.0f * uiScale,
-                    ImVec2(panelPad, roomsY),
-                    IM_COL32(230, 235, 240, 255),
-                    "Discovered Rooms");
-
-                const float roomsTop = roomsY + 32.0f * uiScale;
-                const float roomsH = contentBottom - roomsTop - panelPad;
-
-                ImGui::SetCursorScreenPos(
-                    ImVec2(panelPad, roomsTop));
-
-                ImGui::PushStyleColor(
-                    ImGuiCol_ChildBg,
-                    ImVec4(0.01f, 0.015f, 0.02f, 0.48f));
-
-                ImGui::BeginChild(
-                    "##Rooms",
-                    ImVec2(leftW - panelPad * 2.0f, std::max(80.0f, roomsH)),
-                    true,
-                    ImGuiWindowFlags_NoScrollbar);
-
-                {
-                    std::lock_guard<std::mutex> lock(g_PeerMutex);
-
-                    if (g_DiscoveredPeers.empty()) {
-                        ImGui::TextDisabled("No active rooms found yet.");
-                    } else {
-                        for (size_t i = 0; i < g_DiscoveredPeers.size(); ++i) {
-                            std::string label =
-                                g_DiscoveredPeers[i].name + " [" +
-                                g_DiscoveredPeers[i].ip + "]";
-
-                            char roomId[32];
-                            snprintf(
-                                roomId,
-                                sizeof(roomId),
-                                "##Room%u",
-                                (unsigned)i);
-
-                            const float roomW = leftW - panelPad * 2.0f - 2.0f;
-                            const float roomH =
-                                std::max(50.0f * uiScale, 58.0f * uiScale);
-
-                            if (ImGui::Button(
-                                    label.c_str(),
-                                    ImVec2(roomW, roomH)))
-                            {
-                                if (!g_IsHost.load() &&
-                                    !g_IsClient.load())
-                                {
-                                    ClearChat();
-                                    g_IsClient.store(true);
-
-                                    const std::string targetIP =
-                                        g_DiscoveredPeers[i].ip;
-
-                                    std::thread(
-                                        TCPClientThread,
-                                        targetIP).detach();
-                                }
+                std::lock_guard<std::mutex> lock(g_PeerMutex);
+                if (g_DiscoveredPeers.empty()) {
+                    ImGui::TextDisabled("No active rooms found yet.");
+                } else {
+                    const float roomW = controlW - 60.0f;
+                    const float roomH = commonButtonH;
+                    for (size_t i = 0; i < g_DiscoveredPeers.size(); ++i) {
+                        std::string roomLabel = g_DiscoveredPeers[i].name;
+                        if (roomLabel.empty()) roomLabel = "Room";
+                        char roomId[32];
+                        snprintf(roomId, sizeof(roomId), "##Room%u", static_cast<unsigned int>(i));
+                        if (DrawGameStyleButton(roomId, roomLabel.c_str(),
+                                                ImVec2(roomW, roomH), 1.06f, false)) {
+                            if (!g_IsHost.load() && !g_IsClient.load()) {
+                                ClearChat();
+                                g_IsClient.store(true);
+                                std::string targetIP = g_DiscoveredPeers[i].ip;
+                                std::thread(TCPClientThread, targetIP).detach();
                             }
-
-                            ImGui::Spacing();
                         }
+                        ImGui::TextDisabled("%s", g_DiscoveredPeers[i].ip.c_str());
+                        ImGui::Spacing();
                     }
                 }
-
-                ImGui::EndChild();
-                ImGui::PopStyleColor();
             } else {
-                if (DrawGameMenuButton(
-                        "##JoinGame",
-                        "Join game",
-                        ImVec2(0.0f, scanY),
-                        ImVec2(buttonW, buttonH),
-                        29.0f * uiScale))
-                {
+                ImGui::Text("Connected To Room");
+                ImGui::Spacing();
+                if (DrawGameStyleButton("##JoinGame", "Join Game",
+                                        ImVec2(std::min(commonButtonW, controlW - 36.0f), commonButtonH), 1.08f, false)) {
                     AutoStartGameForClient();
                 }
-
-                const float disconnectY = scanY + buttonH + 12.0f * uiScale;
-
-                if (DrawGameMenuButton(
-                        "##Disconnect",
-                        "Disconnect",
-                        ImVec2(0.0f, disconnectY),
-                        ImVec2(buttonW, buttonH),
-                        29.0f * uiScale))
-                {
+                ImGui::Spacing();
+                if (DrawGameStyleButton("##Disconnect", "Disconnect",
+                                        ImVec2(std::min(commonButtonW, controlW - 36.0f), commonButtonH), 1.08f, false)) {
                     ClearChat();
                     g_IsHost = false;
                     g_IsClient = false;
                     g_IsConnected = false;
-
                     if (g_TcpSocket >= 0) {
                         shutdown(g_TcpSocket, SHUT_RDWR);
                         close(g_TcpSocket);
                         g_TcpSocket = -1;
                     }
                 }
-
-                RenderChatPanel(
-                    rightPanelMin.x,
-                    rightPanelMin.y,
-                    rightW,
-                    rightPanelMax.y - rightPanelMin.y,
-                    uiScale);
             }
+            ImGui::EndChild();
+            ImGui::PopStyleColor();
+
+            RenderChatUI(0.0f, chatTop, chatW, bodyBottom - chatTop);
         }
 
+        ImGui::PopFont();
         ImGui::End();
         ImGui::PopStyleVar();
     }
 
     ImGui::Render();
 
-    // Save and restore the OpenGL state touched by the ImGui renderer.
     GLboolean depthTestEnabled = glIsEnabled(GL_DEPTH_TEST);
     GLboolean cullFaceEnabled = glIsEnabled(GL_CULL_FACE);
-
     glDisable(GL_DEPTH_TEST);
     glDisable(GL_CULL_FACE);
-
     ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
-
     if (depthTestEnabled) glEnable(GL_DEPTH_TEST);
     if (cullFaceEnabled) glEnable(GL_CULL_FACE);
 }
@@ -2786,6 +2533,10 @@ void my_GameUpdateStateBase(void* thiz, float param_1, uint32_t param_2, uint32_
         orig_GameUpdateStateBase(thiz, param_1, param_2, param_3, param_4);
     }
 
+    // The game itself decides the real frame/vsync cadence. The C output shows
+    // Game::update() ends with waitVSync(), so this hook must not try to force
+    // the engine to 120 FPS. We sample at up to 120 Hz when callbacks allow it,
+    // and the network is independently capped at 10 snapshots/sec.
     ApplyRemoteVehicleStates(g_EngineInstance);
     CaptureAndQueueLocalVehicleState(g_EngineInstance);
 }
@@ -2795,7 +2546,15 @@ void* my_updateGUI(void* thiz, void* p1, void* p2, void* p3, void* p4) {
 
     if (!g_TextureLoaded) {
         g_MultiplayerButtonTexture = LoadTextureFromPNGArray(buton_png_data, buton_png_len);
-        g_TextureLoaded = true;
+        g_TextureLoaded = (g_MultiplayerButtonTexture != 0);
+    }
+
+    if (!g_GameMenuBackgroundLoaded) {
+        g_GameMenuBackgroundTexture = LoadTextureFromPNGArrayEx(
+            game_menu_bg_png_data, game_menu_bg_png_len,
+            &g_GameMenuBackgroundWidth, &g_GameMenuBackgroundHeight
+        );
+        g_GameMenuBackgroundLoaded = (g_GameMenuBackgroundTexture != 0);
     }
     return orig_updateGUI ? orig_updateGUI(thiz, p1, p2, p3, p4) : nullptr;
 }
