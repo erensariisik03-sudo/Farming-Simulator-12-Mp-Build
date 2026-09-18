@@ -1805,13 +1805,13 @@ int32_t my_AInputQueue_getEvent(void* queue, AInputEvent** outEvent) {
                     if (g_IsMultiplayerMenuActive) {
                         shouldEatEvent = true;
                     } else {
-                        if (action == AINPUT_EVENT_ACTION_DOWN) {
+                        if (action == AMOTION_EVENT_ACTION_DOWN) {
                             g_IsEatingTouch = io.WantCaptureMouse;
                         }
                         if (g_IsEatingTouch || io.WantCaptureMouse) {
                             shouldEatEvent = true;
                         }
-                        if (action == AINPUT_EVENT_ACTION_UP) {
+                        if (action == AMOTION_EVENT_ACTION_UP) {
                             if (g_IsEatingTouch) shouldEatEvent = true;
                             g_IsEatingTouch = false;
                         }
@@ -1849,13 +1849,40 @@ int32_t my_AInputQueue_getEvent(void* queue, AInputEvent** outEvent) {
                     }
 
                     if (isDown) {
-                        // Let Android translate the physical/soft-keyboard key into
-                        // the real Unicode character. This works for letters, digits,
-                        // punctuation and keyboard layouts beyond the old A-Z mapper.
-                        const int32_t unicodeChar =
-                            AKeyEvent_getUnicodeChar(*outEvent, metaState);
-                        if (unicodeChar != 0) {
-                            io.AddInputCharacter((unsigned int)unicodeChar);
+                        // NDK r16b does not expose AKeyEvent_getUnicodeChar(), so
+                        // translate the common soft-keyboard/physical-key codes here.
+                        // This keeps the project compatible with the existing API 15
+                        // + NDK r16b build setup.
+                        bool shift = (metaState & AMETA_SHIFT_ON) != 0;
+                        int ch = 0;
+
+                        if (keyCode >= AKEYCODE_A && keyCode <= AKEYCODE_Z) {
+                            ch = (shift ? 'A' : 'a') + (keyCode - AKEYCODE_A);
+                        } else if (keyCode >= AKEYCODE_0 && keyCode <= AKEYCODE_9) {
+                            static const char normalDigits[] = "0123456789";
+                            static const char shiftedDigits[] = ")!@#$%^&*(";
+                            ch = shift ? shiftedDigits[keyCode - AKEYCODE_0]
+                                       : normalDigits[keyCode - AKEYCODE_0];
+                        } else {
+                            switch (keyCode) {
+                                case AKEYCODE_SPACE:         ch = ' '; break;
+                                case AKEYCODE_COMMA:         ch = shift ? '<' : ','; break;
+                                case AKEYCODE_PERIOD:        ch = shift ? '>' : '.'; break;
+                                case AKEYCODE_MINUS:         ch = shift ? '_' : '-'; break;
+                                case AKEYCODE_EQUALS:        ch = shift ? '+' : '='; break;
+                                case AKEYCODE_SLASH:         ch = shift ? '?' : '/'; break;
+                                case AKEYCODE_SEMICOLON:     ch = shift ? ':' : ';'; break;
+                                case AKEYCODE_APOSTROPHE:    ch = shift ? '"' : '\''; break;
+                                case AKEYCODE_LEFT_BRACKET:  ch = shift ? '{' : '['; break;
+                                case AKEYCODE_RIGHT_BRACKET: ch = shift ? '}' : ']'; break;
+                                case AKEYCODE_BACKSLASH:     ch = shift ? '|' : '\\'; break;
+                                case AKEYCODE_GRAVE:         ch = shift ? '~' : '`'; break;
+                                default: break;
+                            }
+                        }
+
+                        if (ch != 0) {
+                            io.AddInputCharacter((unsigned int)ch);
                         }
                     }
 
