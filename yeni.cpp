@@ -2329,7 +2329,9 @@ void DrawImGui() {
                     for (size_t i = 0; i < g_DiscoveredPeers.size(); ++i) {
                         std::string roomLabel = g_DiscoveredPeers[i].name;
                         if (roomLabel.empty()) roomLabel = "ROOM";
-                        std::string id = "##Room" + std::to_string(i);
+                        char roomId[32];
+                        snprintf(roomId, sizeof(roomId), "##Room%u", static_cast<unsigned int>(i));
+                        std::string id = std::string(roomId);
                         if (DrawGameStyleButton(id.c_str(), roomLabel.c_str(), ImVec2(innerWidth, roomButtonHeight))) {
                             if (!g_IsHost.load() && !g_IsClient.load()) {
                                 ClearChat();
