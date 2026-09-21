@@ -24,6 +24,7 @@
 #include <cerrno>
 #include <math.h>
 #include <algorithm>
+#include <math.h>
 
 #include "Substrate.h"
 #include "imgui.h"
@@ -217,6 +218,7 @@ GameUpdateStateBase_t orig_GameUpdateStateBase = nullptr;
 
 // ========================================================================
 // VEHICLE / MULTIPLAYER SYNCHRONIZATION
+// Core synchronized implementation retained from the known-working yeni.cpp.
 // ========================================================================
 struct TestB2Vec2 {
     float x;
@@ -244,6 +246,9 @@ static const uint16_t VEHICLE_ID_INVALID = 0xFFFF;
 static const uint16_t VEHICLE_SLOT_LIMIT = 512;
 static const uint8_t VEHICLE_OWNER_NONE = 0xFF;
 
+// Local vehicle sampling target: 120 Hz.
+// The actual callback frequency still follows the game's own update/vsync loop.
+// Network vehicle snapshots are deliberately limited to 10 snapshots/sec.
 static const uint32_t VEHICLE_LOCAL_SAMPLE_INTERVAL_US = 8333;
 static const uint32_t VEHICLE_NETWORK_INTERVAL_MS = 100;
 static const uint32_t VEHICLE_STOP_RELEASE_MS = 1000;
@@ -279,6 +284,9 @@ struct VehiclePositionPacket {
     uint8_t moving;
 };
 
+// One TCP message can carry the newest state of many vehicles.
+// This keeps vehicle traffic at ~10 network messages/sec regardless of
+// how many local vehicles are being sampled.
 struct VehicleSnapshotHeader {
     uint8_t type;
     uint8_t ownerId;
@@ -296,6 +304,7 @@ struct VehicleSnapshotEntry {
     uint8_t moving;
 };
 
+// Client -> host. The host decides which player gets authority first.
 struct VehicleClaimPacket {
     uint8_t type;
     uint8_t ownerId;
@@ -303,6 +312,8 @@ struct VehicleClaimPacket {
     uint32_t claimSequence;
 };
 
+// Host -> client. This is the authoritative owner of one vehicle.
+// ownerId == VEHICLE_OWNER_NONE means that the vehicle was released.
 struct VehicleAuthorityPacket {
     uint8_t type;
     uint8_t ownerId;
@@ -310,6 +321,7 @@ struct VehicleAuthorityPacket {
     uint32_t generation;
 };
 
+// Client -> host. The owner explicitly releases a vehicle after stopping.
 struct VehicleReleasePacket {
     uint8_t type;
     uint8_t ownerId;
@@ -372,6 +384,8 @@ static uint64_t g_RemoteStationarySince[VEHICLE_SLOT_LIMIT];
 static uint32_t g_LastKnownVehicleCount = 0;
 static std::mutex g_VehicleStateMutex;
 
+// Network transport keeps only the newest sample for each vehicle.
+// The network thread packs all valid samples into one snapshot every 100 ms.
 static VehiclePositionPacket g_LatestOutgoingVehicles[VEHICLE_SLOT_LIMIT];
 static bool g_HasLatestOutgoingVehicle[VEHICLE_SLOT_LIMIT];
 static uint64_t g_LastVehicleNetworkSendMs = 0;
@@ -405,6 +419,7 @@ static uintptr_t GetActiveVehicleFromGame(uintptr_t game, uint16_t* outVehicleId
     return GetVehicleFromIndex(game, (uint16_t)vehicleIndex);
 }
 
+// Send a complete packet over TCP, handling partial sends.
 static bool SendAllBytes(int socketFd, const void* data, size_t size) {
     if (socketFd < 0 || data == nullptr || size == 0) return false;
 
@@ -489,6 +504,9 @@ static void RefreshVehicleTopology(uintptr_t game) {
 
     std::lock_guard<std::mutex> lock(g_VehicleStateMutex);
 
+    // Vehicle::removeVehicle() compacts the pointer array, so a numeric index
+    // is not a persistent identity. Reset all ownership if the pointer topology
+    // changes instead of assigning an old owner to a different vehicle.
     for (uint16_t i = 0; i < VEHICLE_SLOT_LIMIT; ++i) {
         ClearVehicleStateSlot(i);
     }
@@ -684,6 +702,7 @@ static bool TryClaimLocalVehicle(uint16_t vehicleId) {
     }
 
     if (g_IsHost.load()) {
+        // Host participates in the same first-claim arbitration as the client.
         if (!AssignVehicleAuthority(vehicleId, localOwner, true)) {
             std::lock_guard<std::mutex> lock(g_VehicleStateMutex);
             g_ClaimPending[vehicleId] = false;
@@ -765,6 +784,10 @@ static void CaptureAndQueueLocalVehicleState(uintptr_t game) {
 
         const bool moving = moved || rotated;
 
+        // Ask the host for authority when appropriate, but do not make
+        // network publication depend on the authority handshake. This is
+        // what allows Player A to drive the harvester while Player B drives
+        // the tractor on a different vehicle slot.
         if (vehicleId == activeVehicleId && moving &&
             ownerId == VEHICLE_OWNER_NONE) {
             TryClaimLocalVehicle(vehicleId);
@@ -791,8 +814,17 @@ static void CaptureAndQueueLocalVehicleState(uintptr_t game) {
             }
         }
 
-        const bool publishActiveVehicle = (vehicleId == activeVehicleId);
-        const bool publishOwnedVehicle = (ownerId == localOwner);
+        // Publish:
+        //   - the currently driven vehicle even if it is still contested;
+        //   - vehicles for which this device already has authority.
+        //
+        // Therefore different vehicles can travel simultaneously, while the
+        // same vehicle can still exhibit the expected tug-of-war/tremble.
+        const bool publishActiveVehicle =
+            (vehicleId == activeVehicleId);
+
+        const bool publishOwnedVehicle =
+            (ownerId == localOwner);
 
         if (publishActiveVehicle || publishOwnedVehicle) {
             QueueVehiclePosition(
@@ -830,6 +862,10 @@ static void ApplyRemoteVehicleStates(uintptr_t game) {
         {
             std::lock_guard<std::mutex> lock(g_VehicleStateMutex);
 
+            // A snapshot may arrive before the host's authority packet.
+            // Keep buffering it, but NEVER apply it until this vehicle is
+            // explicitly owned by that remote player. This is the critical
+            // separation between network reception and local physics control.
             authorityOwner = g_VehicleAuthority[vehicleId].ownerId;
 
             if (authorityOwner == VEHICLE_OWNER_NONE) {
@@ -847,6 +883,8 @@ static void ApplyRemoteVehicleStates(uintptr_t game) {
             state = g_RemoteVehicles[vehicleId];
         }
 
+        // A remote snapshot is valid only when its sender is the current
+        // authoritative owner for this exact vehicle slot.
         if (state.ownerId != authorityOwner) continue;
         if (state.vehicleId != vehicleId) continue;
 
@@ -864,6 +902,7 @@ static void ApplyRemoteVehicleStates(uintptr_t game) {
             float elapsedSec =
                 (float)(nowMs - state.lastReceiveMs) / 1000.0f;
 
+            // Never extrapolate too far past the newest snapshot.
             if (elapsedSec > 0.12f) {
                 elapsedSec = 0.12f;
             }
@@ -877,6 +916,8 @@ static void ApplyRemoteVehicleStates(uintptr_t game) {
         position.x = predictedX;
         position.y = predictedY;
 
+        // This call is intentionally restricted to remotely-authoritative
+        // vehicles. The local driver's physics is left completely intact.
         g_b2BodySetTransform(
             (void*)body,
             &position,
@@ -977,6 +1018,9 @@ static void StoreRemoteVehicleState(
 
     VehicleRemoteState& state = g_RemoteVehicles[vehicleId];
 
+    // Receiving is deliberately independent from authority. The state is
+    // buffered here; ApplyRemoteVehicleStates() is the only place allowed to
+    // touch the physics body, and it checks authority before doing so.
     if (state.valid &&
         state.ownerId == ownerId &&
         sequence <= state.sequence) {
@@ -1228,6 +1272,9 @@ void OpenAndroidKeyboard() {
 }
 
 void CloseAndroidKeyboard() {
+    // Do not blindly call toggleSoftInput(): when the keyboard is already hidden,
+    // that API can OPEN it. The old UI used exactly that toggle and made BACK appear
+    // to open the keyboard. We now close only when our UI actually opened it.
     if (!g_AndroidKeyboardOpen.exchange(false)) return;
     if (g_GlobalJavaVM == nullptr) return;
 
@@ -1313,6 +1360,7 @@ GLuint LoadTextureFromPNGArray(const unsigned char* png_data, int data_len) {
     return LoadTextureFromPNGArrayEx(png_data, data_len, &g_ButtonOrigWidth, &g_ButtonOrigHeight);
 }
 
+// Send the current authority table to a newly connected client.
 static void QueueAllCurrentAuthorities() {
     if (!g_IsHost.load() || !g_IsConnected.load()) return;
 
@@ -1549,6 +1597,8 @@ void NetworkLoop() {
             }
         }
 
+        // Vehicle network traffic is intentionally capped at 10 snapshots/sec.
+        // All currently-known local vehicle states are packed into one TCP message.
         if (g_IsConnected.load()) {
             const uint64_t nowMs = GetMonotonicMilliseconds();
 
@@ -1846,14 +1896,10 @@ int32_t my_AInputQueue_getEvent(void* queue, AInputEvent** outEvent) {
                 }
 
                 bool shouldEatEvent = false;
-
-                // Mod menüsü aktifken dokunma olaylarının tamamını yakala, oyuna geçirme
-                if (g_IsMultiplayerMenuActive) {
-                    shouldEatEvent = true;
-                } else if (g_ImGuiInitialized && ImGui::GetCurrentContext() != nullptr) {
+                if (g_ImGuiInitialized && ImGui::GetCurrentContext() != nullptr) {
                     ImGuiIO& io = ImGui::GetIO();
                     if (action == AMOTION_EVENT_ACTION_DOWN) {
-                        g_IsEatingTouch = io.WantCaptureMouse || ImGui::IsAnyItemHovered();
+                        g_IsEatingTouch = io.WantCaptureMouse;
                     }
                     if (g_IsEatingTouch || io.WantCaptureMouse) {
                         shouldEatEvent = true;
@@ -1880,7 +1926,7 @@ int32_t my_AInputQueue_getEvent(void* queue, AInputEvent** outEvent) {
 
                 bool shouldEatEvent = false;
 
-                // Android BACK tuşu
+                // Android BACK: first close the soft keyboard, otherwise close our MP menu.
                 if (keyCode == AKEYCODE_BACK && action == AKEY_EVENT_ACTION_DOWN &&
                     g_ImGuiInitialized && ImGui::GetCurrentContext() != nullptr) {
                     if (g_IsMultiplayerMenuActive) {
@@ -1927,7 +1973,7 @@ int32_t my_AInputQueue_getEvent(void* queue, AInputEvent** outEvent) {
                         }
                     }
 
-                    if (g_IsMultiplayerMenuActive || io.WantCaptureKeyboard) {
+                    if (io.WantCaptureKeyboard) {
                         shouldEatEvent = true;
                     }
                 }
@@ -1961,7 +2007,7 @@ static void InitGameUIFont() {
     ImGuiIO& io = ImGui::GetIO();
     static const ImWchar gameRanges[] = {
         0x0020, 0x024F, // Latin + Latin Extended
-        0x00C0, 0x00FF, // Latin-1 supplement
+        0x00C0, 0x00FF, // Latin-1 supplement (kept explicit for older ImGui builds)
         0
     };
 
@@ -2099,9 +2145,11 @@ static bool DrawCenteredMirroredGameButton(const char* id, const char* label,
     ImGui::Dummy(ImVec2(actualTotal, h));
 
     if (g_MultiplayerButtonTexture != 0) {
+        // Sol taraf: Aynalı (Çıkıntısı sola/dışa bakar)
         draw->AddImage(ToImGuiTexture(g_MultiplayerButtonTexture),
                        start, ImVec2(start.x + halfW, start.y + h),
                        ImVec2(1.0f, 0.0f), ImVec2(0.0f, 1.0f));
+        // Sağ taraf: Düz (Çıkıntısı sağa/dışa bakar)
         draw->AddImage(ToImGuiTexture(g_MultiplayerButtonTexture),
                        ImVec2(start.x + halfW - overlap, start.y),
                        ImVec2(start.x + actualTotal, start.y + h),
@@ -2123,6 +2171,7 @@ static void DrawFadingHeaderLine(float startX, float y, float endX) {
     ImDrawList* draw = ImGui::GetWindowDrawList();
     const float thick = std::max(5.5f, ImGui::GetIO().DisplaySize.y * 0.0050f);
     
+    // Soldan sağa yumuşak geçişli (fade-out) çizgi
     draw->AddRectFilledMultiColor(
         ImVec2(startX, y - thick * 0.5f), ImVec2(endX, y + thick * 0.5f),
         IM_COL32(255, 255, 255, 222), IM_COL32(255, 255, 255, 0),
@@ -2214,29 +2263,18 @@ void DrawImGui() {
     ImGui_ImplOpenGL3_NewFrame();
     ImGui::NewFrame();
 
-    // ========================================================================
-    // OYUN İÇİ ODA OLUŞTURMA / KATILMA GİRİŞ BUTONLARI (REVIZE EDİLDİ)
-    // ========================================================================
     if (g_CurrentMenu != MENU_INGAME && !g_IsMultiplayerMenuActive && g_MultiplayerButtonTexture != 0) {
         const bool isSettings = (g_CurrentMenu == MENU_SETTINGS);
         const char* entryLabel = isSettings ? "Create Room" : "Join Room";
-        
-        float entryW, entryH;
-        if (isSettings) {
-            // "Create Room" butonu: eni daraltıldı, boyu uzatıldı
-            entryW = std::min(480.0f, std::max(340.0f, screen.x * 0.26f));
-            entryH = std::min(110.0f, std::max(75.0f, entryW / 3.80f));
-        } else {
-            // "Join Room" butonu
-            entryW = std::min(520.0f, std::max(360.0f, screen.x * 0.28f));
-            entryH = std::min(115.0f, std::max(75.0f, entryW / 3.20f));
-        }
-
+        float entryW = isSettings
+                         ? std::min(680.0f, std::max(440.0f, screen.x * 0.36f))
+                         : std::min(620.0f, std::max(420.0f, screen.x * 0.32f));
+        float entryH = isSettings ? entryW / 5.80f : entryW / 2.72f;
         const float entryX = isSettings
                              ? (screen.x - entryW) * 0.5f
                              : -10.0f;
         const float entryY = isSettings
-                             ? std::max(10.0f, screen.y - entryH - (screen.y * 0.05f))
+                             ? std::max(8.0f, screen.y - entryH - screen.y * 0.075f)
                              : std::max(3.0f, screen.y * 0.005f);
 
         ImGui::SetNextWindowPos(ImVec2(entryX, entryY), ImGuiCond_Always);
@@ -2248,8 +2286,8 @@ void DrawImGui() {
                      ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoScrollbar |
                      ImGuiWindowFlags_NoScrollWithMouse);
         const bool entryClicked = isSettings
-            ? DrawCenteredMirroredGameButton("##RoomEntryCreate", entryLabel, entryW, entryH, 1.30f)
-            : DrawGameStyleButton("##RoomEntryJoin", entryLabel, ImVec2(entryW, entryH), 1.30f, false);
+            ? DrawCenteredMirroredGameButton("##RoomEntryCreate", entryLabel, entryW, entryH, 1.36f)
+            : DrawGameStyleButton("##RoomEntryJoin", entryLabel, ImVec2(entryW, entryH), 1.34f, false);
         if (entryClicked) {
             g_CurrentMenu = isSettings ? MENU_SETTINGS : MENU_SAVELOAD;
             g_IsMultiplayerMenuActive = true;
@@ -2324,14 +2362,12 @@ void DrawImGui() {
         DrawGamePanel(ImVec2(0.0f, bodyTop), ImVec2(controlW, bodyBottom), 112);
         DrawGamePanel(ImVec2(chatX, bodyTop), ImVec2(screen.x, bodyBottom), 112);
 
-        // ========================================================================
-        // SOHBET ARAYÜZÜ (GİRDİ VE KLAVYE TETİKLEME REVİZE EDİLDİ)
-        // ========================================================================
         auto RenderChatUI = [&](float x, float y, float width, float height) {
             const float inner = 14.0f;
             ImGui::SetCursorPos(ImVec2(x + inner, y + 12.0f));
             DrawGameSectionTitle("Chat", width - inner * 2.0f);
 
+            // Büyütülen Send butonu boyutları
             const float inputH = std::max(60.0f, std::min(84.0f, commonButtonH * 0.34f));
             const float sendW = std::min(145.0f, width * 0.26f);
             const float sendH = inputH + 4.0f;
@@ -2361,32 +2397,26 @@ void DrawImGui() {
             ImGui::PushStyleColor(ImGuiCol_FrameBgActive, ImVec4(0.035f, 0.060f, 0.070f, 0.95f));
             ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1, 1, 1, 1));
             
+            // Input genişliği Send butonuna göre ayarlandı
             ImGui::SetNextItemWidth(std::max(160.0f, width - inner * 2.0f - sendW - 12.0f));
             static char inputBuffer[200] = "";
-            
-            // Sohbet kutusu kullanıcı odadaysa veya oda sahibi ise aktif olur
-            const bool chatAvailable = g_IsConnected.load() || g_IsHost.load() || g_IsClient.load();
-            if (!chatAvailable) ImGui::BeginDisabled(true);
-
+            const bool chatConnected = g_IsConnected.load();
+            if (!chatConnected) ImGui::BeginDisabled(true);
             bool enterPressed = ImGui::InputText("##ChatInput", inputBuffer,
                                                  IM_ARRAYSIZE(inputBuffer),
                                                  ImGuiInputTextFlags_EnterReturnsTrue);
-            
-            if (chatAvailable && (ImGui::IsItemClicked() || ImGui::IsItemActivated())) {
-                OpenAndroidKeyboard();
-            }
-
-            const bool chatInputActive = chatAvailable && ImGui::IsItemActive();
-            if (!chatAvailable) ImGui::EndDisabled();
+            if (chatConnected && ImGui::IsItemClicked()) OpenAndroidKeyboard();
+            const bool chatInputActive = chatConnected && ImGui::IsItemActive();
+            if (!chatConnected) ImGui::EndDisabled();
             ImGui::PopStyleColor(4);
 
+            // Send butonu tam sağa dayandı
             const float sendX = x + width - sendW;
             ImGui::SetCursorPos(ImVec2(sendX, inputY - 2.0f));
-            if (!chatAvailable) ImGui::BeginDisabled(true);
+            if (!chatConnected) ImGui::BeginDisabled(true);
             const bool sendClicked = DrawGameStyleButton("##SendButton", "Send", ImVec2(sendW, sendH), 1.15f, true);
-            if (!chatAvailable) ImGui::EndDisabled();
-
-            if (chatAvailable && (sendClicked || enterPressed)) {
+            if (!chatConnected) ImGui::EndDisabled();
+            if (chatConnected && (sendClicked || enterPressed)) {
                 if (strlen(inputBuffer) > 0) {
                     const std::string msgStr(inputBuffer);
                     {
@@ -2482,21 +2512,18 @@ void DrawImGui() {
             ImGui::PushStyleColor(ImGuiCol_Border, ImVec4(0.72f, 0.82f, 0.88f, 0.34f));
             ImGui::PushStyleVar(ImGuiStyleVar_FrameBorderSize, 1.0f);
             
-            // ========================================================================
-            // NICKNAME KUTUSU (GİRDİ VE KLAVYE TETİKLEME REVİZE EDİLDİ)
-            // ========================================================================
+            // İsim Kutusu: Dokunulduğunda/Odaklandığında Android Klavesi tetiklenir
             bool nickEnterPressed = ImGui::InputText("##NicknameInput", g_Nickname,
                                                      IM_ARRAYSIZE(g_Nickname),
                                                      ImGuiInputTextFlags_EnterReturnsTrue);
             if (ImGui::IsItemClicked() || ImGui::IsItemActivated()) {
                 OpenAndroidKeyboard();
             }
-            if (nickEnterPressed && g_AndroidKeyboardOpen.load()) {
-                CloseAndroidKeyboard();
-            }
+            if (nickEnterPressed && g_AndroidKeyboardOpen.load()) CloseAndroidKeyboard();
             ImGui::PopStyleVar();
             ImGui::PopStyleColor(2);
 
+            // Discovered Rooms başlığı aşağıya taşındı (bodyTop + 200.0f)
             ImGui::SetCursorPos(ImVec2(infoX, bodyTop + 200.0f));
             DrawGameSectionTitle("Discovered Rooms", infoW);
             const float listH = std::max(100.0f, bodyBottom - ImGui::GetCursorScreenPos().y - 12.0f);
@@ -2573,6 +2600,7 @@ void DrawImGui() {
 
 // ========================================================================
 // RENDER HOOKS
+// UI/render layer merged from arayüz.cpp; game/network hooks retained.
 // ========================================================================
 void my_GameUpdate(void* thiz, float param_1) {
     g_EngineInstance = (uintptr_t)thiz; 
@@ -2587,6 +2615,10 @@ void my_GameUpdateStateBase(void* thiz, float param_1, uint32_t param_2, uint32_
         orig_GameUpdateStateBase(thiz, param_1, param_2, param_3, param_4);
     }
 
+    // The game itself decides the real frame/vsync cadence. The C output shows
+    // Game::update() ends with waitVSync(), so this hook must not try to force
+    // the engine to 120 FPS. We sample at up to 120 Hz when callbacks allow it,
+    // and the network is independently capped at 10 snapshots/sec.
     ApplyRemoteVehicleStates(g_EngineInstance);
     CaptureAndQueueLocalVehicleState(g_EngineInstance);
 }
