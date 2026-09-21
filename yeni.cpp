@@ -24,7 +24,6 @@
 #include <cerrno>
 #include <math.h>
 #include <algorithm>
-#include <math.h>
 
 #include "Substrate.h"
 #include "imgui.h"
@@ -65,7 +64,6 @@ std::atomic<bool> g_TouchDown(false);
 
 static bool g_IsEatingTouch = false;
 static std::atomic<bool> g_AndroidKeyboardOpen(false);
-
 static ImFont* g_GameUIFont = nullptr;
 static bool g_GameUIFontInitialized = false;
 
@@ -218,7 +216,6 @@ GameUpdateStateBase_t orig_GameUpdateStateBase = nullptr;
 
 // ========================================================================
 // VEHICLE / MULTIPLAYER SYNCHRONIZATION
-// Core synchronized implementation retained from the known-working yeni.cpp.
 // ========================================================================
 struct TestB2Vec2 {
     float x;
@@ -1926,7 +1923,7 @@ int32_t my_AInputQueue_getEvent(void* queue, AInputEvent** outEvent) {
 
                 bool shouldEatEvent = false;
 
-                // Android BACK: first close the soft keyboard, otherwise close our MP menu.
+                // Android BACK: close keyboard first, otherwise close multiplayer menu.
                 if (keyCode == AKEYCODE_BACK && action == AKEY_EVENT_ACTION_DOWN &&
                     g_ImGuiInitialized && ImGui::GetCurrentContext() != nullptr) {
                     if (g_IsMultiplayerMenuActive) {
@@ -2053,19 +2050,14 @@ static bool DrawGameStyleButton(const char* id, const char* label, ImVec2 size,
                                 float textScale = 1.0f, bool rightAligned = false) {
     ImVec2 pos = ImGui::GetCursorScreenPos();
 
-    const float paintTop = 0.245f;
-    const float paintBottom = 0.765f;
-    const float paintH = size.y * (paintBottom - paintTop);
-    const ImVec2 hitPos(pos.x, pos.y + size.y * paintTop);
-    ImGui::SetCursorScreenPos(hitPos);
-    ImGui::InvisibleButton(id, ImVec2(size.x, std::max(1.0f, paintH)));
-    const bool hovered = ImGui::IsItemHovered() && IsInsideGameButtonTexture(pos, size, rightAligned);
+    // Görselin tamamını tıklanabilir yap: texture maskesi dokunma alanını daraltmasın.
+    ImGui::SetCursorScreenPos(pos);
+    ImGui::InvisibleButton(id, size);
+    const bool hovered = ImGui::IsItemHovered();
     const bool active = hovered && ImGui::IsItemActive();
-    const bool clicked = ImGui::IsItemClicked(ImGuiMouseButton_Left) &&
-                         IsInsideGameButtonTexture(pos, size, rightAligned);
+    const bool clicked = ImGui::IsItemClicked(ImGuiMouseButton_Left);
 
     ImGui::SetCursorScreenPos(pos);
-    ImGui::Dummy(size);
 
     ImDrawList* draw = ImGui::GetWindowDrawList();
 
@@ -2111,38 +2103,11 @@ static bool DrawCenteredMirroredGameButton(const char* id, const char* label,
     const float halfW = (totalW + overlap) * 0.5f;
     const float actualTotal = halfW * 2.0f - overlap;
 
-    const float paintTop = 0.245f;
-    const float paintBottom = 0.765f;
-    const float hitH = std::max(1.0f, h * (paintBottom - paintTop));
-    const ImVec2 hitStart(start.x, start.y + h * paintTop);
-    ImGui::SetCursorScreenPos(hitStart);
-    ImGui::InvisibleButton(id, ImVec2(actualTotal, hitH));
+    ImGui::SetCursorScreenPos(start);
+    ImGui::InvisibleButton(id, ImVec2(actualTotal, h));
     bool clicked = ImGui::IsItemClicked(ImGuiMouseButton_Left);
 
-    if (clicked) {
-        const ImVec2 mouse = ImGui::GetIO().MousePos;
-        const float relX = mouse.x - start.x;
-        const float relY = mouse.y - start.y;
-        bool inVisible = false;
-        for (int side = 0; side < 2; ++side) {
-            const float localX = side == 0 ? relX : (actualTotal - relX);
-            if (localX < 0.0f || localX > halfW) continue;
-            const float u = localX / std::max(1.0f, halfW);
-            const float v = relY / std::max(1.0f, h);
-            if (v >= paintTop && v <= paintBottom) {
-                const float t = (v - paintTop) / (paintBottom - paintTop);
-                const float right = 0.990f - 0.080f * t;
-                if (u >= 0.006f && u <= right) {
-                    inVisible = true;
-                    break;
-                }
-            }
-        }
-        clicked = inVisible;
-    }
-
     ImGui::SetCursorScreenPos(start);
-    ImGui::Dummy(ImVec2(actualTotal, h));
 
     if (g_MultiplayerButtonTexture != 0) {
         // Sol taraf: Aynalı (Çıkıntısı sola/dışa bakar)
@@ -2339,8 +2304,8 @@ void DrawImGui() {
         const float lineLeft = std::max(screen.x * 0.36f, titleX - screen.x * 0.40f);
         DrawFadingHeaderLine(lineLeft, titleY + titleSize + 9.0f, lineRight);
 
-        const float commonButtonW = std::min(560.0f, std::max(440.0f, screen.x * 0.30f));
-        const float commonButtonH = commonButtonW / 3.05f;
+        const float commonButtonW = std::min(500.0f, std::max(360.0f, screen.x * 0.27f));
+        const float commonButtonH = commonButtonW / 3.35f;
 
         const float headerBottom = titleY + titleSize + 28.0f;
         const float actionY = std::max(headerBottom - 9.0f, 58.0f);
@@ -2405,7 +2370,11 @@ void DrawImGui() {
             bool enterPressed = ImGui::InputText("##ChatInput", inputBuffer,
                                                  IM_ARRAYSIZE(inputBuffer),
                                                  ImGuiInputTextFlags_EnterReturnsTrue);
-            if (chatConnected && ImGui::IsItemClicked()) OpenAndroidKeyboard();
+            if (chatConnected &&
+                (ImGui::IsItemClicked() || ImGui::IsItemActivated() || ImGui::IsItemFocused()) &&
+                !g_AndroidKeyboardOpen.load()) {
+                OpenAndroidKeyboard();
+            }
             const bool chatInputActive = chatConnected && ImGui::IsItemActive();
             if (!chatConnected) ImGui::EndDisabled();
             ImGui::PopStyleColor(4);
@@ -2516,7 +2485,8 @@ void DrawImGui() {
             bool nickEnterPressed = ImGui::InputText("##NicknameInput", g_Nickname,
                                                      IM_ARRAYSIZE(g_Nickname),
                                                      ImGuiInputTextFlags_EnterReturnsTrue);
-            if (ImGui::IsItemClicked() || ImGui::IsItemActivated()) {
+            if ((ImGui::IsItemClicked() || ImGui::IsItemActivated() || ImGui::IsItemFocused()) &&
+                !g_AndroidKeyboardOpen.load()) {
                 OpenAndroidKeyboard();
             }
             if (nickEnterPressed && g_AndroidKeyboardOpen.load()) CloseAndroidKeyboard();
@@ -2535,8 +2505,8 @@ void DrawImGui() {
                 if (g_DiscoveredPeers.empty()) {
                     ImGui::TextDisabled("No active rooms found yet.");
                 } else {
-                    const float roomW = std::min(commonButtonW, infoW);
-                    const float roomH = commonButtonH;
+                    const float roomW = std::min(commonButtonW * 0.82f, infoW);
+                    const float roomH = std::max(72.0f, commonButtonH * 0.72f);
                     for (size_t i = 0; i < g_DiscoveredPeers.size(); ++i) {
                         std::string roomLabel = g_DiscoveredPeers[i].name;
                         if (roomLabel.empty()) roomLabel = "Room";
@@ -2600,7 +2570,6 @@ void DrawImGui() {
 
 // ========================================================================
 // RENDER HOOKS
-// UI/render layer merged from arayüz.cpp; game/network hooks retained.
 // ========================================================================
 void my_GameUpdate(void* thiz, float param_1) {
     g_EngineInstance = (uintptr_t)thiz; 
@@ -2638,6 +2607,7 @@ void* my_updateGUI(void* thiz, void* p1, void* p2, void* p3, void* p4) {
         );
         g_GameMenuBackgroundLoaded = (g_GameMenuBackgroundTexture != 0);
     }
+
     return orig_updateGUI ? orig_updateGUI(thiz, p1, p2, p3, p4) : nullptr;
 }
 
