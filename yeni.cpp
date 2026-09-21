@@ -1977,6 +1977,52 @@ void TCPClientThread(std::string hostIP) {
 }
 
 // ========================================================================
+// NDK r16b COMPATIBLE KEY -> UNICODE HELPER
+// ========================================================================
+static int32_t GetUnicodeCharCompat(const AInputEvent* event, int32_t metaState) {
+    typedef int32_t (*GetUnicodeCharFn)(const AInputEvent*, int32_t);
+
+    static GetUnicodeCharFn fn = []() -> GetUnicodeCharFn {
+        void* p = dlsym(RTLD_DEFAULT, "AKeyEvent_getUnicodeChar");
+        return reinterpret_cast<GetUnicodeCharFn>(p);
+    }();
+
+    if (fn != nullptr && event != nullptr) {
+        int32_t value = fn(event, metaState);
+        if (value > 0) return value;
+    }
+
+    // Fallback for older Android/NDK combinations where the helper is not exported.
+    const int32_t keyCode = AKeyEvent_getKeyCode(event);
+    const bool shift = (metaState & AMETA_SHIFT_ON) != 0;
+
+    if (keyCode >= AKEYCODE_A && keyCode <= AKEYCODE_Z) {
+        const int32_t base = shift ? 'A' : 'a';
+        return base + (keyCode - AKEYCODE_A);
+    }
+
+    if (keyCode >= AKEYCODE_0 && keyCode <= AKEYCODE_9) {
+        return '0' + (keyCode - AKEYCODE_0);
+    }
+
+    switch (keyCode) {
+        case AKEYCODE_SPACE:   return ' ';
+        case AKEYCODE_PERIOD:  return '.';
+        case AKEYCODE_COMMA:   return ',';
+        case AKEYCODE_MINUS:   return shift ? '_' : '-';
+        case AKEYCODE_EQUALS:  return shift ? '+' : '=';
+        case AKEYCODE_SLASH:   return shift ? '?' : '/';
+        case AKEYCODE_SEMICOLON: return shift ? ':' : ';';
+        case AKEYCODE_APOSTROPHE: return shift ? '"' : '\'';
+        case AKEYCODE_LEFT_BRACKET:  return shift ? '{' : '[';
+        case AKEYCODE_RIGHT_BRACKET: return shift ? '}' : ']';
+        case AKEYCODE_BACKSLASH: return shift ? '|' : '\\';
+        case AKEYCODE_GRAVE: return shift ? '~' : '`';
+        default: return 0;
+    }
+}
+
+// ========================================================================
 // HOOKS AND RENDERING
 // ========================================================================
 int32_t my_AInputQueue_getEvent(void* queue, AInputEvent** outEvent) {
@@ -2070,10 +2116,10 @@ int32_t my_AInputQueue_getEvent(void* queue, AInputEvent** outEvent) {
                     }
 
                     if (isDown) {
-                        // Android soft keyboards may report KEYCODE_UNKNOWN and
-                        // put the actual typed character in Unicode form.
+                        // Use the Unicode helper when available; otherwise fall back
+                        // to NDK-r16b-compatible keycode conversion.
                         const int32_t unicodeChar =
-                            AKeyEvent_getUnicodeChar(*outEvent, metaState);
+                            GetUnicodeCharCompat(*outEvent, metaState);
                         if (unicodeChar > 0) {
                             io.AddInputCharacter((unsigned int)unicodeChar);
                         }
