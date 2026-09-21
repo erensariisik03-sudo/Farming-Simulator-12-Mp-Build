@@ -1219,9 +1219,107 @@ bool IsLocalIP(const std::string& ip) {
     return isLocal;
 }
 
+static jobject GetCurrentActivity(JNIEnv* env) {
+    if (!env) return nullptr;
+
+    jclass activityThreadClass = env->FindClass("android/app/ActivityThread");
+    if (!activityThreadClass) return nullptr;
+
+    jmethodID currentActivityThreadMethod = env->GetStaticMethodID(
+        activityThreadClass, "currentActivityThread", "()Landroid/app/ActivityThread;");
+    if (!currentActivityThreadMethod) return nullptr;
+
+    jobject activityThread = env->CallStaticObjectMethod(
+        activityThreadClass, currentActivityThreadMethod);
+    if (env->ExceptionCheck()) {
+        env->ExceptionClear();
+        return nullptr;
+    }
+    if (!activityThread) return nullptr;
+
+    // Android versions use different concrete types for ActivityThread.mActivities.
+    jfieldID activitiesField = env->GetFieldID(
+        activityThreadClass, "mActivities", "Landroid/util/ArrayMap;");
+    if (!activitiesField) {
+        if (env->ExceptionCheck()) env->ExceptionClear();
+        activitiesField = env->GetFieldID(
+            activityThreadClass, "mActivities", "Ljava/util/Map;");
+        if (!activitiesField) {
+            if (env->ExceptionCheck()) env->ExceptionClear();
+            return nullptr;
+        }
+    }
+
+    jobject activities = env->GetObjectField(activityThread, activitiesField);
+    if (!activities) return nullptr;
+
+    jclass mapClass = env->FindClass("java/util/Map");
+    jmethodID valuesMethod = env->GetMethodID(
+        mapClass, "values", "()Ljava/util/Collection;");
+    if (!valuesMethod) return nullptr;
+
+    jobject values = env->CallObjectMethod(activities, valuesMethod);
+    if (env->ExceptionCheck()) {
+        env->ExceptionClear();
+        return nullptr;
+    }
+    if (!values) return nullptr;
+
+    jclass collectionClass = env->FindClass("java/util/Collection");
+    jmethodID iteratorMethod = env->GetMethodID(
+        collectionClass, "iterator", "()Ljava/util/Iterator;");
+    if (!iteratorMethod) return nullptr;
+
+    jobject iterator = env->CallObjectMethod(values, iteratorMethod);
+    if (!iterator) return nullptr;
+
+    jclass iteratorClass = env->FindClass("java/util/Iterator");
+    jmethodID hasNextMethod = env->GetMethodID(iteratorClass, "hasNext", "()Z");
+    jmethodID nextMethod = env->GetMethodID(
+        iteratorClass, "next", "()Ljava/lang/Object;");
+    if (!hasNextMethod || !nextMethod) return nullptr;
+
+    while (env->CallBooleanMethod(iterator, hasNextMethod)) {
+        jobject record = env->CallObjectMethod(iterator, nextMethod);
+        if (!record) continue;
+
+        jclass recordClass = env->GetObjectClass(record);
+        jfieldID activityField = env->GetFieldID(
+            recordClass, "activity", "Landroid/app/Activity;");
+        if (activityField) {
+            jobject activity = env->GetObjectField(record, activityField);
+            if (activity) return activity;
+        } else if (env->ExceptionCheck()) {
+            env->ExceptionClear();
+        }
+    }
+
+    return nullptr;
+}
+
+static jobject GetActivityDecorView(JNIEnv* env) {
+    jobject activity = GetCurrentActivity(env);
+    if (!activity) return nullptr;
+
+    jclass activityClass = env->GetObjectClass(activity);
+    jmethodID getWindowMethod = env->GetMethodID(
+        activityClass, "getWindow", "()Landroid/view/Window;");
+    if (!getWindowMethod) return nullptr;
+
+    jobject window = env->CallObjectMethod(activity, getWindowMethod);
+    if (!window) return nullptr;
+
+    jclass windowClass = env->GetObjectClass(window);
+    jmethodID getDecorViewMethod = env->GetMethodID(
+        windowClass, "getDecorView", "()Landroid/view/View;");
+    if (!getDecorViewMethod) return nullptr;
+
+    return env->CallObjectMethod(window, getDecorViewMethod);
+}
+
 void OpenAndroidKeyboard() {
     if (g_GlobalJavaVM == nullptr) return;
-    g_AndroidKeyboardOpen.store(true);
+    if (g_AndroidKeyboardOpen.exchange(true)) return;
 
     JNIEnv* env = nullptr;
     bool attached = false;
@@ -1232,30 +1330,42 @@ void OpenAndroidKeyboard() {
         }
     }
 
+    bool shown = false;
     if (env != nullptr) {
-        jclass activityThreadClass = env->FindClass("android/app/ActivityThread");
-        if (activityThreadClass != nullptr) {
-            jmethodID currentActivityThreadMethod = env->GetStaticMethodID(activityThreadClass, "currentActivityThread", "()Landroid/app/ActivityThread;");
-            if (currentActivityThreadMethod != nullptr) {
-                jobject activityThread = env->CallStaticObjectMethod(activityThreadClass, currentActivityThreadMethod);
-                if (activityThread != nullptr) {
-                    jmethodID getApplicationMethod = env->GetMethodID(activityThreadClass, "getApplication", "()Landroid/app/Application;");
-                    jobject context = env->CallObjectMethod(activityThread, getApplicationMethod);
+        jobject activity = GetCurrentActivity(env);
+        jobject decorView = GetActivityDecorView(env);
 
-                    if (context != nullptr) {
-                        jclass contextClass = env->GetObjectClass(context);
-                        jmethodID getSystemServiceMethod = env->GetMethodID(contextClass, "getSystemService", "(Ljava/lang/String;)Ljava/lang/Object;");
-                        
-                        jstring immStr = env->NewStringUTF("input_method");
-                        jobject imm = env->CallObjectMethod(context, getSystemServiceMethod, immStr);
-                        env->DeleteLocalRef(immStr);
+        if (activity && decorView) {
+            jclass activityClass = env->GetObjectClass(activity);
+            jmethodID getSystemServiceMethod = env->GetMethodID(
+                activityClass,
+                "getSystemService",
+                "(Ljava/lang/String;)Ljava/lang/Object;");
 
-                        if (imm != nullptr) {
-                            jclass immClass = env->GetObjectClass(imm);
-                            jmethodID toggleSoftInputMethod = env->GetMethodID(immClass, "toggleSoftInput", "(II)V");
-                            if (toggleSoftInputMethod != nullptr) {
-                                env->CallVoidMethod(imm, toggleSoftInputMethod, 2, 0); 
-                            }
+            if (getSystemServiceMethod) {
+                jstring immName = env->NewStringUTF("input_method");
+                jobject imm = env->CallObjectMethod(
+                    activity, getSystemServiceMethod, immName);
+                env->DeleteLocalRef(immName);
+
+                if (imm) {
+                    jclass immClass = env->GetObjectClass(imm);
+                    jmethodID showMethod = env->GetMethodID(
+                        immClass,
+                        "showSoftInput",
+                        "(Landroid/view/View;I)Z");
+                    if (showMethod) {
+                        shown = env->CallBooleanMethod(imm, showMethod, decorView, 0);
+                    }
+
+                    // Fallback for NativeActivity/game windows where the decor view
+                    // does not expose a normal text editor connection.
+                    if (!shown) {
+                        jmethodID toggleMethod = env->GetMethodID(
+                            immClass, "toggleSoftInput", "(II)V");
+                        if (toggleMethod) {
+                            env->CallVoidMethod(imm, toggleMethod, 2, 0);
+                            shown = true;
                         }
                     }
                 }
@@ -1263,17 +1373,19 @@ void OpenAndroidKeyboard() {
         }
     }
 
-    if (attached) {
-        g_GlobalJavaVM->DetachCurrentThread();
-    }
+    // Do not mark the keyboard open when Android refused the show request.
+    if (!shown) g_AndroidKeyboardOpen.store(false);
+
+    if (attached) g_GlobalJavaVM->DetachCurrentThread();
 }
 
 void CloseAndroidKeyboard() {
-    // Do not blindly call toggleSoftInput(): when the keyboard is already hidden,
-    // that API can OPEN it. The old UI used exactly that toggle and made BACK appear
-    // to open the keyboard. We now close only when our UI actually opened it.
-    if (!g_AndroidKeyboardOpen.exchange(false)) return;
-    if (g_GlobalJavaVM == nullptr) return;
+    if (g_GlobalJavaVM == nullptr) {
+        g_AndroidKeyboardOpen.store(false);
+        return;
+    }
+
+    g_AndroidKeyboardOpen.store(false);
 
     JNIEnv* env = nullptr;
     bool attached = false;
@@ -1285,29 +1397,38 @@ void CloseAndroidKeyboard() {
     }
 
     if (env != nullptr) {
-        jclass activityThreadClass = env->FindClass("android/app/ActivityThread");
-        if (activityThreadClass != nullptr) {
-            jmethodID currentActivityThreadMethod = env->GetStaticMethodID(activityThreadClass, "currentActivityThread", "()Landroid/app/ActivityThread;");
-            if (currentActivityThreadMethod != nullptr) {
-                jobject activityThread = env->CallStaticObjectMethod(activityThreadClass, currentActivityThreadMethod);
-                if (activityThread != nullptr) {
-                    jmethodID getApplicationMethod = env->GetMethodID(activityThreadClass, "getApplication", "()Landroid/app/Application;");
-                    jobject context = env->CallObjectMethod(activityThread, getApplicationMethod);
+        jobject activity = GetCurrentActivity(env);
+        jobject decorView = GetActivityDecorView(env);
 
-                    if (context != nullptr) {
-                        jclass contextClass = env->GetObjectClass(context);
-                        jmethodID getSystemServiceMethod = env->GetMethodID(contextClass, "getSystemService", "(Ljava/lang/String;)Ljava/lang/Object;");
-                        
-                        jstring immStr = env->NewStringUTF("input_method");
-                        jobject imm = env->CallObjectMethod(context, getSystemServiceMethod, immStr);
-                        env->DeleteLocalRef(immStr);
+        if (activity && decorView) {
+            jclass viewClass = env->GetObjectClass(decorView);
+            jmethodID getWindowTokenMethod = env->GetMethodID(
+                viewClass, "getWindowToken", "()Landroid/os/IBinder;");
+            jobject token = getWindowTokenMethod
+                ? env->CallObjectMethod(decorView, getWindowTokenMethod)
+                : nullptr;
 
-                        if (imm != nullptr) {
-                            jclass immClass = env->GetObjectClass(imm);
-                            jmethodID toggleSoftInputMethod = env->GetMethodID(immClass, "toggleSoftInput", "(II)V");
-                            if (toggleSoftInputMethod != nullptr) {
-                                env->CallVoidMethod(imm, toggleSoftInputMethod, 0, 0); 
-                            }
+            if (token) {
+                jclass activityClass = env->GetObjectClass(activity);
+                jmethodID getSystemServiceMethod = env->GetMethodID(
+                    activityClass,
+                    "getSystemService",
+                    "(Ljava/lang/String;)Ljava/lang/Object;");
+
+                if (getSystemServiceMethod) {
+                    jstring immName = env->NewStringUTF("input_method");
+                    jobject imm = env->CallObjectMethod(
+                        activity, getSystemServiceMethod, immName);
+                    env->DeleteLocalRef(immName);
+
+                    if (imm) {
+                        jclass immClass = env->GetObjectClass(imm);
+                        jmethodID hideMethod = env->GetMethodID(
+                            immClass,
+                            "hideSoftInputFromWindow",
+                            "(Landroid/os/IBinder;I)Z");
+                        if (hideMethod) {
+                            env->CallBooleanMethod(imm, hideMethod, token, 0);
                         }
                     }
                 }
@@ -1315,9 +1436,7 @@ void CloseAndroidKeyboard() {
         }
     }
 
-    if (attached) {
-        g_GlobalJavaVM->DetachCurrentThread();
-    }
+    if (attached) g_GlobalJavaVM->DetachCurrentThread();
 }
 
 GLuint LoadTextureFromPNGArrayEx(const unsigned char* png_data, int data_len, int* outWidth, int* outHeight) {
@@ -1951,22 +2070,12 @@ int32_t my_AInputQueue_getEvent(void* queue, AInputEvent** outEvent) {
                     }
 
                     if (isDown) {
-                        bool isShift = (metaState & AMETA_SHIFT_ON) != 0;
-                        char c = 0;
-
-                        if (keyCode >= AKEYCODE_A && keyCode <= AKEYCODE_Z) {
-                            c = (isShift ? 'A' : 'a') + (keyCode - AKEYCODE_A);
-                        } else if (keyCode >= AKEYCODE_0 && keyCode <= AKEYCODE_9) {
-                            c = '0' + (keyCode - AKEYCODE_0);
-                        } else if (keyCode == AKEYCODE_SPACE) { c = ' '; }
-                          else if (keyCode == AKEYCODE_PERIOD) { c = '.'; }
-                          else if (keyCode == AKEYCODE_COMMA) { c = ','; }
-                          else if (keyCode == AKEYCODE_MINUS) { c = (isShift ? '_' : '-'); }
-                          else if (keyCode == AKEYCODE_EQUALS) { c = (isShift ? '+' : '='); }
-                          else if (keyCode == AKEYCODE_SLASH) { c = (isShift ? '?' : '/'); }
-                        
-                        if (c != 0) {
-                            io.AddInputCharacter(c);
+                        // Android soft keyboards may report KEYCODE_UNKNOWN and
+                        // put the actual typed character in Unicode form.
+                        const int32_t unicodeChar =
+                            AKeyEvent_getUnicodeChar(*outEvent, metaState);
+                        if (unicodeChar > 0) {
+                            io.AddInputCharacter((unsigned int)unicodeChar);
                         }
                     }
 
@@ -2370,8 +2479,7 @@ void DrawImGui() {
             bool enterPressed = ImGui::InputText("##ChatInput", inputBuffer,
                                                  IM_ARRAYSIZE(inputBuffer),
                                                  ImGuiInputTextFlags_EnterReturnsTrue);
-            if (chatConnected &&
-                (ImGui::IsItemClicked() || ImGui::IsItemActivated() || ImGui::IsItemFocused()) &&
+            if (chatConnected && ImGui::IsItemClicked(ImGuiMouseButton_Left) &&
                 !g_AndroidKeyboardOpen.load()) {
                 OpenAndroidKeyboard();
             }
@@ -2485,7 +2593,7 @@ void DrawImGui() {
             bool nickEnterPressed = ImGui::InputText("##NicknameInput", g_Nickname,
                                                      IM_ARRAYSIZE(g_Nickname),
                                                      ImGuiInputTextFlags_EnterReturnsTrue);
-            if ((ImGui::IsItemClicked() || ImGui::IsItemActivated() || ImGui::IsItemFocused()) &&
+            if (ImGui::IsItemClicked(ImGuiMouseButton_Left) &&
                 !g_AndroidKeyboardOpen.load()) {
                 OpenAndroidKeyboard();
             }
