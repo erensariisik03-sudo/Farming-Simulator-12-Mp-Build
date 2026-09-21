@@ -7,137 +7,65 @@ jobs:
   build:
     runs-on: ubuntu-22.04
 
-    env:
-      NDK_DIR: ${{ github.workspace }}/.cache/android-ndk-r16b
-      NDK_VERSION: r16b
-      BUILD_TOOLS_VERSION: 34.0.0
-
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      # ============================================================
-      # CACHE ANDROID NDK R16B
-      # ============================================================
-      - name: Restore cached Android NDK r16b
-        id: ndk-cache
-        uses: actions/cache@v4
-        with:
-          path: ${{ github.workspace }}/.cache/android-ndk-r16b
-          key: ${{ runner.os }}-android-ndk-${{ env.NDK_VERSION }}-v1
-
       - name: Download Android NDK r16b
-        if: steps.ndk-cache.outputs.cache-hit != 'true'
         run: |
-          mkdir -p "${{ github.workspace }}/.cache"
+          wget -q https://dl.google.com/android/repository/android-ndk-r16b-linux-x86_64.zip
+          unzip -q android-ndk-r16b-linux-x86_64.zip
+          mv android-ndk-r16b "$HOME/android-ndk-r16b"
 
-          wget -q \
-            https://dl.google.com/android/repository/android-ndk-r16b-linux-x86_64.zip \
-            -O "${{ github.workspace }}/.cache/android-ndk-r16b.zip"
-
-          unzip -q \
-            "${{ github.workspace }}/.cache/android-ndk-r16b.zip" \
-            -d "${{ github.workspace }}/.cache"
-
-          mv \
-            "${{ github.workspace }}/.cache/android-ndk-r16b" \
-            "${{ github.workspace }}/.cache/android-ndk-r16b"
-
-      - name: Check cached NDK
-        run: |
-          test -f "${{ github.workspace }}/.cache/android-ndk-r16b/ndk-build"
-          "${{ github.workspace }}/.cache/android-ndk-r16b/ndk-build" --version
-
-      # ============================================================
-      # ONLY REQUIRED OLD-NDK SYSTEM DEPENDENCY
-      # ============================================================
-      - name: Install legacy NDK dependency
+      - name: Install dependencies (NDK, Zip, Java, Android Tools)
         run: |
           sudo apt-get update
-          sudo apt-get install -y libncurses5
+          sudo apt-get install -y libncurses5 zip zipalign apksigner openjdk-17-jdk
 
-      # ============================================================
-      # CHECK PREINSTALLED BUILD TOOLS
-      # ============================================================
-      - name: Check Java
+      - name: Check NDK
         run: |
-          java -version
-          keytool -help >/dev/null
+          "$HOME/android-ndk-r16b/ndk-build" --version
 
-      - name: Check CMake
-        run: |
-          cmake --version
-
-      - name: Check Android build-tools
-        run: |
-          test -x "$ANDROID_HOME/build-tools/${BUILD_TOOLS_VERSION}/zipalign"
-          test -x "$ANDROID_HOME/build-tools/${BUILD_TOOLS_VERSION}/apksigner"
-
-          "$ANDROID_HOME/build-tools/${BUILD_TOOLS_VERSION}/zipalign" -h >/dev/null
-          "$ANDROID_HOME/build-tools/${BUILD_TOOLS_VERSION}/apksigner" --version
-
-      # ============================================================
-      # CONFIGURE CMAKE
-      # ============================================================
       - name: Configure CMake
         run: |
           cmake -S . -B build \
-            -DCMAKE_TOOLCHAIN_FILE="${{ github.workspace }}/.cache/android-ndk-r16b/build/cmake/android.toolchain.cmake" \
+            -DCMAKE_TOOLCHAIN_FILE="$HOME/android-ndk-r16b/build/cmake/android.toolchain.cmake" \
             -DANDROID_ABI=armeabi \
             -DANDROID_PLATFORM=android-15 \
             -DANDROID_STL=gnustl_static \
             -DANDROID_TOOLCHAIN=gcc \
             -DCMAKE_BUILD_TYPE=Release
 
-      # ============================================================
-      # BUILD .SO
-      # ============================================================
       - name: Build .so Library
         run: |
           cmake --build build --config Release -j2
 
-      # ============================================================
-      # VERIFY
-      # ============================================================
       - name: Verify generated library
         run: |
           echo "Checking built library..."
           test -f build/libmultiplayermod.so
           ls -lh build/libmultiplayermod.so
 
-      # ============================================================
-      # PACKAGE APK
-      # ============================================================
       - name: Inject .so into main.zip and Sign APK
         run: |
-          ZIPALIGN="$ANDROID_HOME/build-tools/${BUILD_TOOLS_VERSION}/zipalign"
-          APKSIGNER="$ANDROID_HOME/build-tools/${BUILD_TOOLS_VERSION}/apksigner"
-
           echo "1. Preparing directory structure..."
           mkdir -p lib/armeabi
+          # Copy the compiled library to match target filename
+          cp build/libmultiplayermod.so lib/armeabi/libmultiplayermod.so
 
-          cp build/libmultiplayermod.so \
-             lib/armeabi/libmultiplayermod.so
-
-          echo "2. Copying main.zip..."
+          echo "2. Copying main.zip to working APK structure..."
           cp mainapk/main.zip game_unaligned.apk
 
-          echo "3. Removing existing .so..."
-          zip -d game_unaligned.apk \
-            lib/armeabi/libmultiplayermod.so || true
+          echo "3. Removing existing .so file from ZIP..."
+          zip -d game_unaligned.apk lib/armeabi/libmultiplayermod.so || true
 
-          echo "4. Injecting new uncompressed .so..."
-          zip -g -0 \
-            game_unaligned.apk \
-            lib/armeabi/libmultiplayermod.so
+          echo "4. Injecting newly built uncompressed .so file..."
+          zip -g -0 game_unaligned.apk lib/armeabi/libmultiplayermod.so
 
-          echo "5. Aligning APK..."
-          "$ZIPALIGN" \
-            -f -v 4 \
-            game_unaligned.apk \
-            game_aligned.apk
+          echo "5. Aligning APK (zipalign)..."
+          zipalign -f -v 4 game_unaligned.apk game_aligned.apk
 
-          echo "6. Generating temporary keystore..."
+          echo "6. Generating temporary Keystore..."
           keytool -genkeypair -v \
             -keystore debug.keystore \
             -storepass android \
@@ -148,8 +76,8 @@ jobs:
             -validity 10000 \
             -dname "CN=Android Debug,O=Android,C=US"
 
-          echo "7. Signing APK..."
-          "$APKSIGNER" sign \
+          echo "7. Signing APK (apksigner)..."
+          apksigner sign \
             --ks debug.keystore \
             --ks-pass pass:android \
             --key-pass pass:android \
@@ -157,12 +85,9 @@ jobs:
             --out MultiplayerMod_Signed.apk \
             game_aligned.apk
 
-          echo "8. Verifying APK..."
-          "$APKSIGNER" verify MultiplayerMod_Signed.apk
+          echo "8. Verifying APK signature..."
+          apksigner verify MultiplayerMod_Signed.apk
 
-      # ============================================================
-      # UPLOAD
-      # ============================================================
       - name: Upload Signed APK
         uses: actions/upload-artifact@v4
         with:
