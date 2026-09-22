@@ -64,6 +64,9 @@ std::atomic<bool> g_TouchDown(false);
 
 static bool g_IsEatingTouch = false;
 static std::atomic<bool> g_AndroidKeyboardOpen(false);
+static std::atomic<bool> g_PendingTouchDown(false);
+static std::atomic<float> g_PendingTouchX(0.0f);
+static std::atomic<float> g_PendingTouchY(0.0f);
 static ImFont* g_GameUIFont = nullptr;
 static bool g_GameUIFontInitialized = false;
 
@@ -1219,104 +1222,6 @@ bool IsLocalIP(const std::string& ip) {
     return isLocal;
 }
 
-static jobject GetCurrentActivity(JNIEnv* env) {
-    if (!env) return nullptr;
-
-    jclass activityThreadClass = env->FindClass("android/app/ActivityThread");
-    if (!activityThreadClass) return nullptr;
-
-    jmethodID currentActivityThreadMethod = env->GetStaticMethodID(
-        activityThreadClass, "currentActivityThread", "()Landroid/app/ActivityThread;");
-    if (!currentActivityThreadMethod) return nullptr;
-
-    jobject activityThread = env->CallStaticObjectMethod(
-        activityThreadClass, currentActivityThreadMethod);
-    if (env->ExceptionCheck()) {
-        env->ExceptionClear();
-        return nullptr;
-    }
-    if (!activityThread) return nullptr;
-
-    // Android versions use different concrete types for ActivityThread.mActivities.
-    jfieldID activitiesField = env->GetFieldID(
-        activityThreadClass, "mActivities", "Landroid/util/ArrayMap;");
-    if (!activitiesField) {
-        if (env->ExceptionCheck()) env->ExceptionClear();
-        activitiesField = env->GetFieldID(
-            activityThreadClass, "mActivities", "Ljava/util/Map;");
-        if (!activitiesField) {
-            if (env->ExceptionCheck()) env->ExceptionClear();
-            return nullptr;
-        }
-    }
-
-    jobject activities = env->GetObjectField(activityThread, activitiesField);
-    if (!activities) return nullptr;
-
-    jclass mapClass = env->FindClass("java/util/Map");
-    jmethodID valuesMethod = env->GetMethodID(
-        mapClass, "values", "()Ljava/util/Collection;");
-    if (!valuesMethod) return nullptr;
-
-    jobject values = env->CallObjectMethod(activities, valuesMethod);
-    if (env->ExceptionCheck()) {
-        env->ExceptionClear();
-        return nullptr;
-    }
-    if (!values) return nullptr;
-
-    jclass collectionClass = env->FindClass("java/util/Collection");
-    jmethodID iteratorMethod = env->GetMethodID(
-        collectionClass, "iterator", "()Ljava/util/Iterator;");
-    if (!iteratorMethod) return nullptr;
-
-    jobject iterator = env->CallObjectMethod(values, iteratorMethod);
-    if (!iterator) return nullptr;
-
-    jclass iteratorClass = env->FindClass("java/util/Iterator");
-    jmethodID hasNextMethod = env->GetMethodID(iteratorClass, "hasNext", "()Z");
-    jmethodID nextMethod = env->GetMethodID(
-        iteratorClass, "next", "()Ljava/lang/Object;");
-    if (!hasNextMethod || !nextMethod) return nullptr;
-
-    while (env->CallBooleanMethod(iterator, hasNextMethod)) {
-        jobject record = env->CallObjectMethod(iterator, nextMethod);
-        if (!record) continue;
-
-        jclass recordClass = env->GetObjectClass(record);
-        jfieldID activityField = env->GetFieldID(
-            recordClass, "activity", "Landroid/app/Activity;");
-        if (activityField) {
-            jobject activity = env->GetObjectField(record, activityField);
-            if (activity) return activity;
-        } else if (env->ExceptionCheck()) {
-            env->ExceptionClear();
-        }
-    }
-
-    return nullptr;
-}
-
-static jobject GetActivityDecorView(JNIEnv* env) {
-    jobject activity = GetCurrentActivity(env);
-    if (!activity) return nullptr;
-
-    jclass activityClass = env->GetObjectClass(activity);
-    jmethodID getWindowMethod = env->GetMethodID(
-        activityClass, "getWindow", "()Landroid/view/Window;");
-    if (!getWindowMethod) return nullptr;
-
-    jobject window = env->CallObjectMethod(activity, getWindowMethod);
-    if (!window) return nullptr;
-
-    jclass windowClass = env->GetObjectClass(window);
-    jmethodID getDecorViewMethod = env->GetMethodID(
-        windowClass, "getDecorView", "()Landroid/view/View;");
-    if (!getDecorViewMethod) return nullptr;
-
-    return env->CallObjectMethod(window, getDecorViewMethod);
-}
-
 void OpenAndroidKeyboard() {
     if (g_GlobalJavaVM == nullptr) return;
 
@@ -1364,15 +1269,29 @@ void OpenAndroidKeyboard() {
                             jmethodID toggleSoftInputMethod = env->GetMethodID(
                                 immClass, "toggleSoftInput", "(II)V");
                             if (toggleSoftInputMethod != nullptr) {
-                                // This is the exact mechanism from the known-working yeni.cpp.
                                 env->CallVoidMethod(imm, toggleSoftInputMethod, 2, 0);
                                 g_AndroidKeyboardOpen.store(true);
+                                LOGI("OpenAndroidKeyboard: toggleSoftInput called");
+                            } else {
+                                LOGI("OpenAndroidKeyboard: toggleSoftInput method not found");
                             }
+                        } else {
+                            LOGI("OpenAndroidKeyboard: InputMethodManager is null");
                         }
+                    } else {
+                        LOGI("OpenAndroidKeyboard: application context is null");
                     }
+                } else {
+                    LOGI("OpenAndroidKeyboard: ActivityThread is null");
                 }
+            } else {
+                LOGI("OpenAndroidKeyboard: currentActivityThread method not found");
             }
+        } else {
+            LOGI("OpenAndroidKeyboard: ActivityThread class not found");
         }
+    } else {
+        LOGI("OpenAndroidKeyboard: JNIEnv is null");
     }
 
     if (attached) {
@@ -1430,7 +1349,6 @@ void CloseAndroidKeyboard() {
                             jmethodID toggleSoftInputMethod = env->GetMethodID(
                                 immClass, "toggleSoftInput", "(II)V");
                             if (toggleSoftInputMethod != nullptr) {
-                                // This is the exact mechanism from the known-working yeni.cpp.
                                 env->CallVoidMethod(imm, toggleSoftInputMethod, 0, 0);
                             }
                         }
@@ -2010,7 +1928,16 @@ int32_t my_AInputQueue_getEvent(void* queue, AInputEvent** outEvent) {
 
                 size_t pointerCount = AMotionEvent_getPointerCount(*outEvent);
                 if (pointerCount > 0) {
-                    if (action == AMOTION_EVENT_ACTION_DOWN || action == AMOTION_EVENT_ACTION_MOVE) {
+                    if (action == AMOTION_EVENT_ACTION_DOWN) {
+                        const float tx = AMotionEvent_getX(*outEvent, 0);
+                        const float ty = AMotionEvent_getY(*outEvent, 0);
+                        g_TouchX.store(tx);
+                        g_TouchY.store(ty);
+                        g_PendingTouchX.store(tx);
+                        g_PendingTouchY.store(ty);
+                        g_PendingTouchDown.store(true);
+                        g_TouchDown.store(true);
+                    } else if (action == AMOTION_EVENT_ACTION_MOVE) {
                         g_TouchX.store(AMotionEvent_getX(*outEvent, 0));
                         g_TouchY.store(AMotionEvent_getY(*outEvent, 0));
                         g_TouchDown.store(true);
@@ -2297,6 +2224,17 @@ static void DrawGamePanel(ImVec2 minPos, ImVec2 maxPos, int alpha = 88) {
     draw->AddRect(minPos, maxPos, IM_COL32(255, 255, 255, 28), 3.0f, 0, 1.0f);
 }
 
+static bool ConsumePendingTouchForRect(const ImVec2& minPos, const ImVec2& maxPos) {
+    if (!g_PendingTouchDown.load()) return false;
+    const float x = g_PendingTouchX.load();
+    const float y = g_PendingTouchY.load();
+    if (x >= minPos.x && x <= maxPos.x && y >= minPos.y && y <= maxPos.y) {
+        g_PendingTouchDown.store(false);
+        return true;
+    }
+    return false;
+}
+
 static void DrawHeaderDarkening(const ImVec2& screen) {
     ImDrawList* draw = ImGui::GetBackgroundDrawList();
     const float bandH = std::min(210.0f, screen.y * 0.28f);
@@ -2491,14 +2429,19 @@ void DrawImGui() {
             ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1, 1, 1, 1));
             
             // Input genişliği Send butonuna göre ayarlandı
-            ImGui::SetNextItemWidth(std::max(160.0f, width - inner * 2.0f - sendW - 12.0f));
+            const float chatInputW = std::max(160.0f, width - inner * 2.0f - sendW - 12.0f);
+            ImGui::SetNextItemWidth(chatInputW);
             static char inputBuffer[200] = "";
             const bool chatConnected = g_IsConnected.load();
+            const ImVec2 chatInputMin = ImGui::GetCursorScreenPos();
+            const ImVec2 chatInputMax = chatInputMin + ImVec2(chatInputW, ImGui::GetFrameHeight());
+            const bool chatTouch = chatConnected && ConsumePendingTouchForRect(chatInputMin, chatInputMax);
             if (!chatConnected) ImGui::BeginDisabled(true);
+            if (chatTouch) ImGui::SetKeyboardFocusHere();
             bool enterPressed = ImGui::InputText("##ChatInput", inputBuffer,
                                                  IM_ARRAYSIZE(inputBuffer),
                                                  ImGuiInputTextFlags_EnterReturnsTrue);
-            if (chatConnected && ImGui::IsItemClicked()) {
+            if (chatConnected && (ImGui::IsItemClicked() || chatTouch)) {
                 OpenAndroidKeyboard();
             }
             const bool chatInputActive = chatConnected && ImGui::IsItemActive();
@@ -2607,11 +2550,16 @@ void DrawImGui() {
             ImGui::PushStyleColor(ImGuiCol_Border, ImVec4(0.72f, 0.82f, 0.88f, 0.34f));
             ImGui::PushStyleVar(ImGuiStyleVar_FrameBorderSize, 1.0f);
             
-            // İsim Kutusu: Dokunulduğunda/Odaklandığında Android Klavesi tetiklenir
+            // İsim kutusunda ImGui tıklamasına ek olarak ham Android dokunuşu da kullanılır.
+            const float nickInputW = std::max(180.0f, infoW * 0.56f);
+            const ImVec2 nickInputMin = ImGui::GetCursorScreenPos();
+            const ImVec2 nickInputMax = nickInputMin + ImVec2(nickInputW, ImGui::GetFrameHeight());
+            const bool nickTouch = ConsumePendingTouchForRect(nickInputMin, nickInputMax);
+            if (nickTouch) ImGui::SetKeyboardFocusHere();
             bool nickEnterPressed = ImGui::InputText("##NicknameInput", g_Nickname,
                                                      IM_ARRAYSIZE(g_Nickname),
                                                      ImGuiInputTextFlags_EnterReturnsTrue);
-            if (ImGui::IsItemClicked()) {
+            if (ImGui::IsItemClicked() || nickTouch) {
                 OpenAndroidKeyboard();
             }
             if (nickEnterPressed && g_AndroidKeyboardOpen.load()) CloseAndroidKeyboard();
@@ -2681,6 +2629,9 @@ void DrawImGui() {
         ImGui::End();
         ImGui::PopStyleVar();
     }
+
+    // If this tap was not on either input field, discard it after this frame.
+    g_PendingTouchDown.store(false);
 
     ImGui::Render();
 
