@@ -2434,7 +2434,7 @@ void DrawImGui() {
             static char inputBuffer[200] = "";
             const bool chatConnected = g_IsConnected.load();
             const ImVec2 chatInputMin = ImGui::GetCursorScreenPos();
-            const ImVec2 chatInputMax = chatInputMin + ImVec2(chatInputW, ImGui::GetFrameHeight());
+            const ImVec2 chatInputMax(chatInputMin.x + chatInputW, chatInputMin.y + ImGui::GetFrameHeight());
             const bool chatTouch = chatConnected && ConsumePendingTouchForRect(chatInputMin, chatInputMax);
             if (!chatConnected) ImGui::BeginDisabled(true);
             if (chatTouch) ImGui::SetKeyboardFocusHere();
@@ -2553,7 +2553,7 @@ void DrawImGui() {
             // İsim kutusunda ImGui tıklamasına ek olarak ham Android dokunuşu da kullanılır.
             const float nickInputW = std::max(180.0f, infoW * 0.56f);
             const ImVec2 nickInputMin = ImGui::GetCursorScreenPos();
-            const ImVec2 nickInputMax = nickInputMin + ImVec2(nickInputW, ImGui::GetFrameHeight());
+            const ImVec2 nickInputMax(nickInputMin.x + nickInputW, nickInputMin.y + ImGui::GetFrameHeight());
             const bool nickTouch = ConsumePendingTouchForRect(nickInputMin, nickInputMax);
             if (nickTouch) ImGui::SetKeyboardFocusHere();
             bool nickEnterPressed = ImGui::InputText("##NicknameInput", g_Nickname,
