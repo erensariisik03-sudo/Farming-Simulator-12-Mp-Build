@@ -108,6 +108,11 @@ std::mutex g_ChatMutex;
 std::vector<std::string> g_OutgoingChats;
 std::mutex g_OutgoingChatMutex;
 
+// Active chat text is kept globally for the render thread.
+// Network threads only raise the pending-clear flag to avoid a data race.
+char g_ChatInputBuffer[200] = "";
+std::atomic<bool> g_ClearChatInputPending(false);
+
 // ========================================================================
 // JNI_OnLoad
 // ========================================================================
@@ -189,6 +194,7 @@ void ClearChat() {
         std::lock_guard<std::mutex> lock(g_OutgoingChatMutex);
         g_OutgoingChats.clear();
     }
+    g_ClearChatInputPending.store(true);
 }
 
 void AutoStartGameForClient() {
@@ -1858,6 +1864,7 @@ void TCPHostThread() {
     
     g_IsConnected = false;
     g_IsHost = false;
+    ClearChat();
     ResetVehicleSyncState();
     if (g_ConnectedStatus != "Room Closed.") g_ConnectedStatus = "Connection Lost.";
 }
@@ -1873,8 +1880,9 @@ void TCPClientThread(std::string hostIP) {
     serv_addr.sin_port = htons(TCP_SYNC_PORT);
     
     if (inet_pton(AF_INET, hostIP.c_str(), &serv_addr.sin_addr) <= 0) {
-        ShowNativeToast("Error: Invalid IP!");
+        ShowNativeToast("Error: Invalid room address!");
         g_IsClient = false;
+        ClearChat();
         return;
     }
 
@@ -1884,7 +1892,7 @@ void TCPClientThread(std::string hostIP) {
     setsockopt(g_TcpSocket, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout));
 
     g_ConnectedStatus = "Connecting to room...";
-    ShowNativeToast("Connecting to room: " + hostIP);
+    ShowNativeToast("Connecting to room...");
 
     if (connect(g_TcpSocket, (struct sockaddr*)&serv_addr, sizeof(serv_addr)) >= 0) {
         g_IsConnected = true;
@@ -1894,11 +1902,13 @@ void TCPClientThread(std::string hostIP) {
     } else {
         ShowNativeToast("Error: Could not connect to room!");
         g_ConnectedStatus = "Connection Failed";
+        ClearChat();
     }
     
     if (g_TcpSocket >= 0) { shutdown(g_TcpSocket, SHUT_RDWR); close(g_TcpSocket); g_TcpSocket = -1; }
     g_IsConnected = false;
     g_IsClient = false;
+    ClearChat();
     ResetVehicleSyncState();
 }
 
@@ -2394,19 +2404,23 @@ void DrawImGui() {
         DrawGamePanel(ImVec2(chatX, bodyTop), ImVec2(screen.x, bodyBottom), 112);
 
         auto RenderChatUI = [&](float x, float y, float width, float height) {
+            if (g_ClearChatInputPending.exchange(false)) {
+                memset(g_ChatInputBuffer, 0, sizeof(g_ChatInputBuffer));
+            }
+
             const float inner = 14.0f;
             ImGui::SetCursorPos(ImVec2(x + inner, y + 12.0f));
             DrawGameSectionTitle("Chat", width - inner * 2.0f);
 
-            // Büyütülen Send butonu boyutları
-            const float inputH = std::max(60.0f, std::min(84.0f, commonButtonH * 0.34f));
-            const float sendW = std::min(145.0f, width * 0.26f);
-            const float sendH = inputH + 4.0f;
-            const float historyH = std::max(90.0f, height - inputH - 76.0f);
+            // Sağ panelde sohbet geçmişi.
+            const float inputH = std::max(56.0f, std::min(72.0f, commonButtonH * 0.30f));
+            const float previewH = std::max(46.0f, inputH * 0.78f);
+            const float historyH = std::max(80.0f, height - inputH - previewH - 94.0f);
             const float historyW = width - inner * 2.0f;
 
             ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0, 0, 0, 0.0f));
             ImGui::PushStyleVar(ImGuiStyleVar_ChildBorderSize, 0.0f);
+            ImGui::SetCursorPos(ImVec2(x + inner, y + 62.0f));
             ImGui::BeginChild("##ChatHistory", ImVec2(historyW, historyH), false,
                               ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoBackground);
             {
@@ -2421,42 +2435,63 @@ void DrawImGui() {
             ImGui::PopStyleVar();
             ImGui::PopStyleColor();
 
+            // Yazılan metni klavyenin hemen üzerinde görünür tutan ayrı blok.
+            const float previewY = y + height - inputH - previewH - 20.0f;
+            ImGui::SetCursorPos(ImVec2(x + inner, previewY));
+            ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0.0f, 0.0f, 0.0f, 0.84f));
+            ImGui::PushStyleVar(ImGuiStyleVar_ChildBorderSize, 1.0f);
+            ImGui::BeginChild("##ChatTypingPreview", ImVec2(historyW, previewH), false,
+                              ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoBackground);
+            ImGui::PushFont(g_GameUIFont);
+            if (strlen(g_ChatInputBuffer) > 0) {
+                ImGui::TextWrapped("%s", g_ChatInputBuffer);
+            } else {
+                ImGui::TextDisabled("Type a message...");
+            }
+            ImGui::PopFont();
+            ImGui::EndChild();
+            ImGui::PopStyleVar();
+            ImGui::PopStyleColor();
+
+            // Gerçek InputText küçük alt kutuda kalır; klavye bunu besler.
+            // Enter gönderim yapar, ayrı Send butonu yoktur.
             const float inputY = y + height - inputH - 10.0f;
             ImGui::SetCursorPos(ImVec2(x + inner, inputY));
             ImGui::PushStyleColor(ImGuiCol_FrameBg, ImVec4(0.015f, 0.022f, 0.028f, 0.82f));
             ImGui::PushStyleColor(ImGuiCol_FrameBgHovered, ImVec4(0.025f, 0.040f, 0.050f, 0.90f));
             ImGui::PushStyleColor(ImGuiCol_FrameBgActive, ImVec4(0.035f, 0.060f, 0.070f, 0.95f));
             ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1, 1, 1, 1));
-            
-            // Input genişliği Send butonuna göre ayarlandı
-            const float chatInputW = std::max(160.0f, width - inner * 2.0f - sendW - 12.0f);
+
+            const float chatInputW = std::max(160.0f, width - inner * 2.0f);
             ImGui::SetNextItemWidth(chatInputW);
-            static char inputBuffer[200] = "";
-            const bool chatConnected = g_IsConnected.load();
+
             const ImVec2 chatInputMin = ImGui::GetCursorScreenPos();
-            const ImVec2 chatInputMax(chatInputMin.x + chatInputW, chatInputMin.y + ImGui::GetFrameHeight());
-            // Sohbet kutusu bağlantıdan bağımsız olarak yazı kabul eder;
-            // bağlantı yoksa sadece gönderme işlemi engellenir.
+            const ImVec2 chatInputMax(
+                chatInputMin.x + chatInputW,
+                chatInputMin.y + ImGui::GetFrameHeight()
+            );
             const bool chatTouch = ConsumePendingTouchForRect(chatInputMin, chatInputMax);
             if (chatTouch) ImGui::SetKeyboardFocusHere();
-            bool enterPressed = ImGui::InputText("##ChatInput", inputBuffer,
-                                                 IM_ARRAYSIZE(inputBuffer),
-                                                 ImGuiInputTextFlags_EnterReturnsTrue);
+
+            const bool enterPressed = ImGui::InputText(
+                "##ChatInput",
+                g_ChatInputBuffer,
+                IM_ARRAYSIZE(g_ChatInputBuffer),
+                ImGuiInputTextFlags_EnterReturnsTrue
+            );
+
             if (ImGui::IsItemClicked() || ImGui::IsItemActivated() || chatTouch) {
                 OpenAndroidKeyboard();
             }
+
             const bool chatInputActive = ImGui::IsItemActive();
             ImGui::PopStyleColor(4);
 
-            // Send butonu tam sağa dayandı
-            const float sendX = x + width - sendW;
-            ImGui::SetCursorPos(ImVec2(sendX, inputY - 2.0f));
-            if (!chatConnected) ImGui::BeginDisabled(true);
-            const bool sendClicked = DrawGameStyleButton("##SendButton", "Send", ImVec2(sendW, sendH), 1.15f, true);
-            if (!chatConnected) ImGui::EndDisabled();
-            if (chatConnected && (sendClicked || enterPressed)) {
-                if (strlen(inputBuffer) > 0) {
-                    const std::string msgStr(inputBuffer);
+            // Enter = gönder. Send butonu tamamen kaldırıldı.
+            if (enterPressed) {
+                if (g_IsConnected.load() && strlen(g_ChatInputBuffer) > 0) {
+                    const std::string msgStr(g_ChatInputBuffer);
+
                     {
                         std::lock_guard<std::mutex> lock(g_ChatMutex);
                         g_ChatMessages.push_back("You: " + msgStr);
@@ -2465,11 +2500,14 @@ void DrawImGui() {
                         std::lock_guard<std::mutex> lock(g_OutgoingChatMutex);
                         g_OutgoingChats.push_back(msgStr);
                     }
-                    memset(inputBuffer, 0, sizeof(inputBuffer));
+
+                    memset(g_ChatInputBuffer, 0, sizeof(g_ChatInputBuffer));
+                    g_ClearChatInputPending.store(false);
                 }
-                if (chatInputActive || g_AndroidKeyboardOpen.load()) CloseAndroidKeyboard();
-            } else if (enterPressed) {
-                CloseAndroidKeyboard();
+
+                if (chatInputActive || g_AndroidKeyboardOpen.load()) {
+                    CloseAndroidKeyboard();
+                }
             }
         };
 
@@ -2531,13 +2569,33 @@ void DrawImGui() {
 
             RenderChatUI(chatX, bodyTop, chatW, bodyBottom - bodyTop);
         } else if (g_CurrentMenu == MENU_SAVELOAD) {
+            // Üst ana buton bağlantı durumuna göre değişir:
+            // - bağlı değilken Scan Networks
+            // - bağlıyken Disconnect
             ImGui::SetCursorPos(ImVec2(edgeBleed, buttonY));
-            if (DrawGameStyleButton("##ScanNetworks",
-                                    g_IsSearching.load() ? "Searching..." : "Scan Networks",
-                                    ImVec2(commonButtonW, commonButtonH), 1.30f, false)) {
-                if (!g_IsSearching.load()) {
-                    g_IsSearching.store(true);
-                    std::thread(StartLANDiscoveryThread).detach();
+
+            if (!g_IsConnected.load()) {
+                if (DrawGameStyleButton("##ScanNetworks",
+                                        g_IsSearching.load() ? "Searching..." : "Scan Networks",
+                                        ImVec2(commonButtonW, commonButtonH), 1.30f, false)) {
+                    if (!g_IsSearching.load()) {
+                        g_IsSearching.store(true);
+                        std::thread(StartLANDiscoveryThread).detach();
+                    }
+                }
+            } else {
+                if (DrawGameStyleButton("##DisconnectTop", "Disconnect",
+                                        ImVec2(commonButtonW, commonButtonH), 1.30f, false)) {
+                    ClearChat();
+                    g_IsHost.store(false);
+                    g_IsClient.store(false);
+                    g_IsConnected.store(false);
+                    if (g_TcpSocket >= 0) {
+                        shutdown(g_TcpSocket, SHUT_RDWR);
+                        close(g_TcpSocket);
+                        g_TcpSocket = -1;
+                    }
+                    g_ConnectedStatus = "Disconnected.";
                 }
             }
 
@@ -2582,59 +2640,62 @@ void DrawImGui() {
                 } else {
                     const float roomW = std::min(commonButtonW * 0.82f, infoW);
                     const float roomH = std::max(72.0f, commonButtonH * 0.72f);
+
                     for (size_t i = 0; i < g_DiscoveredPeers.size(); ++i) {
                         std::string roomLabel = g_DiscoveredPeers[i].name;
                         if (roomLabel.empty()) roomLabel = "Room";
-                        char roomId[32];
-                        snprintf(roomId, sizeof(roomId), "##Room%u", static_cast<unsigned int>(i));
 
-                        // Butonun gerçek ekran alanını ayrıca takip ediyoruz.
-                        // Böylece Android dokunması doğrudan oda bağlantısını tetikleyebilir.
+                        char roomId[32];
+                        snprintf(roomId, sizeof(roomId), "##Room%u",
+                                 static_cast<unsigned int>(i));
+
+                        // DrawGameStyleButton imleci eski konumunda bıraktığından,
+                        // child sınırını büyütmek için SetCursorScreenPos kullanmıyoruz.
+                        // Dummy() her oda satırını temiz şekilde aşağı taşır ve ImGui
+                        // parent sınırlarını da doğru hesaplar.
                         const ImVec2 roomButtonMin = ImGui::GetCursorScreenPos();
-                        const ImVec2 roomButtonMax(roomButtonMin.x + roomW,
-                                                   roomButtonMin.y + roomH);
-                        const bool roomTouch = ConsumePendingTouchForRect(roomButtonMin, roomButtonMax);
+                        const ImVec2 roomButtonMax(
+                            roomButtonMin.x + roomW,
+                            roomButtonMin.y + roomH
+                        );
+
+                        const bool roomTouch =
+                            ConsumePendingTouchForRect(roomButtonMin, roomButtonMax);
+
                         const bool roomClicked = DrawGameStyleButton(
-                            roomId, roomLabel.c_str(),
-                            ImVec2(roomW, roomH), 1.06f, false);
+                            roomId,
+                            roomLabel.c_str(),
+                            ImVec2(roomW, roomH),
+                            1.06f,
+                            false
+                        );
 
                         if (roomClicked || roomTouch) {
                             if (!g_IsHost.load() && !g_IsClient.load()) {
                                 ClearChat();
                                 g_IsClient.store(true);
-                                std::string targetIP = g_DiscoveredPeers[i].ip;
+                                const std::string targetIP = g_DiscoveredPeers[i].ip;
                                 std::thread(TCPClientThread, targetIP).detach();
                             }
                         }
 
-                        // DrawGameStyleButton çizim için imleci eski yerine bıraktığı
-                        // için IP satırını açıkça butonun altına taşıyoruz.
-                        ImGui::SetCursorScreenPos(
-                            ImVec2(roomButtonMin.x, roomButtonMax.y + 6.0f));
-                        ImGui::TextDisabled("%s", g_DiscoveredPeers[i].ip.c_str());
-                        ImGui::SetCursorScreenPos(
-                            ImVec2(roomButtonMin.x, roomButtonMax.y + 6.0f + ImGui::GetTextLineHeight() + 8.0f));
+                        // IP adresi tamamen gizlendi.
+                        ImGui::Dummy(ImVec2(roomW, roomH + 18.0f));
                     }
                 }
             } else {
                 ImGui::Text("Connected To Room");
                 ImGui::Spacing();
-                if (DrawGameStyleButton("##JoinGame", "Join Game",
-                                        ImVec2(std::min(commonButtonW, infoW), commonButtonH), 1.20f, false)) {
+
+                // Bağlıyken sadece Join Game içeride kalır.
+                // Disconnect artık yukarıdaki ana butondadır.
+                if (DrawGameStyleButton(
+                        "##JoinGame",
+                        "Join Game",
+                        ImVec2(std::min(commonButtonW, infoW), commonButtonH),
+                        1.20f,
+                        false)) {
                     AutoStartGameForClient();
-                }
-                ImGui::Spacing();
-                if (DrawGameStyleButton("##Disconnect", "Disconnect",
-                                        ImVec2(std::min(commonButtonW, infoW), commonButtonH), 1.20f, false)) {
-                    ClearChat();
-                    g_IsHost = false;
-                    g_IsClient = false;
-                    g_IsConnected = false;
-                    if (g_TcpSocket >= 0) {
-                        shutdown(g_TcpSocket, SHUT_RDWR);
-                        close(g_TcpSocket);
-                        g_TcpSocket = -1;
-                    }
                 }
             }
             ImGui::EndChild();
