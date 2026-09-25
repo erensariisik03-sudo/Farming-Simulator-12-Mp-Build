@@ -2435,17 +2435,17 @@ void DrawImGui() {
             const bool chatConnected = g_IsConnected.load();
             const ImVec2 chatInputMin = ImGui::GetCursorScreenPos();
             const ImVec2 chatInputMax(chatInputMin.x + chatInputW, chatInputMin.y + ImGui::GetFrameHeight());
-            const bool chatTouch = chatConnected && ConsumePendingTouchForRect(chatInputMin, chatInputMax);
-            if (!chatConnected) ImGui::BeginDisabled(true);
+            // Sohbet kutusu bağlantıdan bağımsız olarak yazı kabul eder;
+            // bağlantı yoksa sadece gönderme işlemi engellenir.
+            const bool chatTouch = ConsumePendingTouchForRect(chatInputMin, chatInputMax);
             if (chatTouch) ImGui::SetKeyboardFocusHere();
             bool enterPressed = ImGui::InputText("##ChatInput", inputBuffer,
                                                  IM_ARRAYSIZE(inputBuffer),
                                                  ImGuiInputTextFlags_EnterReturnsTrue);
-            if (chatConnected && (ImGui::IsItemClicked() || chatTouch)) {
+            if (ImGui::IsItemClicked() || ImGui::IsItemActivated() || chatTouch) {
                 OpenAndroidKeyboard();
             }
-            const bool chatInputActive = chatConnected && ImGui::IsItemActive();
-            if (!chatConnected) ImGui::EndDisabled();
+            const bool chatInputActive = ImGui::IsItemActive();
             ImGui::PopStyleColor(4);
 
             // Send butonu tam sağa dayandı
@@ -2468,6 +2468,8 @@ void DrawImGui() {
                     memset(inputBuffer, 0, sizeof(inputBuffer));
                 }
                 if (chatInputActive || g_AndroidKeyboardOpen.load()) CloseAndroidKeyboard();
+            } else if (enterPressed) {
+                CloseAndroidKeyboard();
             }
         };
 
@@ -2585,8 +2587,18 @@ void DrawImGui() {
                         if (roomLabel.empty()) roomLabel = "Room";
                         char roomId[32];
                         snprintf(roomId, sizeof(roomId), "##Room%u", static_cast<unsigned int>(i));
-                        if (DrawGameStyleButton(roomId, roomLabel.c_str(),
-                                                ImVec2(roomW, roomH), 1.06f, false)) {
+
+                        // Butonun gerçek ekran alanını ayrıca takip ediyoruz.
+                        // Böylece Android dokunması doğrudan oda bağlantısını tetikleyebilir.
+                        const ImVec2 roomButtonMin = ImGui::GetCursorScreenPos();
+                        const ImVec2 roomButtonMax(roomButtonMin.x + roomW,
+                                                   roomButtonMin.y + roomH);
+                        const bool roomTouch = ConsumePendingTouchForRect(roomButtonMin, roomButtonMax);
+                        const bool roomClicked = DrawGameStyleButton(
+                            roomId, roomLabel.c_str(),
+                            ImVec2(roomW, roomH), 1.06f, false);
+
+                        if (roomClicked || roomTouch) {
                             if (!g_IsHost.load() && !g_IsClient.load()) {
                                 ClearChat();
                                 g_IsClient.store(true);
@@ -2594,8 +2606,14 @@ void DrawImGui() {
                                 std::thread(TCPClientThread, targetIP).detach();
                             }
                         }
+
+                        // DrawGameStyleButton çizim için imleci eski yerine bıraktığı
+                        // için IP satırını açıkça butonun altına taşıyoruz.
+                        ImGui::SetCursorScreenPos(
+                            ImVec2(roomButtonMin.x, roomButtonMax.y + 6.0f));
                         ImGui::TextDisabled("%s", g_DiscoveredPeers[i].ip.c_str());
-                        ImGui::Spacing();
+                        ImGui::SetCursorScreenPos(
+                            ImVec2(roomButtonMin.x, roomButtonMax.y + 6.0f + ImGui::GetTextLineHeight() + 8.0f));
                     }
                 }
             } else {
