@@ -25,6 +25,8 @@
 #include <math.h>
 #include <algorithm>
 
+static bool SendAllBytes(int socketFd, const void* data, size_t size);
+
 #include "Substrate.h"
 #include "imgui.h"
 #include "imgui_impl_opengl3.h"
@@ -112,6 +114,14 @@ std::mutex g_OutgoingChatMutex;
 // Network threads only raise the pending-clear flag to avoid a data race.
 char g_ChatInputBuffer[200] = "";
 std::atomic<bool> g_ClearChatInputPending(false);
+
+// Native Android EditText bridge.  The EditText is tiny and transparent inside
+// the game window, while Android IME uses it as the real text editor.  This makes
+// the keyboard show its native extracted-text area and DONE action.
+static jobject g_NativeKeyboardEditText = nullptr;
+static std::atomic<int> g_KeyboardFieldMode(0); // 0=none, 1=nickname, 2=chat
+static std::atomic<bool> g_NativeKeyboardWasActive(false);
+static std::atomic<bool> g_KeyboardBackPressed(false);
 
 // ========================================================================
 // JNI_OnLoad
@@ -246,6 +256,7 @@ static const uint8_t PACKET_VEHICLE_CLAIM = 4;
 static const uint8_t PACKET_VEHICLE_AUTHORITY = 5;
 static const uint8_t PACKET_VEHICLE_RELEASE = 6;
 static const uint8_t PACKET_VEHICLE_SNAPSHOT = 7;
+static const uint8_t PACKET_PLAYER_INFO = 8;
 
 static const uint8_t MAX_PLAYERS = 4;
 static const uint16_t VEHICLE_ID_INVALID = 0xFFFF;
@@ -271,6 +282,12 @@ struct SessionWelcomePacket {
     uint8_t ownerId;
     uint8_t maxPlayers;
     uint8_t reserved;
+};
+
+struct PlayerInfoPacket {
+    uint8_t type;
+    uint8_t playerId;
+    char playerName[32];
 };
 
 struct NetworkPacket {
@@ -338,6 +355,7 @@ struct VehicleReleasePacket {
 #pragma pack(pop)
 
 static_assert(sizeof(SessionWelcomePacket) == 4, "SessionWelcomePacket size mismatch");
+static_assert(sizeof(PlayerInfoPacket) == 34, "PlayerInfoPacket size mismatch");
 static_assert(sizeof(NetworkPacket) == 256, "NetworkPacket size mismatch");
 static_assert(sizeof(VehiclePositionPacket) == 21, "VehiclePositionPacket size mismatch");
 static_assert(sizeof(VehicleSnapshotHeader) == 8, "VehicleSnapshotHeader size mismatch");
@@ -347,6 +365,40 @@ static_assert(sizeof(VehicleAuthorityPacket) == 8, "VehicleAuthorityPacket size 
 static_assert(sizeof(VehicleReleasePacket) == 8, "VehicleReleasePacket size mismatch");
 
 static std::atomic<uint8_t> g_LocalPlayerId(0xFF);
+static char g_PlayerNames[4][32] = {{0}};
+static std::mutex g_PlayerNamesMutex;
+
+static void ResetPlayerNames() {
+    std::lock_guard<std::mutex> lock(g_PlayerNamesMutex);
+    memset(g_PlayerNames, 0, sizeof(g_PlayerNames));
+}
+
+static void SetPlayerName(uint8_t playerId, const char* name) {
+    if (playerId >= 4) return;
+    std::lock_guard<std::mutex> lock(g_PlayerNamesMutex);
+    memset(g_PlayerNames[playerId], 0, sizeof(g_PlayerNames[playerId]));
+    if (name) strncpy(g_PlayerNames[playerId], name, sizeof(g_PlayerNames[playerId]) - 1);
+}
+
+static std::string GetPlayerName(uint8_t playerId) {
+    if (playerId >= 4) return std::string();
+    std::lock_guard<std::mutex> lock(g_PlayerNamesMutex);
+    return std::string(g_PlayerNames[playerId]);
+}
+
+static void SendLocalPlayerInfo() {
+    if (!g_IsConnected.load() || g_TcpSocket < 0) return;
+    const uint8_t playerId = g_LocalPlayerId.load();
+    if (playerId >= MAX_PLAYERS) return;
+
+    PlayerInfoPacket pkt;
+    memset(&pkt, 0, sizeof(pkt));
+    pkt.type = PACKET_PLAYER_INFO;
+    pkt.playerId = playerId;
+    strncpy(pkt.playerName, g_Nickname, sizeof(pkt.playerName) - 1);
+    SendAllBytes(g_TcpSocket, &pkt, sizeof(pkt));
+}
+
 static std::atomic<uint32_t> g_LocalVehicleSequence(0);
 static std::atomic<uint32_t> g_LocalClaimSequence(0);
 
@@ -935,11 +987,24 @@ static void ApplyRemoteVehicleStates(uintptr_t game) {
 static void HandleSessionWelcome(const SessionWelcomePacket& pkt) {
     if (pkt.ownerId >= MAX_PLAYERS) return;
     g_LocalPlayerId.store(pkt.ownerId);
+    SetPlayerName(pkt.ownerId, g_Nickname);
 
-    char playerMsg[64];
-    snprintf(playerMsg, sizeof(playerMsg), "Joined multiplayer as Player %u",
-             (unsigned)(pkt.ownerId + 1));
+    char playerMsg[96];
+    snprintf(playerMsg, sizeof(playerMsg), "Joined multiplayer as %s",
+             g_Nickname);
     ShowNativeToast(playerMsg);
+
+    // Tell the host our nickname as soon as the welcome packet is received.
+    SendLocalPlayerInfo();
+}
+
+static void HandlePlayerInfoPacket(const PlayerInfoPacket& pkt) {
+    if (pkt.playerId >= MAX_PLAYERS) return;
+    char safeName[sizeof(pkt.playerName)];
+    memcpy(safeName, pkt.playerName, sizeof(safeName));
+    safeName[sizeof(safeName) - 1] = '\0';
+    SetPlayerName(pkt.playerId, safeName);
+    LOGI("[PLAYERS] player=%u name=%s", (unsigned)pkt.playerId, safeName);
 }
 
 static void HandleVehicleClaimPacket(const VehicleClaimPacket& pkt) {
@@ -1228,7 +1293,171 @@ bool IsLocalIP(const std::string& ip) {
     return isLocal;
 }
 
-void OpenAndroidKeyboard() {
+static jobject GetCurrentActivityForKeyboard(JNIEnv* env) {
+    if (!env) return nullptr;
+
+    jclass activityThreadClass = env->FindClass("android/app/ActivityThread");
+    if (!activityThreadClass) return nullptr;
+
+    jmethodID currentMethod = env->GetStaticMethodID(
+        activityThreadClass,
+        "currentActivityThread",
+        "()Landroid/app/ActivityThread;");
+    if (!currentMethod) return nullptr;
+
+    jobject activityThread = env->CallStaticObjectMethod(activityThreadClass, currentMethod);
+    if (env->ExceptionCheck()) {
+        env->ExceptionClear();
+        return nullptr;
+    }
+    if (!activityThread) return nullptr;
+
+    jfieldID activitiesField = env->GetFieldID(
+        activityThreadClass,
+        "mActivities",
+        "Landroid/util/ArrayMap;");
+    if (!activitiesField) {
+        if (env->ExceptionCheck()) env->ExceptionClear();
+        activitiesField = env->GetFieldID(
+            activityThreadClass,
+            "mActivities",
+            "Ljava/util/Map;");
+        if (!activitiesField) {
+            if (env->ExceptionCheck()) env->ExceptionClear();
+            return nullptr;
+        }
+    }
+
+    jobject activities = env->GetObjectField(activityThread, activitiesField);
+    if (!activities) return nullptr;
+
+    jclass mapClass = env->FindClass("java/util/Map");
+    jmethodID valuesMethod = env->GetMethodID(mapClass, "values", "()Ljava/util/Collection;");
+    if (!valuesMethod) return nullptr;
+    jobject values = env->CallObjectMethod(activities, valuesMethod);
+    if (!values) return nullptr;
+
+    jclass collectionClass = env->FindClass("java/util/Collection");
+    jmethodID iteratorMethod = env->GetMethodID(
+        collectionClass, "iterator", "()Ljava/util/Iterator;");
+    if (!iteratorMethod) return nullptr;
+    jobject iterator = env->CallObjectMethod(values, iteratorMethod);
+    if (!iterator) return nullptr;
+
+    jclass iteratorClass = env->FindClass("java/util/Iterator");
+    jmethodID hasNextMethod = env->GetMethodID(iteratorClass, "hasNext", "()Z");
+    jmethodID nextMethod = env->GetMethodID(iteratorClass, "next", "()Ljava/lang/Object;");
+    if (!hasNextMethod || !nextMethod) return nullptr;
+
+    while (env->CallBooleanMethod(iterator, hasNextMethod)) {
+        jobject record = env->CallObjectMethod(iterator, nextMethod);
+        if (!record) continue;
+
+        jclass recordClass = env->GetObjectClass(record);
+        jfieldID activityField = env->GetFieldID(
+            recordClass, "activity", "Landroid/app/Activity;");
+        if (activityField) {
+            jobject activity = env->GetObjectField(record, activityField);
+            if (activity) return activity;
+        } else if (env->ExceptionCheck()) {
+            env->ExceptionClear();
+        }
+    }
+
+    return nullptr;
+}
+
+static bool EnsureNativeKeyboardEditText(JNIEnv* env) {
+    if (!env) return false;
+    if (g_NativeKeyboardEditText != nullptr) return true;
+
+    jobject activity = GetCurrentActivityForKeyboard(env);
+    if (!activity) {
+        LOGI("Native keyboard: current Activity not found");
+        return false;
+    }
+
+    jclass activityClass = env->GetObjectClass(activity);
+    jmethodID getWindow = env->GetMethodID(
+        activityClass, "getWindow", "()Landroid/view/Window;");
+    if (!getWindow) return false;
+    jobject window = env->CallObjectMethod(activity, getWindow);
+    if (!window) return false;
+
+    jclass windowClass = env->GetObjectClass(window);
+    jmethodID getDecorView = env->GetMethodID(
+        windowClass, "getDecorView", "()Landroid/view/View;");
+    if (!getDecorView) return false;
+    jobject decorView = env->CallObjectMethod(window, getDecorView);
+    if (!decorView) return false;
+
+    jclass editTextClass = env->FindClass("android/widget/EditText");
+    if (!editTextClass) return false;
+    jmethodID editCtor = env->GetMethodID(
+        editTextClass, "<init>", "(Landroid/content/Context;)V");
+    if (!editCtor) return false;
+    jobject editText = env->NewObject(editTextClass, editCtor, activity);
+    if (!editText) return false;
+
+    // Make the native editor effectively invisible inside the game.
+    jmethodID setAlpha = env->GetMethodID(editTextClass, "setAlpha", "(F)V");
+    if (setAlpha) env->CallVoidMethod(editText, setAlpha, 0.0f);
+    jmethodID setCursorVisible = env->GetMethodID(editTextClass, "setCursorVisible", "(Z)V");
+    if (setCursorVisible) env->CallVoidMethod(editText, setCursorVisible, JNI_FALSE);
+    jmethodID setInputType = env->GetMethodID(editTextClass, "setInputType", "(I)V");
+    if (setInputType) env->CallVoidMethod(editText, setInputType, 1); // TYPE_CLASS_TEXT
+    jmethodID setSingleLine = env->GetMethodID(editTextClass, "setSingleLine", "(Z)V");
+    if (setSingleLine) env->CallVoidMethod(editText, setSingleLine, JNI_TRUE);
+    jmethodID setImeOptions = env->GetMethodID(editTextClass, "setImeOptions", "(I)V");
+    if (setImeOptions) env->CallVoidMethod(editText, setImeOptions, 6); // IME_ACTION_DONE
+
+    jclass frameParamsClass = env->FindClass("android/widget/FrameLayout$LayoutParams");
+    if (!frameParamsClass) return false;
+    jmethodID paramsCtor = env->GetMethodID(
+        frameParamsClass, "<init>", "(II)V");
+    if (!paramsCtor) return false;
+    jobject params = env->NewObject(frameParamsClass, paramsCtor, 1, 1);
+
+    jclass viewGroupClass = env->FindClass("android/view/ViewGroup");
+    jmethodID addView = env->GetMethodID(
+        viewGroupClass, "addView", "(Landroid/view/View;Landroid/view/ViewGroup$LayoutParams;)V");
+    if (!addView) return false;
+
+    env->CallVoidMethod(decorView, addView, editText, params);
+    if (env->ExceptionCheck()) {
+        env->ExceptionDescribe();
+        env->ExceptionClear();
+        LOGI("Native keyboard: failed to attach hidden EditText");
+        return false;
+    }
+
+    g_NativeKeyboardEditText = env->NewGlobalRef(editText);
+    LOGI("Native keyboard: hidden EditText created");
+    return g_NativeKeyboardEditText != nullptr;
+}
+
+static void SetNativeKeyboardText(JNIEnv* env, const char* text) {
+    if (!env || !g_NativeKeyboardEditText) return;
+
+    jclass editTextClass = env->GetObjectClass(g_NativeKeyboardEditText);
+    jmethodID setText = env->GetMethodID(
+        editTextClass, "setText", "(Ljava/lang/CharSequence;)V");
+    jmethodID setSelection = env->GetMethodID(
+        editTextClass, "setSelection", "(I)V");
+    jmethodID requestFocus = env->GetMethodID(
+        editTextClass, "requestFocus", "()Z");
+
+    jstring jText = env->NewStringUTF(text ? text : "");
+    if (setText) env->CallVoidMethod(g_NativeKeyboardEditText, setText, jText);
+    if (setSelection) env->CallVoidMethod(
+        g_NativeKeyboardEditText,
+        setSelection,
+        (jint)(text ? strlen(text) : 0));
+    if (requestFocus) env->CallBooleanMethod(g_NativeKeyboardEditText, requestFocus);
+    env->DeleteLocalRef(jText);
+}
+
+void OpenAndroidKeyboardForField(int fieldMode, const char* initialText) {
     if (g_GlobalJavaVM == nullptr) return;
 
     JNIEnv* env = nullptr;
@@ -1239,75 +1468,214 @@ void OpenAndroidKeyboard() {
             attached = true;
         }
     }
+    if (!env) return;
 
-    if (env != nullptr) {
+    g_KeyboardFieldMode.store(fieldMode);
+    g_KeyboardBackPressed.store(false);
+    g_NativeKeyboardWasActive.store(false);
+
+    if (EnsureNativeKeyboardEditText(env)) {
+        SetNativeKeyboardText(env, initialText);
+
+        jclass editTextClass = env->GetObjectClass(g_NativeKeyboardEditText);
         jclass activityThreadClass = env->FindClass("android/app/ActivityThread");
-        if (activityThreadClass != nullptr) {
-            jmethodID currentActivityThreadMethod = env->GetStaticMethodID(
+        jmethodID currentMethod = env->GetStaticMethodID(
+            activityThreadClass, "currentActivityThread", "()Landroid/app/ActivityThread;");
+        jobject activityThread = env->CallStaticObjectMethod(activityThreadClass, currentMethod);
+        jmethodID getApplication = env->GetMethodID(
+            activityThreadClass, "getApplication", "()Landroid/app/Application;");
+        jobject context = env->CallObjectMethod(activityThread, getApplication);
+
+        jclass contextClass = env->GetObjectClass(context);
+        jmethodID getSystemService = env->GetMethodID(
+            contextClass, "getSystemService", "(Ljava/lang/String;)Ljava/lang/Object;");
+        jstring immName = env->NewStringUTF("input_method");
+        jobject imm = env->CallObjectMethod(context, getSystemService, immName);
+        env->DeleteLocalRef(immName);
+
+        if (imm) {
+            jclass immClass = env->GetObjectClass(imm);
+            jmethodID showSoftInput = env->GetMethodID(
+                immClass, "showSoftInput", "(Landroid/view/View;I)Z");
+            if (showSoftInput) {
+                env->CallBooleanMethod(imm, showSoftInput, g_NativeKeyboardEditText, 0);
+                if (!env->ExceptionCheck()) {
+                    g_AndroidKeyboardOpen.store(true);
+                    LOGI("OpenAndroidKeyboard: native EditText + showSoftInput");
+                } else {
+                    env->ExceptionClear();
+                    LOGI("OpenAndroidKeyboard: showSoftInput failed");
+                }
+            }
+        }
+    }
+
+    // Keep the old mechanism as a fallback for devices/builds where the hidden
+    // editor cannot be attached to the game's Activity window.
+    if (!g_AndroidKeyboardOpen.load()) {
+        jclass activityThreadClass = env->FindClass("android/app/ActivityThread");
+        if (activityThreadClass) {
+            jmethodID currentMethod = env->GetStaticMethodID(
                 activityThreadClass,
                 "currentActivityThread",
                 "()Landroid/app/ActivityThread;");
-            if (currentActivityThreadMethod != nullptr) {
-                jobject activityThread = env->CallStaticObjectMethod(
-                    activityThreadClass, currentActivityThreadMethod);
-                if (activityThread != nullptr) {
+            if (currentMethod) {
+                jobject activityThread = env->CallStaticObjectMethod(activityThreadClass, currentMethod);
+                if (activityThread) {
                     jmethodID getApplicationMethod = env->GetMethodID(
                         activityThreadClass,
                         "getApplication",
                         "()Landroid/app/Application;");
-                    jobject context = env->CallObjectMethod(
-                        activityThread, getApplicationMethod);
-
-                    if (context != nullptr) {
+                    jobject context = env->CallObjectMethod(activityThread, getApplicationMethod);
+                    if (context) {
                         jclass contextClass = env->GetObjectClass(context);
                         jmethodID getSystemServiceMethod = env->GetMethodID(
                             contextClass,
                             "getSystemService",
                             "(Ljava/lang/String;)Ljava/lang/Object;");
-
                         jstring immStr = env->NewStringUTF("input_method");
                         jobject imm = env->CallObjectMethod(
                             context, getSystemServiceMethod, immStr);
                         env->DeleteLocalRef(immStr);
-
-                        if (imm != nullptr) {
+                        if (imm) {
                             jclass immClass = env->GetObjectClass(imm);
                             jmethodID toggleSoftInputMethod = env->GetMethodID(
                                 immClass, "toggleSoftInput", "(II)V");
-                            if (toggleSoftInputMethod != nullptr) {
+                            if (toggleSoftInputMethod) {
                                 env->CallVoidMethod(imm, toggleSoftInputMethod, 2, 0);
                                 g_AndroidKeyboardOpen.store(true);
-                                LOGI("OpenAndroidKeyboard: toggleSoftInput called");
-                            } else {
-                                LOGI("OpenAndroidKeyboard: toggleSoftInput method not found");
+                                LOGI("OpenAndroidKeyboard: toggleSoftInput fallback");
                             }
-                        } else {
-                            LOGI("OpenAndroidKeyboard: InputMethodManager is null");
                         }
-                    } else {
-                        LOGI("OpenAndroidKeyboard: application context is null");
                     }
-                } else {
-                    LOGI("OpenAndroidKeyboard: ActivityThread is null");
                 }
-            } else {
-                LOGI("OpenAndroidKeyboard: currentActivityThread method not found");
             }
-        } else {
-            LOGI("OpenAndroidKeyboard: ActivityThread class not found");
         }
-    } else {
-        LOGI("OpenAndroidKeyboard: JNIEnv is null");
     }
 
-    if (attached) {
-        g_GlobalJavaVM->DetachCurrentThread();
+    if (attached) g_GlobalJavaVM->DetachCurrentThread();
+}
+
+void OpenAndroidKeyboard() {
+    OpenAndroidKeyboardForField(2, g_ChatInputBuffer);
+}
+
+static bool IsNativeKeyboardActive(JNIEnv* env) {
+    if (!env || !g_NativeKeyboardEditText) return false;
+
+    jclass activityThreadClass = env->FindClass("android/app/ActivityThread");
+    if (!activityThreadClass) return false;
+    jmethodID currentMethod = env->GetStaticMethodID(
+        activityThreadClass,
+        "currentActivityThread",
+        "()Landroid/app/ActivityThread;");
+    if (!currentMethod) return false;
+    jobject activityThread = env->CallStaticObjectMethod(activityThreadClass, currentMethod);
+    if (!activityThread) return false;
+
+    jmethodID getApplicationMethod = env->GetMethodID(
+        activityThreadClass,
+        "getApplication",
+        "()Landroid/app/Application;");
+    if (!getApplicationMethod) return false;
+    jobject context = env->CallObjectMethod(activityThread, getApplicationMethod);
+    if (!context) return false;
+
+    jclass contextClass = env->GetObjectClass(context);
+    jmethodID getSystemServiceMethod = env->GetMethodID(
+        contextClass,
+        "getSystemService",
+        "(Ljava/lang/String;)Ljava/lang/Object;");
+    if (!getSystemServiceMethod) return false;
+
+    jstring immStr = env->NewStringUTF("input_method");
+    jobject imm = env->CallObjectMethod(context, getSystemServiceMethod, immStr);
+    env->DeleteLocalRef(immStr);
+    if (!imm) return false;
+
+    jclass immClass = env->GetObjectClass(imm);
+    jmethodID isActiveMethod = env->GetMethodID(
+        immClass, "isActive", "(Landroid/view/View;)Z");
+    if (!isActiveMethod) return false;
+
+    return env->CallBooleanMethod(imm, isActiveMethod, g_NativeKeyboardEditText) == JNI_TRUE;
+}
+
+static void SyncNativeKeyboardTextAndSubmitState() {
+    if (g_GlobalJavaVM == nullptr || !g_NativeKeyboardEditText ||
+        !g_AndroidKeyboardOpen.load()) return;
+
+    JNIEnv* env = nullptr;
+    bool attached = false;
+    jint res = g_GlobalJavaVM->GetEnv((void**)&env, JNI_VERSION_1_6);
+    if (res == JNI_EDETACHED) {
+        if (g_GlobalJavaVM->AttachCurrentThread(&env, nullptr) == 0) attached = true;
     }
+    if (!env) return;
+
+    jclass editTextClass = env->GetObjectClass(g_NativeKeyboardEditText);
+    jmethodID getText = env->GetMethodID(
+        editTextClass, "getText", "()Landroid/text/Editable;");
+    if (getText) {
+        jobject editable = env->CallObjectMethod(g_NativeKeyboardEditText, getText);
+        if (editable) {
+            jclass objectClass = env->GetObjectClass(editable);
+            jmethodID toString = env->GetMethodID(objectClass, "toString", "()Ljava/lang/String;");
+            if (toString) {
+                jstring jText = (jstring)env->CallObjectMethod(editable, toString);
+                if (jText) {
+                    const char* utf = env->GetStringUTFChars(jText, nullptr);
+                    if (utf) {
+                        const int mode = g_KeyboardFieldMode.load();
+                        if (mode == 1) {
+                            strncpy(g_Nickname, utf, sizeof(g_Nickname) - 1);
+                            g_Nickname[sizeof(g_Nickname) - 1] = '\0';
+                        } else if (mode == 2) {
+                            strncpy(g_ChatInputBuffer, utf, sizeof(g_ChatInputBuffer) - 1);
+                            g_ChatInputBuffer[sizeof(g_ChatInputBuffer) - 1] = '\0';
+                        }
+                        env->ReleaseStringUTFChars(jText, utf);
+                    }
+                    env->DeleteLocalRef(jText);
+                }
+            }
+            env->DeleteLocalRef(editable);
+        }
+    }
+
+    const bool active = IsNativeKeyboardActive(env);
+    if (active) {
+        g_NativeKeyboardWasActive.store(true);
+    } else if (g_NativeKeyboardWasActive.load()) {
+        const int mode = g_KeyboardFieldMode.load();
+        const bool wasBack = g_KeyboardBackPressed.load();
+
+        g_AndroidKeyboardOpen.store(false);
+        g_NativeKeyboardWasActive.store(false);
+        g_KeyboardFieldMode.store(0);
+        g_KeyboardBackPressed.store(false);
+
+        if (mode == 2 && !wasBack && g_IsConnected.load() && strlen(g_ChatInputBuffer) > 0) {
+            const std::string msgStr(g_ChatInputBuffer);
+            {
+                std::lock_guard<std::mutex> lock(g_ChatMutex);
+                g_ChatMessages.push_back(std::string(g_Nickname) + ": " + msgStr);
+            }
+            {
+                std::lock_guard<std::mutex> lock(g_OutgoingChatMutex);
+                g_OutgoingChats.push_back(msgStr);
+            }
+            memset(g_ChatInputBuffer, 0, sizeof(g_ChatInputBuffer));
+        }
+    }
+
+    if (attached) g_GlobalJavaVM->DetachCurrentThread();
 }
 
 void CloseAndroidKeyboard() {
     if (g_GlobalJavaVM == nullptr) {
         g_AndroidKeyboardOpen.store(false);
+        g_KeyboardFieldMode.store(0);
         return;
     }
 
@@ -1315,48 +1683,85 @@ void CloseAndroidKeyboard() {
     bool attached = false;
     jint res = g_GlobalJavaVM->GetEnv((void**)&env, JNI_VERSION_1_6);
     if (res == JNI_EDETACHED) {
-        if (g_GlobalJavaVM->AttachCurrentThread(&env, nullptr) == 0) {
-            attached = true;
-        }
+        if (g_GlobalJavaVM->AttachCurrentThread(&env, nullptr) == 0) attached = true;
     }
 
-    if (env != nullptr) {
-        jclass activityThreadClass = env->FindClass("android/app/ActivityThread");
-        if (activityThreadClass != nullptr) {
-            jmethodID currentActivityThreadMethod = env->GetStaticMethodID(
+    if (env && g_NativeKeyboardEditText) {
+        jclass editTextClass = env->GetObjectClass(g_NativeKeyboardEditText);
+        jmethodID getWindowToken = env->GetMethodID(
+            editTextClass, "getWindowToken", "()Landroid/os/IBinder;");
+        jobject token = getWindowToken
+            ? env->CallObjectMethod(g_NativeKeyboardEditText, getWindowToken)
+            : nullptr;
+
+        if (token) {
+            jclass activityThreadClass = env->FindClass("android/app/ActivityThread");
+            jmethodID currentMethod = env->GetStaticMethodID(
                 activityThreadClass,
                 "currentActivityThread",
                 "()Landroid/app/ActivityThread;");
-            if (currentActivityThreadMethod != nullptr) {
-                jobject activityThread = env->CallStaticObjectMethod(
-                    activityThreadClass, currentActivityThreadMethod);
-                if (activityThread != nullptr) {
-                    jmethodID getApplicationMethod = env->GetMethodID(
-                        activityThreadClass,
-                        "getApplication",
-                        "()Landroid/app/Application;");
-                    jobject context = env->CallObjectMethod(
-                        activityThread, getApplicationMethod);
+            jobject activityThread = currentMethod
+                ? env->CallStaticObjectMethod(activityThreadClass, currentMethod)
+                : nullptr;
+            jobject context = nullptr;
+            if (activityThread) {
+                jmethodID getApplicationMethod = env->GetMethodID(
+                    activityThreadClass,
+                    "getApplication",
+                    "()Landroid/app/Application;");
+                if (getApplicationMethod) {
+                    context = env->CallObjectMethod(activityThread, getApplicationMethod);
+                }
+            }
+            if (context) {
+                jclass contextClass = env->GetObjectClass(context);
+                jmethodID getSystemServiceMethod = env->GetMethodID(
+                    contextClass,
+                    "getSystemService",
+                    "(Ljava/lang/String;)Ljava/lang/Object;");
+                jstring immName = env->NewStringUTF("input_method");
+                jobject imm = env->CallObjectMethod(context, getSystemServiceMethod, immName);
+                env->DeleteLocalRef(immName);
+                if (imm) {
+                    jclass immClass = env->GetObjectClass(imm);
+                    jmethodID hideSoftInput = env->GetMethodID(
+                        immClass,
+                        "hideSoftInputFromWindow",
+                        "(Landroid/os/IBinder;I)Z");
+                    if (hideSoftInput) {
+                        env->CallBooleanMethod(imm, hideSoftInput, token, 0);
+                    }
+                }
+            }
+            env->DeleteLocalRef(token);
+        }
+    }
 
-                    if (context != nullptr) {
+    // If the hidden native editor was never created, retain the old working
+    // toggle-based close as a fallback.
+    if (env && !g_NativeKeyboardEditText) {
+        jclass activityThreadClass = env->FindClass("android/app/ActivityThread");
+        if (activityThreadClass) {
+            jmethodID currentMethod = env->GetStaticMethodID(
+                activityThreadClass, "currentActivityThread", "()Landroid/app/ActivityThread;");
+            if (currentMethod) {
+                jobject activityThread = env->CallStaticObjectMethod(activityThreadClass, currentMethod);
+                if (activityThread) {
+                    jmethodID getApplicationMethod = env->GetMethodID(
+                        activityThreadClass, "getApplication", "()Landroid/app/Application;");
+                    jobject context = env->CallObjectMethod(activityThread, getApplicationMethod);
+                    if (context) {
                         jclass contextClass = env->GetObjectClass(context);
                         jmethodID getSystemServiceMethod = env->GetMethodID(
-                            contextClass,
-                            "getSystemService",
-                            "(Ljava/lang/String;)Ljava/lang/Object;");
-
+                            contextClass, "getSystemService", "(Ljava/lang/String;)Ljava/lang/Object;");
                         jstring immStr = env->NewStringUTF("input_method");
-                        jobject imm = env->CallObjectMethod(
-                            context, getSystemServiceMethod, immStr);
+                        jobject imm = env->CallObjectMethod(context, getSystemServiceMethod, immStr);
                         env->DeleteLocalRef(immStr);
-
-                        if (imm != nullptr) {
+                        if (imm) {
                             jclass immClass = env->GetObjectClass(imm);
                             jmethodID toggleSoftInputMethod = env->GetMethodID(
                                 immClass, "toggleSoftInput", "(II)V");
-                            if (toggleSoftInputMethod != nullptr) {
-                                env->CallVoidMethod(imm, toggleSoftInputMethod, 0, 0);
-                            }
+                            if (toggleSoftInputMethod) env->CallVoidMethod(imm, toggleSoftInputMethod, 0, 0);
                         }
                     }
                 }
@@ -1365,10 +1770,11 @@ void CloseAndroidKeyboard() {
     }
 
     g_AndroidKeyboardOpen.store(false);
+    g_NativeKeyboardWasActive.store(false);
+    g_KeyboardFieldMode.store(0);
+    g_KeyboardBackPressed.store(false);
 
-    if (attached) {
-        g_GlobalJavaVM->DetachCurrentThread();
-    }
+    if (attached) g_GlobalJavaVM->DetachCurrentThread();
 }
 
 GLuint LoadTextureFromPNGArrayEx(const unsigned char* png_data, int data_len, int* outWidth, int* outHeight) {
@@ -1474,6 +1880,8 @@ void NetworkLoop() {
 
             if (packetType == PACKET_SESSION_WELCOME) {
                 packetSize = sizeof(SessionWelcomePacket);
+            } else if (packetType == PACKET_PLAYER_INFO) {
+                packetSize = sizeof(PlayerInfoPacket);
             } else if (packetType == PACKET_CHAT) {
                 packetSize = sizeof(NetworkPacket);
             } else if (packetType == PACKET_VEHICLE_POSITION) {
@@ -1515,6 +1923,10 @@ void NetworkLoop() {
                 SessionWelcomePacket pkt;
                 memcpy(&pkt, recvBuffer, sizeof(pkt));
                 HandleSessionWelcome(pkt);
+            } else if (packetType == PACKET_PLAYER_INFO) {
+                PlayerInfoPacket pkt;
+                memcpy(&pkt, recvBuffer, sizeof(pkt));
+                HandlePlayerInfoPacket(pkt);
             } else if (packetType == PACKET_CHAT) {
                 NetworkPacket pkt;
                 memcpy(&pkt, recvBuffer, sizeof(pkt));
@@ -1815,7 +2227,9 @@ void StartLANDiscoveryThread() {
 
 void TCPHostThread() {
     ResetVehicleSyncState();
+    ResetPlayerNames();
     g_LocalPlayerId.store(0);
+    SetPlayerName(0, g_Nickname);
 
     if (!IsNetworkAvailable()) {
         ShowNativeToast("Error: Check your network connection!");
@@ -1854,6 +2268,15 @@ void TCPHostThread() {
             g_IsConnected = true;
             g_ConnectedStatus = "Client Connected!";
             ShowNativeToast("Client Joined the Room!");
+
+            // Share the host name immediately so the client can show real names.
+            PlayerInfoPacket hostInfo;
+            memset(&hostInfo, 0, sizeof(hostInfo));
+            hostInfo.type = PACKET_PLAYER_INFO;
+            hostInfo.playerId = 0;
+            strncpy(hostInfo.playerName, g_Nickname, sizeof(hostInfo.playerName) - 1);
+            SendAllBytes(g_TcpSocket, &hostInfo, sizeof(hostInfo));
+
             QueueAllCurrentAuthorities();
             NetworkLoop();
         }
@@ -1865,12 +2288,14 @@ void TCPHostThread() {
     g_IsConnected = false;
     g_IsHost = false;
     ClearChat();
+    ResetPlayerNames();
     ResetVehicleSyncState();
     if (g_ConnectedStatus != "Room Closed.") g_ConnectedStatus = "Connection Lost.";
 }
 
 void TCPClientThread(std::string hostIP) {
     ResetVehicleSyncState();
+    ResetPlayerNames();
     g_LocalPlayerId.store(0xFF);
 
     g_TcpSocket = socket(AF_INET, SOCK_STREAM, 0);
@@ -1909,6 +2334,7 @@ void TCPClientThread(std::string hostIP) {
     g_IsConnected = false;
     g_IsClient = false;
     ClearChat();
+    ResetPlayerNames();
     ResetVehicleSyncState();
 }
 
@@ -1993,6 +2419,7 @@ int32_t my_AInputQueue_getEvent(void* queue, AInputEvent** outEvent) {
                     g_ImGuiInitialized && ImGui::GetCurrentContext() != nullptr) {
                     if (g_IsMultiplayerMenuActive) {
                         if (g_AndroidKeyboardOpen.load()) {
+                            g_KeyboardBackPressed.store(true);
                             CloseAndroidKeyboard();
                         } else {
                             g_IsMultiplayerMenuActive = false;
@@ -2001,43 +2428,63 @@ int32_t my_AInputQueue_getEvent(void* queue, AInputEvent** outEvent) {
                     }
                 }
 
+                if (g_AndroidKeyboardOpen.load() && action == AKEY_EVENT_ACTION_DOWN &&
+                    (keyCode == AKEYCODE_ENTER || keyCode == AKEYCODE_NUMPAD_ENTER) &&
+                    g_KeyboardFieldMode.load() == 2) {
+                    // Native IME DONE/ENTER: send chat immediately.
+                    if (g_IsConnected.load() && strlen(g_ChatInputBuffer) > 0) {
+                        const std::string msgStr(g_ChatInputBuffer);
+                        {
+                            std::lock_guard<std::mutex> lock(g_ChatMutex);
+                            g_ChatMessages.push_back(std::string(g_Nickname) + ": " + msgStr);
+                        }
+                        {
+                            std::lock_guard<std::mutex> lock(g_OutgoingChatMutex);
+                            g_OutgoingChats.push_back(msgStr);
+                        }
+                        memset(g_ChatInputBuffer, 0, sizeof(g_ChatInputBuffer));
+                    }
+                    CloseAndroidKeyboard();
+                    shouldEatEvent = true;
+                }
+
                 if (g_ImGuiInitialized && ImGui::GetCurrentContext() != nullptr) {
                     ImGuiIO& io = ImGui::GetIO();
                     bool isDown = (action == AKEY_EVENT_ACTION_DOWN);
 
-                    if (keyCode == AKEYCODE_DEL) {
-                        io.AddKeyEvent(ImGuiKey_Backspace, isDown);
-                    } else if (keyCode == AKEYCODE_ENTER || keyCode == AKEYCODE_NUMPAD_ENTER) {
-                        io.AddKeyEvent(ImGuiKey_Enter, isDown);
-                    } else if (keyCode == AKEYCODE_DPAD_LEFT) {
-                        io.AddKeyEvent(ImGuiKey_LeftArrow, isDown);
-                    } else if (keyCode == AKEYCODE_DPAD_RIGHT) {
-                        io.AddKeyEvent(ImGuiKey_RightArrow, isDown);
-                    }
+                    // Once a native EditText owns the IME, let Android maintain the
+                    // actual text.  The render thread mirrors its value into ImGui.
+                    if (!g_AndroidKeyboardOpen.load()) {
+                        if (keyCode == AKEYCODE_DEL) {
+                            io.AddKeyEvent(ImGuiKey_Backspace, isDown);
+                        } else if (keyCode == AKEYCODE_ENTER || keyCode == AKEYCODE_NUMPAD_ENTER) {
+                            io.AddKeyEvent(ImGuiKey_Enter, isDown);
+                        } else if (keyCode == AKEYCODE_DPAD_LEFT) {
+                            io.AddKeyEvent(ImGuiKey_LeftArrow, isDown);
+                        } else if (keyCode == AKEYCODE_DPAD_RIGHT) {
+                            io.AddKeyEvent(ImGuiKey_RightArrow, isDown);
+                        }
 
-                    if (isDown) {
-                        bool isShift = (metaState & AMETA_SHIFT_ON) != 0;
-                        char c = 0;
+                        if (isDown) {
+                            bool isShift = (metaState & AMETA_SHIFT_ON) != 0;
+                            char c = 0;
 
-                        if (keyCode >= AKEYCODE_A && keyCode <= AKEYCODE_Z) {
-                            c = (isShift ? 'A' : 'a') + (keyCode - AKEYCODE_A);
-                        } else if (keyCode >= AKEYCODE_0 && keyCode <= AKEYCODE_9) {
-                            c = '0' + (keyCode - AKEYCODE_0);
-                        } else if (keyCode == AKEYCODE_SPACE) { c = ' '; }
-                          else if (keyCode == AKEYCODE_PERIOD) { c = '.'; }
-                          else if (keyCode == AKEYCODE_COMMA) { c = ','; }
-                          else if (keyCode == AKEYCODE_MINUS) { c = (isShift ? '_' : '-'); }
-                          else if (keyCode == AKEYCODE_EQUALS) { c = (isShift ? '+' : '='); }
-                          else if (keyCode == AKEYCODE_SLASH) { c = (isShift ? '?' : '/'); }
+                            if (keyCode >= AKEYCODE_A && keyCode <= AKEYCODE_Z) {
+                                c = (isShift ? 'A' : 'a') + (keyCode - AKEYCODE_A);
+                            } else if (keyCode >= AKEYCODE_0 && keyCode <= AKEYCODE_9) {
+                                c = '0' + (keyCode - AKEYCODE_0);
+                            } else if (keyCode == AKEYCODE_SPACE) { c = ' '; }
+                              else if (keyCode == AKEYCODE_PERIOD) { c = '.'; }
+                              else if (keyCode == AKEYCODE_COMMA) { c = ','; }
+                              else if (keyCode == AKEYCODE_MINUS) { c = (isShift ? '_' : '-'); }
+                              else if (keyCode == AKEYCODE_EQUALS) { c = (isShift ? '+' : '='); }
+                              else if (keyCode == AKEYCODE_SLASH) { c = (isShift ? '?' : '/'); }
 
-                        if (c != 0) {
-                            io.AddInputCharacter(c);
+                            if (c != 0) io.AddInputCharacter(c);
                         }
                     }
 
-                    if (io.WantCaptureKeyboard) {
-                        shouldEatEvent = true;
-                    }
+                    if (io.WantCaptureKeyboard) shouldEatEvent = true;
                 }
 
                 if (shouldEatEvent) {
@@ -2304,6 +2751,8 @@ void DrawImGui() {
     ImGui_ImplOpenGL3_NewFrame();
     ImGui::NewFrame();
 
+    SyncNativeKeyboardTextAndSubmitState();
+
     if (g_CurrentMenu != MENU_INGAME && !g_IsMultiplayerMenuActive && g_MultiplayerButtonTexture != 0) {
         const bool isSettings = (g_CurrentMenu == MENU_SETTINGS);
         const char* entryLabel = isSettings ? "Create Room" : "Join Room";
@@ -2412,10 +2861,8 @@ void DrawImGui() {
             ImGui::SetCursorPos(ImVec2(x + inner, y + 12.0f));
             DrawGameSectionTitle("Chat", width - inner * 2.0f);
 
-            // Sağ panelde sohbet geçmişi.
-            const float inputH = std::max(56.0f, std::min(72.0f, commonButtonH * 0.30f));
-            const float previewH = std::max(46.0f, inputH * 0.78f);
-            const float historyH = std::max(80.0f, height - inputH - previewH - 94.0f);
+            const float inputH = std::max(64.0f, std::min(84.0f, commonButtonH * 0.34f));
+            const float historyH = std::max(100.0f, height - inputH - 66.0f);
             const float historyW = width - inner * 2.0f;
 
             ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0, 0, 0, 0.0f));
@@ -2435,36 +2882,17 @@ void DrawImGui() {
             ImGui::PopStyleVar();
             ImGui::PopStyleColor();
 
-            // Yazılan metni klavyenin hemen üzerinde görünür tutan ayrı blok.
-            const float previewY = y + height - inputH - previewH - 20.0f;
-            ImGui::SetCursorPos(ImVec2(x + inner, previewY));
-            ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0.0f, 0.0f, 0.0f, 0.84f));
-            ImGui::PushStyleVar(ImGuiStyleVar_ChildBorderSize, 1.0f);
-            ImGui::BeginChild("##ChatTypingPreview", ImVec2(historyW, previewH), false,
-                              ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoBackground);
-            ImGui::PushFont(g_GameUIFont);
-            if (strlen(g_ChatInputBuffer) > 0) {
-                ImGui::TextWrapped("%s", g_ChatInputBuffer);
-            } else {
-                ImGui::TextDisabled("Type a message...");
-            }
-            ImGui::PopFont();
-            ImGui::EndChild();
-            ImGui::PopStyleVar();
-            ImGui::PopStyleColor();
-
-            // Gerçek InputText küçük alt kutuda kalır; klavye bunu besler.
-            // Enter gönderim yapar, ayrı Send butonu yoktur.
+            // Tek gerçek sohbet kutusu: yazdığımız metin doğrudan burada görünür.
+            // Ayrı "Type a text"/preview bloğu yoktur.
             const float inputY = y + height - inputH - 10.0f;
             ImGui::SetCursorPos(ImVec2(x + inner, inputY));
-            ImGui::PushStyleColor(ImGuiCol_FrameBg, ImVec4(0.015f, 0.022f, 0.028f, 0.82f));
-            ImGui::PushStyleColor(ImGuiCol_FrameBgHovered, ImVec4(0.025f, 0.040f, 0.050f, 0.90f));
-            ImGui::PushStyleColor(ImGuiCol_FrameBgActive, ImVec4(0.035f, 0.060f, 0.070f, 0.95f));
+            ImGui::PushStyleColor(ImGuiCol_FrameBg, ImVec4(0.015f, 0.022f, 0.028f, 0.92f));
+            ImGui::PushStyleColor(ImGuiCol_FrameBgHovered, ImVec4(0.025f, 0.040f, 0.050f, 0.96f));
+            ImGui::PushStyleColor(ImGuiCol_FrameBgActive, ImVec4(0.035f, 0.060f, 0.070f, 1.0f));
             ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1, 1, 1, 1));
 
             const float chatInputW = std::max(160.0f, width - inner * 2.0f);
             ImGui::SetNextItemWidth(chatInputW);
-
             const ImVec2 chatInputMin = ImGui::GetCursorScreenPos();
             const ImVec2 chatInputMax(
                 chatInputMin.x + chatInputW,
@@ -2481,33 +2909,26 @@ void DrawImGui() {
             );
 
             if (ImGui::IsItemClicked() || ImGui::IsItemActivated() || chatTouch) {
-                OpenAndroidKeyboard();
+                OpenAndroidKeyboardForField(2, g_ChatInputBuffer);
             }
 
-            const bool chatInputActive = ImGui::IsItemActive();
             ImGui::PopStyleColor(4);
 
-            // Enter = gönder. Send butonu tamamen kaldırıldı.
+            // Fallback for an ENTER that still reaches ImGui instead of the native editor.
             if (enterPressed) {
                 if (g_IsConnected.load() && strlen(g_ChatInputBuffer) > 0) {
                     const std::string msgStr(g_ChatInputBuffer);
-
                     {
                         std::lock_guard<std::mutex> lock(g_ChatMutex);
-                        g_ChatMessages.push_back("You: " + msgStr);
+                        g_ChatMessages.push_back(std::string(g_Nickname) + ": " + msgStr);
                     }
                     {
                         std::lock_guard<std::mutex> lock(g_OutgoingChatMutex);
                         g_OutgoingChats.push_back(msgStr);
                     }
-
                     memset(g_ChatInputBuffer, 0, sizeof(g_ChatInputBuffer));
-                    g_ClearChatInputPending.store(false);
                 }
-
-                if (chatInputActive || g_AndroidKeyboardOpen.load()) {
-                    CloseAndroidKeyboard();
-                }
+                CloseAndroidKeyboard();
             }
         };
 
@@ -2533,6 +2954,7 @@ void DrawImGui() {
                                         ImVec2(innerButtonW, innerButtonH), 1.30f, false)) {
                     ClearChat();
                     g_IsHost = true;
+                    SetPlayerName(0, g_Nickname);
                     std::thread(TCPHostThread).detach();
                 }
             } else {
@@ -2562,10 +2984,13 @@ void DrawImGui() {
             DrawGameStatusText("Status:", g_ConnectedStatus, infoW);
             ImGui::Text("Room");
             ImGui::TextDisabled("%s's Room", g_Nickname);
-            const uint8_t hostPlayerId = g_LocalPlayerId.load();
-            if (hostPlayerId < MAX_PLAYERS) ImGui::Text("Player %u", (unsigned)(hostPlayerId + 1));
-            else ImGui::TextDisabled("Player -");
-            ImGui::TextDisabled("Up to %u players", (unsigned)MAX_PLAYERS);
+            const std::string player1Name = GetPlayerName(0);
+            const std::string player2Name = GetPlayerName(1);
+            if (!player1Name.empty()) ImGui::Text("%s", player1Name.c_str());
+            if (!player2Name.empty()) ImGui::Text("%s", player2Name.c_str());
+            if (player1Name.empty() && player2Name.empty()) {
+                ImGui::TextDisabled("Waiting for players...");
+            }
 
             RenderChatUI(chatX, bodyTop, chatW, bodyBottom - bodyTop);
         } else if (g_CurrentMenu == MENU_SAVELOAD) {
@@ -2587,6 +3012,8 @@ void DrawImGui() {
                 if (DrawGameStyleButton("##DisconnectTop", "Disconnect",
                                         ImVec2(commonButtonW, commonButtonH), 1.30f, false)) {
                     ClearChat();
+                    CloseAndroidKeyboard();
+                    ResetPlayerNames();
                     g_IsHost.store(false);
                     g_IsClient.store(false);
                     g_IsConnected.store(false);
@@ -2620,11 +3047,21 @@ void DrawImGui() {
                                                      IM_ARRAYSIZE(g_Nickname),
                                                      ImGuiInputTextFlags_EnterReturnsTrue);
             if (ImGui::IsItemClicked() || nickTouch) {
-                OpenAndroidKeyboard();
+                OpenAndroidKeyboardForField(1, g_Nickname);
             }
             if (nickEnterPressed && g_AndroidKeyboardOpen.load()) CloseAndroidKeyboard();
             ImGui::PopStyleVar();
             ImGui::PopStyleColor(2);
+
+            // Odaya bağlıyken gerçek oyuncu isimlerini göster.
+            if (g_IsConnected.load()) {
+                const std::string player1Name = GetPlayerName(0);
+                const std::string player2Name = GetPlayerName(1);
+                ImGui::Spacing();
+                ImGui::Text("Players in Room");
+                if (!player1Name.empty()) ImGui::Text("%s", player1Name.c_str());
+                if (!player2Name.empty()) ImGui::Text("%s", player2Name.c_str());
+            }
 
             // Discovered Rooms başlığı aşağıya taşındı (bodyTop + 200.0f)
             ImGui::SetCursorPos(ImVec2(infoX, bodyTop + 200.0f));
