@@ -122,7 +122,8 @@ static jobject g_NativeKeyboardEditText = nullptr;
 // The hidden EditText cannot be attached from the render thread (CalledFromWrongThreadException),
 // so the typing bar is drawn with ImGui instead.
 static const bool kUseNativeEditText = false;
-static const float kKeyboardTopFraction = 0.44f; // approx. top edge of the soft keyboard (fraction of screen height)
+static const float kKeyboardTopFraction = 0.47f; // FALLBACK: approx. keyboard top (fraction of screen height) when the real height cannot be measured
+static const float kKeyboardGapFixPx = 0.0f;       // manual fine-tune: +value moves the bar down, -value moves it up
 static std::atomic<int> g_KeyboardFieldMode(0); // 0=none, 1=nickname, 2=chat
 static std::atomic<bool> g_NativeKeyboardWasActive(false);
 static std::atomic<bool> g_KeyboardBackPressed(false);
@@ -2708,6 +2709,54 @@ static void DrawHeaderDarkening(const ImVec2& screen) {
         IM_COL32(0,0,0,20), IM_COL32(0,0,0,20));
 }
 
+// Real height of the soft keyboard in pixels (0 = unknown / hidden).
+// Uses InputMethodManager.getInputMethodWindowVisibleHeight(); if the device blocks
+// it, the caller falls back to kKeyboardTopFraction.
+static int QueryKeyboardHeightPx() {
+    if (g_GlobalJavaVM == nullptr) return 0;
+
+    JNIEnv* env = nullptr;
+    bool attached = false;
+    if (g_GlobalJavaVM->GetEnv((void**)&env, JNI_VERSION_1_6) == JNI_EDETACHED) {
+        if (g_GlobalJavaVM->AttachCurrentThread(&env, nullptr) != 0) return 0;
+        attached = true;
+    }
+    if (!env) return 0;
+
+    int height = 0;
+    env->PushLocalFrame(16);
+    do {
+        jclass atc = env->FindClass("android/app/ActivityThread");
+        if (!atc) break;
+        jmethodID cur = env->GetStaticMethodID(atc, "currentActivityThread", "()Landroid/app/ActivityThread;");
+        if (!cur) break;
+        jobject at = env->CallStaticObjectMethod(atc, cur);
+        if (!at) break;
+        jmethodID getApp = env->GetMethodID(atc, "getApplication", "()Landroid/app/Application;");
+        if (!getApp) break;
+        jobject ctx = env->CallObjectMethod(at, getApp);
+        if (!ctx) break;
+        jclass ctxClass = env->GetObjectClass(ctx);
+        jmethodID getSvc = env->GetMethodID(ctxClass, "getSystemService", "(Ljava/lang/String;)Ljava/lang/Object;");
+        if (!getSvc) break;
+        jstring svcName = env->NewStringUTF("input_method");
+        jobject imm = env->CallObjectMethod(ctx, getSvc, svcName);
+        if (!imm) break;
+        jclass immClass = env->GetObjectClass(imm);
+        jmethodID getH = env->GetMethodID(immClass, "getInputMethodWindowVisibleHeight", "()I");
+        if (!getH) break;
+        height = (int)env->CallIntMethod(imm, getH);
+    } while (false);
+    if (env->ExceptionCheck()) {
+        env->ExceptionClear();
+        height = 0;
+    }
+    env->PopLocalFrame(nullptr);
+
+    if (attached) g_GlobalJavaVM->DetachCurrentThread();
+    return height > 0 ? height : 0;
+}
+
 // ========================================================================
 // TYPING BAR (shows what is being typed, directly above the soft keyboard)
 // ========================================================================
@@ -2725,7 +2774,20 @@ static void DrawTypingBar(const ImVec2& screen) {
     const size_t bufSize = (mode == 1) ? sizeof(g_Nickname) : sizeof(g_ChatInputBuffer);
 
     const float barH = std::max(84.0f, screen.y * 0.115f);
-    const float barBottom = screen.y * kKeyboardTopFraction;
+    // Bar sits exactly on top of the keyboard: measure the real keyboard height every few
+    // frames (it also follows the keyboard while it slides up); use the fraction as fallback.
+    static int s_kbFrame = 0;
+    static int s_kbHeight = 0;
+    if ((s_kbFrame++ % 6) == 0) {
+        const int measured = QueryKeyboardHeightPx();
+        if (measured > 0) s_kbHeight = measured;
+    }
+    float barBottom = screen.y * kKeyboardTopFraction;
+    if (s_kbHeight > 0 && s_kbHeight < (int)(screen.y * 0.8f)) {
+        barBottom = screen.y - (float)s_kbHeight;
+    }
+    barBottom += kKeyboardGapFixPx;
+    barBottom = std::min(std::max(barBottom, barH + 4.0f), screen.y);
     const float btnW = 190.0f;
 
     ImGui::SetNextWindowPos(ImVec2(0.0f, std::max(0.0f, barBottom - barH)), ImGuiCond_Always);
@@ -2856,7 +2918,7 @@ void DrawImGui() {
         float entryW = isSettings
                          ? std::min(680.0f, std::max(440.0f, screen.x * 0.36f))
                          : std::min(620.0f, std::max(420.0f, screen.x * 0.32f));
-        float entryH = isSettings ? entryW / 5.80f : entryW / 2.72f;
+        float entryH = isSettings ? entryW / 4.30f : entryW / 2.72f;
         const float entryX = isSettings
                              ? (screen.x - entryW) * 0.5f
                              : -10.0f;
@@ -2873,7 +2935,7 @@ void DrawImGui() {
                      ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoScrollbar |
                      ImGuiWindowFlags_NoScrollWithMouse);
         const bool entryClicked = isSettings
-            ? DrawCenteredMirroredGameButton("##RoomEntryCreate", entryLabel, entryW, entryH, 1.36f)
+            ? DrawCenteredMirroredGameButton("##RoomEntryCreate", entryLabel, entryW, entryH, 1.80f)
             : DrawGameStyleButton("##RoomEntryJoin", entryLabel, ImVec2(entryW, entryH), 1.34f, false);
         if (entryClicked) {
             g_CurrentMenu = isSettings ? MENU_SETTINGS : MENU_SAVELOAD;
@@ -3161,8 +3223,10 @@ void DrawImGui() {
             }
 
             // Discovered Rooms başlığı aşağıya taşındı (bodyTop + 200.0f)
-            ImGui::SetCursorPos(ImVec2(infoX, bodyTop + 200.0f));
-            DrawGameSectionTitle("Discovered Rooms", infoW);
+            // Title follows the content above it (player list etc.) instead of a fixed Y,
+            // so connected-state texts can no longer overlap it.
+            ImGui::SetCursorPos(ImVec2(infoX, std::max(bodyTop + 200.0f, ImGui::GetCursorPosY() + 6.0f)));
+            DrawGameSectionTitle(g_IsConnected.load() ? "Connected Room" : "Discovered Rooms", infoW);
             const float listH = std::max(100.0f, bodyBottom - ImGui::GetCursorScreenPos().y - 12.0f);
             ImGui::PushStyleVar(ImGuiStyleVar_ChildBorderSize, 0.0f);
             ImGui::BeginChild("##RoomsList", ImVec2(infoW, listH), false,
@@ -3218,7 +3282,6 @@ void DrawImGui() {
                     }
                 }
             } else {
-                ImGui::Text("Connected To Room");
                 ImGui::Spacing();
 
                 // Bağlıyken sadece Join Game içeride kalır.
