@@ -119,6 +119,10 @@ std::atomic<bool> g_ClearChatInputPending(false);
 // the game window, while Android IME uses it as the real text editor.  This makes
 // the keyboard show its native extracted-text area and DONE action.
 static jobject g_NativeKeyboardEditText = nullptr;
+// The hidden EditText cannot be attached from the render thread (CalledFromWrongThreadException),
+// so the typing bar is drawn with ImGui instead.
+static const bool kUseNativeEditText = false;
+static const float kKeyboardTopFraction = 0.44f; // approx. top edge of the soft keyboard (fraction of screen height)
 static std::atomic<int> g_KeyboardFieldMode(0); // 0=none, 1=nickname, 2=chat
 static std::atomic<bool> g_NativeKeyboardWasActive(false);
 static std::atomic<bool> g_KeyboardBackPressed(false);
@@ -1474,7 +1478,7 @@ void OpenAndroidKeyboardForField(int fieldMode, const char* initialText) {
     g_KeyboardBackPressed.store(false);
     g_NativeKeyboardWasActive.store(false);
 
-    if (EnsureNativeKeyboardEditText(env)) {
+    if (kUseNativeEditText && EnsureNativeKeyboardEditText(env)) {
         SetNativeKeyboardText(env, initialText);
 
         jclass editTextClass = env->GetObjectClass(g_NativeKeyboardEditText);
@@ -2454,7 +2458,7 @@ int32_t my_AInputQueue_getEvent(void* queue, AInputEvent** outEvent) {
 
                     // Once a native EditText owns the IME, let Android maintain the
                     // actual text.  The render thread mirrors its value into ImGui.
-                    if (!g_AndroidKeyboardOpen.load()) {
+                    if (!g_AndroidKeyboardOpen.load() || g_NativeKeyboardEditText == nullptr) {
                         if (keyCode == AKEYCODE_DEL) {
                             io.AddKeyEvent(ImGuiKey_Backspace, isDown);
                         } else if (keyCode == AKEYCODE_ENTER || keyCode == AKEYCODE_NUMPAD_ENTER) {
@@ -2702,6 +2706,99 @@ static void DrawHeaderDarkening(const ImVec2& screen) {
         ImVec2(0.0f, 0.0f), ImVec2(screen.x, bandH),
         IM_COL32(0,0,0,104), IM_COL32(0,0,0,104),
         IM_COL32(0,0,0,20), IM_COL32(0,0,0,20));
+}
+
+// ========================================================================
+// TYPING BAR (shows what is being typed, directly above the soft keyboard)
+// ========================================================================
+static void DrawTypingBar(const ImVec2& screen) {
+    static bool s_barFocused = false;
+
+    const int mode = g_KeyboardFieldMode.load();
+    if (!g_AndroidKeyboardOpen.load() || g_NativeKeyboardEditText != nullptr ||
+        (mode != 1 && mode != 2) || g_GameUIFont == nullptr) {
+        s_barFocused = false;
+        return;
+    }
+
+    char* buf = (mode == 1) ? g_Nickname : g_ChatInputBuffer;
+    const size_t bufSize = (mode == 1) ? sizeof(g_Nickname) : sizeof(g_ChatInputBuffer);
+
+    const float barH = std::max(84.0f, screen.y * 0.115f);
+    const float barBottom = screen.y * kKeyboardTopFraction;
+    const float btnW = 190.0f;
+
+    ImGui::SetNextWindowPos(ImVec2(0.0f, std::max(0.0f, barBottom - barH)), ImGuiCond_Always);
+    ImGui::SetNextWindowSize(ImVec2(screen.x, barH), ImGuiCond_Always);
+    ImGui::SetNextWindowFocus(); // always keep the bar on top of the menu window
+
+    ImGui::PushStyleColor(ImGuiCol_WindowBg, ImVec4(1.0f, 1.0f, 1.0f, 1.0f));
+    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.09f, 0.09f, 0.09f, 1.0f));
+    ImGui::PushStyleColor(ImGuiCol_FrameBg, ImVec4(0.0f, 0.0f, 0.0f, 0.0f));
+    ImGui::PushStyleColor(ImGuiCol_FrameBgHovered, ImVec4(0.0f, 0.0f, 0.0f, 0.0f));
+    ImGui::PushStyleColor(ImGuiCol_FrameBgActive, ImVec4(0.0f, 0.0f, 0.0f, 0.0f));
+    ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.0f, 0.0f, 0.0f, 0.0f));
+    ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.0f, 0.0f, 0.0f, 0.06f));
+    ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(0.0f, 0.0f, 0.0f, 0.12f));
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0.0f, 0.0f));
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 0.0f);
+
+    bool submit = false;
+
+    ImGui::Begin("##TypingBar", nullptr,
+                 ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize |
+                 ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoSavedSettings |
+                 ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
+    ImGui::PushFont(g_GameUIFont);
+
+    const float fh = ImGui::GetFrameHeight();
+    const float inputW = std::max(120.0f, screen.x - btnW - 56.0f);
+
+    ImGui::SetCursorPos(ImVec2(24.0f, (barH - fh) * 0.5f));
+    ImGui::SetNextItemWidth(inputW);
+    if (!s_barFocused) ImGui::SetKeyboardFocusHere();
+    const bool enterPressed = ImGui::InputText("##TypingBarInput", buf, bufSize,
+                                               ImGuiInputTextFlags_EnterReturnsTrue);
+    s_barFocused = ImGui::IsItemActive();
+
+    {
+        const ImVec2 mn = ImGui::GetItemRectMin();
+        const ImVec2 mx = ImGui::GetItemRectMax();
+        ImGui::GetWindowDrawList()->AddLine(ImVec2(mn.x, mx.y + 2.0f), ImVec2(mx.x, mx.y + 2.0f),
+                                            IM_COL32(0, 128, 128, 255), 2.0f);
+    }
+
+    const ImVec2 winPos = ImGui::GetWindowPos();
+    const ImVec2 btnLocal(screen.x - btnW - 16.0f, (barH - fh * 1.3f) * 0.5f);
+    ImGui::SetCursorPos(btnLocal);
+    const bool btnClicked = ImGui::Button("TAMAM", ImVec2(btnW, fh * 1.3f));
+    const bool btnTouch = ConsumePendingTouchForRect(
+        ImVec2(winPos.x + btnLocal.x, winPos.y + btnLocal.y),
+        ImVec2(winPos.x + btnLocal.x + btnW, winPos.y + btnLocal.y + fh * 1.3f));
+
+    submit = enterPressed || btnClicked || btnTouch;
+
+    ImGui::PopFont();
+    ImGui::End();
+    ImGui::PopStyleVar(2);
+    ImGui::PopStyleColor(8);
+
+    if (submit) {
+        if (mode == 2 && g_IsConnected.load() && strlen(g_ChatInputBuffer) > 0) {
+            const std::string msgStr(g_ChatInputBuffer);
+            {
+                std::lock_guard<std::mutex> lock(g_ChatMutex);
+                g_ChatMessages.push_back(std::string(g_Nickname) + ": " + msgStr);
+            }
+            {
+                std::lock_guard<std::mutex> lock(g_OutgoingChatMutex);
+                g_OutgoingChats.push_back(msgStr);
+            }
+            memset(g_ChatInputBuffer, 0, sizeof(g_ChatInputBuffer));
+        }
+        s_barFocused = false;
+        CloseAndroidKeyboard();
+    }
 }
 
 void DrawImGui() {
@@ -3145,6 +3242,9 @@ void DrawImGui() {
         ImGui::End();
         ImGui::PopStyleVar();
     }
+
+    // Typing bar above the keyboard (shows the text being typed).
+    DrawTypingBar(screen);
 
     // If this tap was not on either input field, discard it after this frame.
     g_PendingTouchDown.store(false);
