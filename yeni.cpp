@@ -2300,31 +2300,39 @@ static bool DrawCenteredMirroredGameButton(const char* id, const char* label,
     ImDrawList* draw = ImGui::GetWindowDrawList();
     const ImVec2 start = ImGui::GetCursorScreenPos();
 
-    const float overlap = std::min(42.0f, totalW * 0.055f);
-    const float halfW = (totalW + overlap) * 0.5f;
-    const float actualTotal = halfW * 2.0f - overlap;
-    // Iki yarim ARTIK ust uste binmiyor: sol yari, sag yarinin basladigi yerde kesiliyor.
-    // (Eskiden ortada iki seffaf katman ust uste biniyor ve koyu bir serit gorunuyordu.)
-    const float seamX = floorf(start.x + halfW - overlap + 0.5f);
-
     ImGui::SetCursorScreenPos(start);
-    ImGui::InvisibleButton(id, ImVec2(actualTotal, h));
+    ImGui::InvisibleButton(id, ImVec2(totalW, h));
     bool clicked = ImGui::IsItemClicked(ImGuiMouseButton_Left);
 
     ImGui::SetCursorScreenPos(start);
 
     if (g_MultiplayerButtonTexture != 0) {
-        // Sol taraf: Aynalı (Çıkıntısı sola/dışa bakar) - seam'e kadar, UV kırpılmış
-        const float leftW = seamX - start.x;
-        const float leftU = 1.0f - leftW / halfW;   // aynalı: u 1.0 -> leftU
-        draw->AddImage(ToImGuiTexture(g_MultiplayerButtonTexture),
-                       start, ImVec2(seamX, start.y + h),
-                       ImVec2(1.0f, 0.0f), ImVec2(leftU, 1.0f));
-        // Sağ taraf: Düz (Çıkıntısı sağa/dışa bakar) - seam'den başlar
-        draw->AddImage(ToImGuiTexture(g_MultiplayerButtonTexture),
-                       ImVec2(seamX, start.y),
-                       ImVec2(start.x + actualTotal, start.y + h),
-                       ImVec2(0.0f, 0.0f), ImVec2(1.0f, 1.0f));
+        // Buton 4 parcadan olusur: [sol uc][sol orta][sag orta][sag uc].
+        // Iki yarinin bulustugu orta noktada dokunun KENAR sutunu degil, ic kismi (midU)
+        // kullanilir; boylece birlesim yerinde bosluk/cizgi olmaz ve ust uste binme yoktur.
+        // Uclar (egimli kisim) eski olcekte cizilir, aradaki duz kisim gerilir.
+        const float overlap = std::min(42.0f, totalW * 0.055f);
+        const float refW = (totalW + overlap) * 0.5f;   // eski tasarimda dokunun tamaminin genisligi
+        const float capU0 = 0.86f;                      // egimli ucun basladigi u
+        const float midU  = 0.50f;                      // iki yarinin bulustugu (ic) u
+        const float capPx = floorf((1.0f - capU0) * refW + 0.5f);
+
+        const float x0 = floorf(start.x + 0.5f);
+        const float x1 = x0 + floorf(totalW + 0.5f);
+        const float xc = floorf((x0 + x1) * 0.5f + 0.5f);
+        const float y0 = start.y, y1 = start.y + h;
+        ImTextureID tex = ToImGuiTexture(g_MultiplayerButtonTexture);
+
+        // Sag yari (duz)
+        draw->AddImage(tex, ImVec2(xc, y0), ImVec2(x1 - capPx, y1),
+                       ImVec2(midU, 0.0f), ImVec2(capU0, 1.0f));
+        draw->AddImage(tex, ImVec2(x1 - capPx, y0), ImVec2(x1, y1),
+                       ImVec2(capU0, 0.0f), ImVec2(1.0f, 1.0f));
+        // Sol yari (aynali)
+        draw->AddImage(tex, ImVec2(x0 + capPx, y0), ImVec2(xc, y1),
+                       ImVec2(capU0, 0.0f), ImVec2(midU, 1.0f));
+        draw->AddImage(tex, ImVec2(x0, y0), ImVec2(x0 + capPx, y1),
+                       ImVec2(1.0f, 0.0f), ImVec2(capU0, 1.0f));
     }
 
     ImFont* font = g_GameUIFont ? g_GameUIFont : ImGui::GetFont();
@@ -2332,7 +2340,7 @@ static bool DrawCenteredMirroredGameButton(const char* id, const char* label,
                                              std::max(0.90f, std::min(1.12f, ImGui::GetIO().DisplaySize.y / 1080.0f)));
     ImVec2 measured = font->CalcTextSizeA(textSizePx, FLT_MAX, 0.0f, label);
     draw->AddText(font, textSizePx,
-                  ImVec2(start.x + (actualTotal - measured.x) * 0.5f,
+                  ImVec2(start.x + (totalW - measured.x) * 0.5f,
                          start.y + (h - measured.y) * 0.5f - 1.0f),
                   IM_COL32(245,245,245,255), label);
     return clicked;
@@ -2386,16 +2394,14 @@ static bool ConsumePendingTouchForRect(const ImVec2& minPos, const ImVec2& maxPo
     return false;
 }
 
+// Eklenen tum menulerde ayni, arka plani tamamen kaplayan sabit karartma.
+// 0 = karartma yok, 255 = tamamen siyah. Ust bant / gradyan yok.
+static const int kMenuDimAlpha = 70;
+
 static void DrawHeaderDarkening(const ImVec2& screen) {
-    ImDrawList* draw = ImGui::GetBackgroundDrawList();
-    const float bandH = std::min(210.0f, screen.y * 0.28f);
-
-    draw->AddRectFilled(ImVec2(0.0f, 0.0f), screen, IM_COL32(0, 0, 0, 34));
-
-    draw->AddRectFilledMultiColor(
-        ImVec2(0.0f, 0.0f), ImVec2(screen.x, bandH),
-        IM_COL32(0,0,0,104), IM_COL32(0,0,0,104),
-        IM_COL32(0,0,0,20), IM_COL32(0,0,0,20));
+    if (kMenuDimAlpha <= 0) return;
+    ImGui::GetBackgroundDrawList()->AddRectFilled(
+        ImVec2(0.0f, 0.0f), screen, IM_COL32(0, 0, 0, kMenuDimAlpha));
 }
 
 // ========================================================================
@@ -2476,6 +2482,45 @@ static void DrawTypingBar(const ImVec2& screen) {
 // ========================================================================
 // MODE SELECT MENU  (Offline / LAN / Server)
 // ========================================================================
+// Kullanici adi alani. editable=false ise salt-okunur (dokunma / klavye yok).
+static void DrawNicknameField(float infoW, bool editable) {
+    ImGui::Text("Username");
+    const float nickInputW = std::max(180.0f, infoW * 0.56f);
+    ImGui::SetNextItemWidth(nickInputW);
+    ImGui::PushStyleColor(ImGuiCol_FrameBg, ImVec4(0.015f, 0.022f, 0.028f, 0.82f));
+    ImGui::PushStyleColor(ImGuiCol_Border, ImVec4(0.72f, 0.82f, 0.88f, 0.34f));
+    ImGui::PushStyleVar(ImGuiStyleVar_FrameBorderSize, 1.0f);
+
+    if (!editable) {
+        if (g_AndroidKeyboardOpen.load() && g_KeyboardFieldMode.load() == 1) CloseAndroidKeyboard();
+        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.62f, 0.66f, 0.70f, 1.0f));
+        ImGui::InputText("##NicknameInput", g_Nickname, IM_ARRAYSIZE(g_Nickname),
+                         ImGuiInputTextFlags_ReadOnly);
+        ImGui::PopStyleColor();
+    } else {
+        // İsim kutusunda ImGui tıklamasına ek olarak ham Android dokunuşu da kullanılır.
+        const ImVec2 nickInputMin = ImGui::GetCursorScreenPos();
+        const ImVec2 nickInputMax(nickInputMin.x + nickInputW, nickInputMin.y + ImGui::GetFrameHeight());
+        const bool nickTouch = ConsumePendingTouchForRect(nickInputMin, nickInputMax);
+        if (nickTouch) ImGui::SetKeyboardFocusHere();
+        bool nickEnterPressed = ImGui::InputText("##NicknameInput", g_Nickname,
+                                                 IM_ARRAYSIZE(g_Nickname),
+                                                 ImGuiInputTextFlags_EnterReturnsTrue);
+        if (ImGui::IsItemClicked() || nickTouch) {
+            OpenAndroidKeyboardForField(1, g_Nickname);
+        }
+        if (nickEnterPressed && g_AndroidKeyboardOpen.load()) CloseAndroidKeyboard();
+    }
+    ImGui::PopStyleVar();
+    ImGui::PopStyleColor(2);
+}
+
+// Isim sadece LAN menusunden gelindiyse ve oda/baglanti yokken degistirilebilir.
+// Oyun ici ayarlardaki Multiplayer sekmesinde asla degistirilemez.
+static bool CanEditNickname() {
+    return g_MpFromLan && !g_IsHost.load() && !g_IsConnected.load();
+}
+
 // Tam ekran secim menusu: baslik + ortada alt alta butonlar + sol altta Back.
 // Tiklanan butonun indexini dondurur (-1: yok). Back tiklanirsa backClicked = true.
 static int DrawChoiceMenu(const char* windowId, const char* title,
@@ -2647,7 +2692,7 @@ void DrawImGui() {
             const long long now = NowMs();
             if (now - g_LastServerToastMs > 2500) {
                 g_LastServerToastMs = now;
-                ShowNativeToast("Çok yakında!");
+                ShowNativeToast("Coming soon!");
             }
         }
     }
@@ -2885,6 +2930,8 @@ void DrawImGui() {
             ImGui::SetCursorPos(ImVec2(infoX, bodyTop + 12.0f));
             DrawGameSectionTitle("Room Info", infoW);
             DrawGameStatusText("Status:", g_ConnectedStatus, infoW);
+            DrawNicknameField(infoW, CanEditNickname());
+            ImGui::Spacing();
             ImGui::Text("Room");
             ImGui::TextDisabled("%s's Room", g_Nickname);
             const std::string player1Name = GetPlayerName(0);
@@ -2934,27 +2981,7 @@ void DrawImGui() {
             ImGui::SetCursorPos(ImVec2(infoX, bodyTop + 12.0f));
             DrawGameSectionTitle("Player", infoW);
             DrawGameStatusText("Network:", g_ConnectedStatus, infoW);
-            ImGui::Text("Username");
-            ImGui::SetNextItemWidth(std::max(180.0f, infoW * 0.56f));
-            ImGui::PushStyleColor(ImGuiCol_FrameBg, ImVec4(0.015f, 0.022f, 0.028f, 0.82f));
-            ImGui::PushStyleColor(ImGuiCol_Border, ImVec4(0.72f, 0.82f, 0.88f, 0.34f));
-            ImGui::PushStyleVar(ImGuiStyleVar_FrameBorderSize, 1.0f);
-            
-            // İsim kutusunda ImGui tıklamasına ek olarak ham Android dokunuşu da kullanılır.
-            const float nickInputW = std::max(180.0f, infoW * 0.56f);
-            const ImVec2 nickInputMin = ImGui::GetCursorScreenPos();
-            const ImVec2 nickInputMax(nickInputMin.x + nickInputW, nickInputMin.y + ImGui::GetFrameHeight());
-            const bool nickTouch = ConsumePendingTouchForRect(nickInputMin, nickInputMax);
-            if (nickTouch) ImGui::SetKeyboardFocusHere();
-            bool nickEnterPressed = ImGui::InputText("##NicknameInput", g_Nickname,
-                                                     IM_ARRAYSIZE(g_Nickname),
-                                                     ImGuiInputTextFlags_EnterReturnsTrue);
-            if (ImGui::IsItemClicked() || nickTouch) {
-                OpenAndroidKeyboardForField(1, g_Nickname);
-            }
-            if (nickEnterPressed && g_AndroidKeyboardOpen.load()) CloseAndroidKeyboard();
-            ImGui::PopStyleVar();
-            ImGui::PopStyleColor(2);
+            DrawNicknameField(infoW, CanEditNickname());
 
 
             ImGui::SetCursorPos(ImVec2(infoX, bodyTop + 200.0f));
