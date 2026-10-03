@@ -70,6 +70,15 @@ static long long g_LastSaveMenuRenderMs = 0;   // my_renderMenu'nun en son calis
 static long long g_LastServerToastMs = 0;      // Server butonu toast spam korumasi
 static std::atomic<long long> g_LastImGuiFrameMs(0); // DrawImGui'nin en son calistigi an
 
+// LAN modu secildi mi? (Offline'da oyun ici sohbet/multiplayer butonu gorunmez.)
+bool g_LanSession = false;
+// Oyun icindeyken (updateStateBase) en son ne zaman calistigi: HUD butonu sadece bu durumda cizilir.
+static std::atomic<long long> g_LastBaseStateMs(0);
+// Oyun ici yuvarlak sohbet butonu: dokunma testi icin son cizim bilgisi (giris kancasi okur).
+static std::atomic<long long> g_HudBtnDrawMs(0);
+static std::atomic<float> g_HudBtnCx(0.0f), g_HudBtnCy(0.0f), g_HudBtnR(0.0f);
+static std::atomic<bool>  g_HudBtnTapped(false);
+
 static long long NowMs() {
     return (long long)std::chrono::duration_cast<std::chrono::milliseconds>(
         std::chrono::steady_clock::now().time_since_epoch()).count();
@@ -2086,6 +2095,17 @@ int32_t my_AInputQueue_getEvent(void* queue, AInputEvent** outEvent) {
                     const bool wantMouse = io.WantCaptureMouse && uiAlive;
                     if (action == AMOTION_EVENT_ACTION_DOWN) {
                         g_IsEatingTouch = wantMouse;
+                        // Oyun ici yuvarlak sohbet butonuna dokunuldu mu? (ImGui'nin eski fare
+                        // konumuna guvenmeden ham dokunus koordinatiyla test edilir.)
+                        if ((NowMs() - g_HudBtnDrawMs.load()) < 250) {
+                            const float dx = g_TouchX.load() - g_HudBtnCx.load();
+                            const float dy = g_TouchY.load() - g_HudBtnCy.load();
+                            const float rr = g_HudBtnR.load();
+                            if (dx * dx + dy * dy <= rr * rr) {
+                                g_IsEatingTouch = true;          // oyun bu dokunusu gormesin
+                                g_HudBtnTapped.store(true);
+                            }
+                        }
                     }
                     if (g_IsEatingTouch || wantMouse) {
                         shouldEatEvent = true;
@@ -2622,6 +2642,42 @@ static void MpGoBack() {
     g_PendingTouchDown.store(false);
 }
 
+// Oyun ici HUD: shop butonunun altinda yuvarlak sohbet butonu (sadece LAN modunda).
+// Hic bir texture gerektirmez; dairesel ImGui cizimi + sohbet balonu ikonu.
+static void DrawHudChatButton(const ImVec2& screen) {
+    const float u = screen.y / 780.0f;           // HUD'un olcegine uyum
+    const float r = 35.0f * u;                   // shop butonuyla ayni boyut
+    const ImVec2 c(59.0f * u, 135.0f * u);       // shop butonunun hemen alti
+    const float hitR = r * 1.15f;
+
+    const float dx = g_TouchX.load() - c.x;
+    const float dy = g_TouchY.load() - c.y;
+    const bool pressed = g_TouchDown.load() && (dx * dx + dy * dy <= hitR * hitR);
+
+    ImDrawList* d = ImGui::GetForegroundDrawList();
+    d->AddCircleFilled(ImVec2(c.x, c.y + 2.0f * u), r + 1.0f * u, IM_COL32(0, 0, 0, 70), 48);
+    d->AddCircleFilled(c, r, pressed ? IM_COL32(64, 64, 64, 235) : IM_COL32(16, 16, 16, 225), 48);
+    d->AddCircle(c, r - 0.5f * u, IM_COL32(236, 236, 236, 255), 48, 2.2f * u);
+    d->AddCircle(c, r - 4.0f * u, IM_COL32(255, 255, 255, 45), 48, 1.2f * u);
+
+    // Sohbet balonu ikonu
+    const ImU32 white = IM_COL32(240, 240, 240, 255);
+    d->AddRectFilled(ImVec2(c.x - 0.50f * r, c.y - 0.38f * r),
+                     ImVec2(c.x + 0.50f * r, c.y + 0.20f * r), white, 0.16f * r);
+    d->AddTriangleFilled(ImVec2(c.x - 0.28f * r, c.y + 0.16f * r),
+                         ImVec2(c.x - 0.32f * r, c.y + 0.50f * r),
+                         ImVec2(c.x + 0.06f * r, c.y + 0.16f * r), white);
+    const ImU32 dot = IM_COL32(22, 22, 22, 255);
+    for (int i = -1; i <= 1; ++i) {
+        d->AddCircleFilled(ImVec2(c.x + i * 0.24f * r, c.y - 0.09f * r), 0.075f * r, dot, 12);
+    }
+
+    g_HudBtnCx.store(c.x);
+    g_HudBtnCy.store(c.y);
+    g_HudBtnR.store(hitR);
+    g_HudBtnDrawMs.store(NowMs());
+}
+
 void DrawImGui() {
     if (!g_ImGuiInitialized) {
         ImGui::CreateContext();
@@ -2684,9 +2740,11 @@ void DrawImGui() {
         } else if (c == 0) {                          // Offline: orijinal "Select a file"
             g_ShowModeSelect = false;
             g_ShowLanChoice = false;
+            g_LanSession = false;                     // oyun icinde sohbet butonu gorunmez
         } else if (c == 1) {                          // LAN: Create Room / Join Room secimi
             g_ShowModeSelect = false;
             g_ShowLanChoice = true;
+            g_LanSession = true;                      // oyun icinde sohbet butonu gorunur
             g_PendingTouchDown.store(false);
         } else if (c == 2) {                          // Server: yakinda
             const long long now = NowMs();
@@ -2718,31 +2776,20 @@ void DrawImGui() {
         }
     }
 
-    if (g_CurrentMenu == MENU_SETTINGS && !g_IsMultiplayerMenuActive && g_MultiplayerButtonTexture != 0) {
-        const char* entryLabel = "Multiplayer";
-        float entryW = std::min(680.0f, std::max(440.0f, screen.x * 0.36f));
-        float entryH = entryW / 4.30f;
-        const float entryX = (screen.x - entryW) * 0.5f;
-        const float entryY = std::max(8.0f, screen.y - entryH - screen.y * 0.075f);
-
-        ImGui::SetNextWindowPos(ImVec2(entryX, entryY), ImGuiCond_Always);
-        ImGui::SetNextWindowSize(ImVec2(entryW, entryH), ImGuiCond_Always);
-        ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0, 0));
-        ImGui::Begin("##MPEntryButton", nullptr,
-                     ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoBackground |
-                     ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove |
-                     ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoScrollbar |
-                     ImGuiWindowFlags_NoScrollWithMouse);
-        const bool entryClicked =
-            DrawCenteredMirroredGameButton("##RoomEntryCreate", entryLabel, entryW, entryH, 1.80f);
-        if (entryClicked) {
-            g_MpFromLan = false;                 // oyun ici ayarlardan: dogrudan Room menusu
+    // Ayarlar menusundeki "Multiplayer" butonu KALDIRILDI. Oyun icinde (LAN modunda)
+    // shop butonunun altindaki yuvarlak sohbet butonu Room menusunu acar.
+    const bool inGameplay = (NowMs() - g_LastBaseStateMs.load()) < 200 &&
+                            g_CurrentMenu == MENU_INGAME;
+    const bool hudTapped = g_HudBtnTapped.exchange(false);
+    if (inGameplay && g_LanSession && !g_IsMultiplayerMenuActive) {
+        DrawHudChatButton(screen);
+        if (hudTapped) {
+            g_MpFromLan = false;               // oyun icinde: isim degistirilemez
             g_MpView = MPV_ROOM;
             g_IsMultiplayerMenuActive = true;
-            g_PendingTouchDown.store(false); // bu dokunus sadece menuyu acar
+            g_HudBtnDrawMs.store(0);
+            g_PendingTouchDown.store(false);
         }
-        ImGui::End();
-        ImGui::PopStyleVar();
     }
 
     if (g_IsMultiplayerMenuActive) {
@@ -3093,6 +3140,7 @@ void my_GameUpdate(void* thiz, float param_1) {
 
 void my_GameUpdateStateBase(void* thiz, float param_1, uint32_t param_2, uint32_t param_3, uint32_t param_4) {
     g_EngineInstance = (uintptr_t)thiz;
+    g_LastBaseStateMs.store(NowMs());   // oyun ici (HUD) durumundayiz
 
     if (orig_GameUpdateStateBase) {
         orig_GameUpdateStateBase(thiz, param_1, param_2, param_3, param_4);
@@ -3176,8 +3224,20 @@ void* my_renderStartMenuMain(void* thiz, void* p1, void* p2, void* p3) {
     void* ret = nullptr;
     if (orig_renderStartMenuMain) ret = orig_renderStartMenuMain(thiz, p1, p2, p3);
     g_CurrentMenu = MENU_SETTINGS;
-    DrawImGui();
+    // Ayarlar menusunde artik eklenen bir arayuz yok (Multiplayer butonu HUD'a tasindi).
     return ret; 
+}
+
+// Oyun ici (HUD) cizimi: Game::update icinde cizimler renderQueues()'ten ONCE olur,
+// bu yuzden oyun sirasinda ImGui'yi kare swap edilmeden hemen once cizeriz.
+// Menu ekranlarinda cizim eski kancalarda yapilir (burada cizilmez -> cift cizim yok).
+static unsigned int (*orig_eglSwapBuffers)(void*, void*) = nullptr;
+static unsigned int my_eglSwapBuffers(void* dpy, void* surf) {
+    const bool inGameplay = (NowMs() - g_LastBaseStateMs.load()) < 200;
+    if (inGameplay && (g_LanSession || g_IsMultiplayerMenuActive)) {
+        DrawImGui();
+    }
+    return orig_eglSwapBuffers ? orig_eglSwapBuffers(dpy, surf) : 0;
 }
 
 // ========================================================================
@@ -3208,6 +3268,11 @@ void ModMain() {
     MSHookFunction((void*)gameUpdateAddr, (void*)my_GameUpdate, (void**)&orig_GameUpdate);
     MSHookFunction((void*)updateStateBaseAddr, (void*)my_GameUpdateStateBase, (void**)&orig_GameUpdateStateBase);
     MSHookFunction((void*)inGameMenuAddr, (void*)my_renderStartMenuMain, (void**)&orig_renderStartMenuMain);
+
+    void* eglSwapAddr = dlsym(RTLD_DEFAULT, "eglSwapBuffers");
+    if (eglSwapAddr != nullptr) {
+        MSHookFunction(eglSwapAddr, (void*)my_eglSwapBuffers, (void**)&orig_eglSwapBuffers);
+    }
 
     void* inputQueueGetEventAddr = dlsym(RTLD_DEFAULT, "AInputQueue_getEvent");
     if (inputQueueGetEventAddr != nullptr) {
