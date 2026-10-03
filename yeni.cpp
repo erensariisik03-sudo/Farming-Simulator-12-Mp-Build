@@ -16,6 +16,8 @@
 #include <chrono>
 #include <sys/socket.h>
 #include <netinet/in.h>
+#include <netinet/tcp.h>
+#include <poll.h>
 #include <arpa/inet.h>
 #include <unistd.h>
 #include <fcntl.h>
@@ -263,13 +265,20 @@ static const uint8_t VEHICLE_OWNER_NONE = 0xFF;
 
 // Local vehicle sampling target: 120 Hz.
 // The actual callback frequency still follows the game's own update/vsync loop.
-// Network vehicle snapshots are deliberately limited to 10 snapshots/sec.
+// Network vehicle snapshots go out 30 times/sec, but only for vehicles that changed.
 static const uint32_t VEHICLE_LOCAL_SAMPLE_INTERVAL_US = 8333;
-static const uint32_t VEHICLE_NETWORK_INTERVAL_MS = 100;
+static const uint32_t VEHICLE_NETWORK_INTERVAL_MS = 33;
+static const uint32_t VEHICLE_KEEPALIVE_MS = 1000;  // unchanged vehicles are re-sent this often (late joiners)
 static const uint32_t VEHICLE_STOP_RELEASE_MS = 1000;
 static const uint8_t VEHICLE_SNAPSHOT_MAX_COUNT = 64;
 static const float POSITION_EPSILON = 0.02f;
 static const float ANGLE_EPSILON = 0.005f;
+
+// Remote vehicle smoothing.
+static const float REMOTE_MAX_EXTRAPOLATION_SEC = 0.15f; // never predict further than this past a snapshot
+static const float REMOTE_ERROR_DECAY_SEC = 0.10f;       // time constant for hiding corrections
+static const float REMOTE_TELEPORT_DISTANCE = 15.0f;     // bigger jumps are snapped, not smoothed
+static const float REMOTE_MAX_SPEED = 60.0f;             // faster than this = bogus data
 static const float CLAIM_POSITION_EPSILON = 0.05f;
 static const float CLAIM_ANGLE_EPSILON = 0.02f;
 
@@ -306,7 +315,7 @@ struct VehiclePositionPacket {
 };
 
 // One TCP message can carry the newest state of many vehicles.
-// This keeps vehicle traffic at ~10 network messages/sec regardless of
+// This keeps vehicle traffic at ~30 network messages/sec regardless of
 // how many local vehicles are being sampled.
 struct VehicleSnapshotHeader {
     uint8_t type;
@@ -397,7 +406,6 @@ static void SendLocalPlayerInfo() {
     SendAllBytes(g_TcpSocket, &pkt, sizeof(pkt));
 }
 
-static std::atomic<uint32_t> g_LocalVehicleSequence(0);
 static std::atomic<uint32_t> g_LocalClaimSequence(0);
 
 struct VehicleAuthorityState {
@@ -415,7 +423,10 @@ struct VehicleRemoteState {
     float vx;
     float vy;
     float angularVelocity;
-    uint32_t sequence;
+    float errX;           // visual offset left over from the last correction;
+    float errY;           // it fades to zero (see ApplyRemoteVehicleStates)
+    float errA;
+    uint32_t sequence;    // sender clock in ms of the newest snapshot
     uint32_t appliedSequence;
     uint64_t lastReceiveMs;
     bool moving;
@@ -423,9 +434,11 @@ struct VehicleRemoteState {
 
 struct VehicleSampleState {
     bool valid;
+    bool moving;
     float x;
     float y;
     float angle;
+    uint64_t timeMs;
 };
 
 static VehicleAuthorityState g_VehicleAuthority[VEHICLE_SLOT_LIMIT];
@@ -441,7 +454,7 @@ static uint32_t g_LastKnownVehicleCount = 0;
 static std::mutex g_VehicleStateMutex;
 
 // Network transport keeps only the newest sample for each vehicle.
-// The network thread packs all valid samples into one snapshot every 100 ms.
+// The network thread packs all changed samples into one snapshot every 33 ms.
 static VehiclePositionPacket g_LatestOutgoingVehicles[VEHICLE_SLOT_LIMIT];
 static bool g_HasLatestOutgoingVehicle[VEHICLE_SLOT_LIMIT];
 static uint64_t g_LastVehicleNetworkSendMs = 0;
@@ -494,10 +507,27 @@ static bool SendAllBytes(int socketFd, const void* data, size_t size) {
             continue;
         }
 
+        if (sent < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+            // Non-blocking socket with a full send buffer: wait a moment instead of dropping the link.
+            struct pollfd pfd;
+            pfd.fd = socketFd;
+            pfd.events = POLLOUT;
+            pfd.revents = 0;
+            if (poll(&pfd, 1, 50) > 0) continue;
+        }
+
         return false;
     }
 
     return true;
+}
+
+// Small vehicle packets must leave immediately: without TCP_NODELAY the OS holds them back
+// (Nagle) and releases them in bunches, which shows up as stutter on the other device.
+static void ConfigureLowLatencySocket(int socketFd) {
+    if (socketFd < 0) return;
+    int one = 1;
+    setsockopt(socketFd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
 }
 
 static uint64_t GetMonotonicMilliseconds() {
@@ -599,7 +629,7 @@ static void QueueVehiclePosition(uint16_t vehicleId, float x, float y, float ang
     pkt.x = x;
     pkt.y = y;
     pkt.angle = angle;
-    pkt.sequence = g_LocalVehicleSequence.fetch_add(1) + 1;
+    pkt.sequence = (uint32_t)GetMonotonicMilliseconds(); // sample time = stream clock for the receiver
     pkt.moving = moving ? 1 : 0;
 
     {
@@ -883,15 +913,59 @@ static void CaptureAndQueueLocalVehicleState(uintptr_t game) {
             (ownerId == localOwner);
 
         if (publishActiveVehicle || publishOwnedVehicle) {
-            QueueVehiclePosition(
-                vehicleId,
-                x,
-                y,
-                angle,
-                moving
-            );
+            // Only changed vehicles go on the wire, plus a slow keep-alive so a player
+            // who joins later still learns where the parked vehicles are.
+            bool changed = false;
+            {
+                std::lock_guard<std::mutex> lock(g_VehicleStateMutex);
+                VehicleSampleState& sent = g_LastSentLocalVehicles[vehicleId];
+                changed = !sent.valid ||
+                          sent.moving != moving ||
+                          fabsf(x - sent.x) > POSITION_EPSILON ||
+                          fabsf(y - sent.y) > POSITION_EPSILON ||
+                          GetAngleDelta(angle, sent.angle) > ANGLE_EPSILON ||
+                          (nowMs - sent.timeMs) >= VEHICLE_KEEPALIVE_MS;
+                if (changed) {
+                    sent.valid = true;
+                    sent.moving = moving;
+                    sent.x = x;
+                    sent.y = y;
+                    sent.angle = angle;
+                    sent.timeMs = nowMs;
+                }
+            }
+            if (changed) QueueVehiclePosition(vehicleId, x, y, angle, moving);
         }
     }
+}
+
+// Where a remote vehicle should be right now: its newest snapshot pushed forward by the
+// measured speed (dead reckoning), capped so a lost packet cannot launch it.
+static void PredictRemotePose(const VehicleRemoteState& s, uint64_t nowMs,
+                              float* x, float* y, float* angle) {
+    float age = 0.0f;
+    if (s.moving && nowMs > s.lastReceiveMs) {
+        age = (float)(nowMs - s.lastReceiveMs) * 0.001f;
+        if (age > REMOTE_MAX_EXTRAPOLATION_SEC) age = REMOTE_MAX_EXTRAPOLATION_SEC;
+    }
+    *x = s.x + s.vx * age;
+    *y = s.y + s.vy * age;
+    *angle = s.angle + s.angularVelocity * age;
+}
+
+// Box2D 2.1 b2Body layout, checked against b2Body::SetLinearVelocity / SetTransform in the
+// decompile: +0x00 type, +0x04 flags (bit 1 = awake), +0x44/+0x48 linear velocity,
+// +0x4C angular velocity, +0x90 sleep time. Giving the remote body its real speed keeps
+// joints, trailers and contacts calm; a body that teleports with zero speed makes them fight.
+static void SetRemoteBodyVelocity(uintptr_t body, float vx, float vy, float w) {
+    if (*(int*)body == 0) return; // static body
+    if (vx * vx + vy * vy > 0.0f && (*(uint16_t*)(body + 4) & 2) == 0) {
+        *(uint16_t*)(body + 4) |= 2;
+        *(float*)(body + 0x90) = 0.0f;
+    }
+    *(float*)(body + 0x44) = vx;
+    *(float*)(body + 0x48) = vy;
+    *(float*)(body + 0x4C) = w;
 }
 
 static void ApplyRemoteVehicleStates(uintptr_t game) {
@@ -911,9 +985,16 @@ static void ApplyRemoteVehicleStates(uintptr_t game) {
 
     const uint64_t nowMs = GetMonotonicMilliseconds();
 
+    // Frame-rate independent fade for the visual correction offsets.
+    static uint64_t s_lastApplyMs = 0;
+    float frameSec = (s_lastApplyMs != 0 && nowMs > s_lastApplyMs)
+        ? (float)(nowMs - s_lastApplyMs) * 0.001f : 0.016f;
+    if (frameSec > 0.1f) frameSec = 0.1f;
+    s_lastApplyMs = nowMs;
+    const float decay = expf(-frameSec / REMOTE_ERROR_DECAY_SEC);
+
     for (uint16_t vehicleId = 0; vehicleId < vehicleCount; ++vehicleId) {
         VehicleRemoteState state;
-        uint8_t authorityOwner = VEHICLE_OWNER_NONE;
 
         {
             std::lock_guard<std::mutex> lock(g_VehicleStateMutex);
@@ -922,27 +1003,29 @@ static void ApplyRemoteVehicleStates(uintptr_t game) {
             // Keep buffering it, but NEVER apply it until this vehicle is
             // explicitly owned by that remote player. This is the critical
             // separation between network reception and local physics control.
-            authorityOwner = g_VehicleAuthority[vehicleId].ownerId;
+            const uint8_t authorityOwner = g_VehicleAuthority[vehicleId].ownerId;
+            if (authorityOwner == VEHICLE_OWNER_NONE || authorityOwner == localOwner) continue;
 
-            if (authorityOwner == VEHICLE_OWNER_NONE) {
-                continue;
+            VehicleRemoteState& stored = g_RemoteVehicles[vehicleId];
+            if (!stored.valid) continue;
+
+            // A remote snapshot is valid only when its sender is the current
+            // authoritative owner for this exact vehicle slot.
+            if (stored.ownerId != authorityOwner || stored.vehicleId != vehicleId) continue;
+
+            stored.errX *= decay;
+            stored.errY *= decay;
+            stored.errA *= decay;
+            if (fabsf(stored.errX) + fabsf(stored.errY) + fabsf(stored.errA) < 0.003f) {
+                stored.errX = stored.errY = stored.errA = 0.0f;
             }
-
-            if (authorityOwner == localOwner) {
-                continue;
-            }
-
-            if (!g_RemoteVehicles[vehicleId].valid) {
-                continue;
-            }
-
-            state = g_RemoteVehicles[vehicleId];
+            state = stored;
         }
 
-        // A remote snapshot is valid only when its sender is the current
-        // authoritative owner for this exact vehicle slot.
-        if (state.ownerId != authorityOwner) continue;
-        if (state.vehicleId != vehicleId) continue;
+        const bool offsetGone = (state.errX == 0.0f && state.errY == 0.0f && state.errA == 0.0f);
+
+        // Parked and already placed: leave the physics body alone.
+        if (!state.moving && offsetGone && state.appliedSequence == state.sequence) continue;
 
         uintptr_t vehicle = GetVehicleFromIndex(game, vehicleId);
         if (vehicle == 0) continue;
@@ -950,35 +1033,28 @@ static void ApplyRemoteVehicleStates(uintptr_t game) {
         uintptr_t body = *(uintptr_t*)(vehicle + 0x528);
         if (body == 0) continue;
 
-        float predictedX = state.x;
-        float predictedY = state.y;
-        float predictedAngle = state.angle;
-
-        if (state.moving && state.lastReceiveMs != 0) {
-            float elapsedSec =
-                (float)(nowMs - state.lastReceiveMs) / 1000.0f;
-
-            // Never extrapolate too far past the newest snapshot.
-            if (elapsedSec > 0.12f) {
-                elapsedSec = 0.12f;
-            }
-
-            predictedX += state.vx * elapsedSec;
-            predictedY += state.vy * elapsedSec;
-            predictedAngle += state.angularVelocity * elapsedSec;
-        }
+        float poseX, poseY, poseAngle;
+        PredictRemotePose(state, nowMs, &poseX, &poseY, &poseAngle);
 
         TestB2Vec2 position;
-        position.x = predictedX;
-        position.y = predictedY;
+        position.x = poseX + state.errX;
+        position.y = poseY + state.errY;
 
         // This call is intentionally restricted to remotely-authoritative
         // vehicles. The local driver's physics is left completely intact.
-        g_b2BodySetTransform(
-            (void*)body,
-            &position,
-            predictedAngle
-        );
+        g_b2BodySetTransform((void*)body, &position, poseAngle + state.errA);
+
+        if (state.moving) {
+            SetRemoteBodyVelocity(body, state.vx, state.vy, state.angularVelocity);
+        } else {
+            SetRemoteBodyVelocity(body, 0.0f, 0.0f, 0.0f);
+            if (offsetGone) {
+                std::lock_guard<std::mutex> lock(g_VehicleStateMutex);
+                if (g_RemoteVehicles[vehicleId].sequence == state.sequence) {
+                    g_RemoteVehicles[vehicleId].appliedSequence = state.sequence;
+                }
+            }
+        }
     }
 }
 
@@ -1072,7 +1148,7 @@ static void StoreRemoteVehicleState(
     float x,
     float y,
     float angle,
-    uint32_t sequence,
+    uint32_t timeMs,   // sender clock in ms (QueueVehiclePosition)
     bool moving
 ) {
     if (ownerId >= MAX_PLAYERS) return;
@@ -1090,34 +1166,40 @@ static void StoreRemoteVehicleState(
     // Receiving is deliberately independent from authority. The state is
     // buffered here; ApplyRemoteVehicleStates() is the only place allowed to
     // touch the physics body, and it checks authority before doing so.
-    if (state.valid &&
-        state.ownerId == ownerId &&
-        sequence <= state.sequence) {
-        return;
-    }
+    float vx = 0.0f, vy = 0.0f, angularVelocity = 0.0f;
+    float errX = 0.0f, errY = 0.0f, errA = 0.0f;
 
-    if (state.valid &&
-        state.ownerId == ownerId &&
-        state.lastReceiveMs != 0) {
+    if (state.valid && state.ownerId == ownerId) {
+        // Signed difference survives the 32-bit wrap-around of the sender clock.
+        const int32_t dtMs = (int32_t)(timeMs - state.sequence);
+        if (dtMs <= 0) return; // old or duplicate snapshot
 
-        uint64_t deltaMs = nowMs - state.lastReceiveMs;
+        // What the player sees right now (before this snapshot changes anything).
+        float oldX, oldY, oldAngle;
+        PredictRemotePose(state, nowMs, &oldX, &oldY, &oldAngle);
 
-        if (deltaMs >= 10 && deltaMs <= 500) {
-            float dt = (float)deltaMs / 1000.0f;
-
-            state.vx = (x - state.x) / dt;
-            state.vy = (y - state.y) / dt;
-
-            const float angleDelta =
-                GetSignedAngleDelta(state.angle, angle);
-
-            state.angularVelocity =
-                angleDelta / dt;
+        // Speed comes from the SENDER's clock, so network delay and bunching
+        // cannot distort it.
+        if (moving && dtMs >= 5 && dtMs <= 500) {
+            const float dt = (float)dtMs * 0.001f;
+            vx = (x - state.x) / dt;
+            vy = (y - state.y) / dt;
+            angularVelocity = GetSignedAngleDelta(state.angle, angle) / dt;
         }
-    } else {
-        state.vx = 0.0f;
-        state.vy = 0.0f;
-        state.angularVelocity = 0.0f;
+
+        const bool teleport =
+            hypotf(oldX - x, oldY - y) > REMOTE_TELEPORT_DISTANCE ||
+            (vx * vx + vy * vy) > REMOTE_MAX_SPEED * REMOTE_MAX_SPEED;
+
+        if (teleport) {
+            vx = vy = angularVelocity = 0.0f;
+        } else {
+            // Do not jump to the new truth: keep the picture continuous and let the
+            // difference fade out over the next few frames.
+            errX = oldX + state.errX - x;
+            errY = oldY + state.errY - y;
+            errA = GetSignedAngleDelta(angle, oldAngle) + state.errA;
+        }
     }
 
     state.valid = true;
@@ -1126,7 +1208,13 @@ static void StoreRemoteVehicleState(
     state.x = x;
     state.y = y;
     state.angle = angle;
-    state.sequence = sequence;
+    state.vx = vx;
+    state.vy = vy;
+    state.angularVelocity = angularVelocity;
+    state.errX = errX;
+    state.errY = errY;
+    state.errA = errA;
+    state.sequence = timeMs;
     state.appliedSequence = 0;
     state.lastReceiveMs = nowMs;
     state.moving = moving;
@@ -1184,7 +1272,6 @@ static void HandleVehicleReleasePacket(const VehicleReleasePacket& pkt) {
 
 static void ResetVehicleSyncState() {
     g_LocalPlayerId.store(0xFF);
-    g_LocalVehicleSequence.store(0);
     g_LocalClaimSequence.store(0);
     g_LastKnownVehicleCount = 0;
     g_LastVehicleSync = std::chrono::steady_clock::now();
@@ -1639,8 +1726,8 @@ void NetworkLoop() {
             }
         }
 
-        // Vehicle network traffic is intentionally capped at 10 snapshots/sec.
-        // All currently-known local vehicle states are packed into one TCP message.
+        // Vehicle network traffic is capped at 30 snapshots/sec.
+        // All changed local vehicle states are packed into one TCP message.
         if (g_IsConnected.load()) {
             const uint64_t nowMs = GetMonotonicMilliseconds();
 
@@ -1676,6 +1763,7 @@ void NetworkLoop() {
                         entry.moving = srcPkt.moving;
 
                         entries.push_back(entry);
+                        g_HasLatestOutgoingVehicle[vehicleId] = false; // sent once, not repeated
                     }
                 }
 
@@ -1686,8 +1774,7 @@ void NetworkLoop() {
                     header.type = PACKET_VEHICLE_SNAPSHOT;
                     header.ownerId = g_LocalPlayerId.load();
                     header.count = (uint8_t)entries.size();
-                    header.sequence =
-                        g_LocalVehicleSequence.load();
+                    header.sequence = (uint32_t)nowMs;
 
                     std::vector<uint8_t> snapshotBuffer;
                     snapshotBuffer.resize(
@@ -1835,6 +1922,7 @@ void TCPHostThread() {
     int addrlen = sizeof(address);
     
     g_TcpSocket = accept(g_TcpServerFd, (struct sockaddr*)&address, (socklen_t*)&addrlen);
+    ConfigureLowLatencySocket(g_TcpSocket);
     
     if (g_TcpSocket >= 0 && g_IsHost) {
         SessionWelcomePacket welcome;
@@ -1902,6 +1990,7 @@ void TCPClientThread(std::string hostIP) {
     ShowNativeToast("Connecting to room...");
 
     if (connect(g_TcpSocket, (struct sockaddr*)&serv_addr, sizeof(serv_addr)) >= 0) {
+        ConfigureLowLatencySocket(g_TcpSocket);
         g_IsConnected = true;
         g_ConnectedStatus = "Connected to Host!";
         ShowNativeToast("Successfully Joined Room!"); 
@@ -2211,8 +2300,8 @@ static bool DrawCenteredMirroredGameButton(const char* id, const char* label,
     return clicked;
 }
 
-static void DrawFadingHeaderLine(float startX, float y, float endX) {
-    ImDrawList* draw = ImGui::GetWindowDrawList();
+static void DrawFadingHeaderLine(float startX, float y, float endX, ImDrawList* draw = nullptr) {
+    if (!draw) draw = ImGui::GetWindowDrawList();
     const float thick = std::max(5.5f, ImGui::GetIO().DisplaySize.y * 0.0050f);
     
     // Soldan sağa yumuşak geçişli (fade-out) çizgi
@@ -2392,6 +2481,13 @@ void DrawImGui() {
 
     ImGui_ImplOpenGL3_NewFrame();
     ImGui::NewFrame();
+
+    // "Select a file." screen: the game's own underline is hidden in my_renderMenu, so the mod
+    // draws the same header line the Server Browser / Room menus use.
+    if (g_CurrentMenu == MENU_SAVELOAD && !g_IsMultiplayerMenuActive) {
+        DrawFadingHeaderLine(screen.x * 0.36f, screen.y * 0.0931f, screen.x,
+                             ImGui::GetForegroundDrawList());
+    }
 
     if (g_CurrentMenu != MENU_INGAME && !g_IsMultiplayerMenuActive && g_MultiplayerButtonTexture != 0) {
         const bool isSettings = (g_CurrentMenu == MENU_SETTINGS);
@@ -2801,7 +2897,7 @@ void my_GameUpdateStateBase(void* thiz, float param_1, uint32_t param_2, uint32_
     // The game itself decides the real frame/vsync cadence. The C output shows
     // Game::update() ends with waitVSync(), so this hook must not try to force
     // the engine to 120 FPS. We sample at up to 120 Hz when callbacks allow it,
-    // and the network is independently capped at 10 snapshots/sec.
+    // and the network is independently capped at 30 snapshots/sec.
     ApplyRemoteVehicleStates(g_EngineInstance);
     CaptureAndQueueLocalVehicleState(g_EngineInstance);
 }
@@ -2825,11 +2921,35 @@ void* my_updateGUI(void* thiz, void* p1, void* p2, void* p3, void* p4) {
     return orig_updateGUI ? orig_updateGUI(thiz, p1, p2, p3, p4) : nullptr;
 }
 
+// The game draws every title underline from one global overlay description
+// (GenericGUIManager::m_overlayTitleUnderlineRight, float[6], [1] = height scale).
+// Setting the height to 0 while the "Select a file." menu renders hides the game's own line.
+// If the symbol cannot be found this stays null and the menu simply keeps the original line.
+static float* GetNativeTitleUnderline() {
+    static float* desc = nullptr;
+    static bool looked = false;
+    if (!looked) {
+        looked = true;
+        void* lib = dlopen("libapp.so", RTLD_NOW | RTLD_NOLOAD);
+        if (lib) {
+            desc = (float*)dlsym(lib, "_ZN17GenericGUIManager28m_overlayTitleUnderlineRightE");
+            dlclose(lib);
+        }
+    }
+    return desc;
+}
+
 void* my_renderMenu(void* thiz, void* p1, void* p2, void* p3) {
     g_MenuInstance = (uintptr_t)thiz;
 
+    float* underline = GetNativeTitleUnderline();
+    const float savedHeight = underline ? underline[1] : 0.0f;
+    if (underline) underline[1] = 0.0f;
+
     void* ret = nullptr;
     if (orig_renderMenu) ret = orig_renderMenu(thiz, p1, p2, p3);
+
+    if (underline) underline[1] = savedHeight;
     g_CurrentMenu = MENU_SAVELOAD;
     DrawImGui();
     return ret; 
