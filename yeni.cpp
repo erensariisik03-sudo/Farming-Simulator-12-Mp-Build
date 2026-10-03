@@ -57,6 +57,12 @@ bool g_TextureLoaded = false;
 bool g_GameMenuBackgroundLoaded = false;
 bool g_IsMultiplayerMenuActive = false;
 
+// Yeni mod secim menusu (Offline / LAN / Server)
+// Baslik ekranindan "Select a file" ekranina gecilince bir kez acilir.
+bool g_ShowModeSelect = false;
+static long long g_LastSaveMenuRenderMs = 0;   // my_renderMenu'nun en son calistigi an
+static long long g_LastServerToastMs = 0;      // Server butonu toast spam korumasi
+
 int g_ButtonOrigWidth = 0;
 int g_ButtonOrigHeight = 0;
 int g_GameMenuBackgroundWidth = 0;
@@ -2093,8 +2099,13 @@ int32_t my_AInputQueue_getEvent(void* queue, AInputEvent** outEvent) {
                             CloseAndroidKeyboard();
                         } else {
                             g_IsMultiplayerMenuActive = false;
+                            // LAN menusunden geri -> mod secim menusune don
+                            if (g_CurrentMenu == MENU_SAVELOAD) g_ShowModeSelect = true;
                         }
                         shouldEatEvent = true;
+                    } else if (g_ShowModeSelect) {
+                        // Mod secim menusundeyken BACK: kapat ve oyuna birak (basliga doner).
+                        g_ShowModeSelect = false;
                     }
                 }
 
@@ -2435,6 +2446,92 @@ static void DrawTypingBar(const ImVec2& screen) {
     }
 }
 
+// ========================================================================
+// MODE SELECT MENU  (Offline / LAN / Server)
+// ========================================================================
+static long long NowMs() {
+    return (long long)std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+
+static void DrawModeSelectMenu(const ImVec2& screen) {
+    // Arka plan: LAN menusuyle ayni gorsel
+    ImDrawList* bg = ImGui::GetBackgroundDrawList();
+    if (g_GameMenuBackgroundTexture != 0 &&
+        g_GameMenuBackgroundWidth > 0 && g_GameMenuBackgroundHeight > 0) {
+        float scale = screen.x / (float)g_GameMenuBackgroundWidth;
+        const float drawW = g_GameMenuBackgroundWidth * scale;
+        const float drawH = g_GameMenuBackgroundHeight * scale;
+        float drawY = screen.y - drawH;
+        if (drawY > 0.0f) drawY = 0.0f;
+        bg->AddImage(ToImGuiTexture(g_GameMenuBackgroundTexture),
+                     ImVec2(0.0f, drawY), ImVec2(drawW, drawY + drawH),
+                     ImVec2(0.0f, 0.0f), ImVec2(1.0f, 1.0f));
+        DrawHeaderDarkening(screen);
+    } else {
+        bg->AddRectFilled(ImVec2(0, 0), screen, IM_COL32(8, 14, 20, 255));
+    }
+
+    // Tam ekran pencere: tum dokunuslari yakalar (arkadaki oyun menusu tiklanmaz)
+    ImGui::SetNextWindowPos(ImVec2(0, 0), ImGuiCond_Always);
+    ImGui::SetNextWindowSize(screen, ImGuiCond_Always);
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0, 0));
+    ImGui::Begin("##ModeSelectRoot", nullptr,
+                 ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoBackground |
+                 ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove |
+                 ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoScrollbar |
+                 ImGuiWindowFlags_NoScrollWithMouse);
+    ImGui::PushFont(g_GameUIFont);
+
+    // Baslik (diger menulerle ayni yerlesim)
+    const char* title = "Select Mode";
+    const float titleSize = std::max(44.0f, std::min(54.0f, screen.y * 0.052f));
+    ImDrawList* draw = ImGui::GetWindowDrawList();
+    const float titleWidth = g_GameUIFont->CalcTextSizeA(titleSize, FLT_MAX, 0.0f, title).x;
+    const float titleX = std::max(24.0f, screen.x - 18.0f - titleWidth);
+    const float titleY = 9.0f;
+    draw->AddText(g_GameUIFont, titleSize, ImVec2(titleX, titleY),
+                  IM_COL32(255, 255, 255, 255), title);
+    DrawFadingHeaderLine(std::max(screen.x * 0.36f, titleX - screen.x * 0.40f),
+                         titleY + titleSize + 9.0f, screen.x - 8.0f);
+
+    // 3 buton: ortada, alt alta
+    const float btnW = std::min(680.0f, std::max(440.0f, screen.x * 0.36f));
+    const float btnH = btnW / 4.30f;
+    const float gap  = btnH * 0.22f;
+    const float totalH = btnH * 3.0f + gap * 2.0f;
+    const float headerBottom = titleY + titleSize + 28.0f;
+    float y = headerBottom + (screen.y - headerBottom - totalH) * 0.5f;
+    if (y < headerBottom + 8.0f) y = headerBottom + 8.0f;
+    const float x = (screen.x - btnW) * 0.5f;
+
+    ImGui::SetCursorPos(ImVec2(x, y));
+    if (DrawCenteredMirroredGameButton("##ModeOffline", "Offline", btnW, btnH, 1.80f)) {
+        g_ShowModeSelect = false;               // orijinal "Select a file" ekrani
+    }
+
+    ImGui::SetCursorPos(ImVec2(x, y + btnH + gap));
+    if (DrawCenteredMirroredGameButton("##ModeLAN", "LAN", btnW, btnH, 1.80f)) {
+        g_ShowModeSelect = false;
+        g_CurrentMenu = MENU_SAVELOAD;
+        g_IsMultiplayerMenuActive = true;       // tasarladigimiz LAN menusu
+        g_PendingTouchDown.store(false);
+    }
+
+    ImGui::SetCursorPos(ImVec2(x, y + (btnH + gap) * 2.0f));
+    if (DrawCenteredMirroredGameButton("##ModeServer", "Server", btnW, btnH, 1.80f)) {
+        const long long now = NowMs();
+        if (now - g_LastServerToastMs > 2500) {   // toast spam korumasi
+            g_LastServerToastMs = now;
+            ShowNativeToast("Çok yakında!");
+        }
+    }
+
+    ImGui::PopFont();
+    ImGui::End();
+    ImGui::PopStyleVar();
+}
+
 void DrawImGui() {
     if (!g_ImGuiInitialized) {
         ImGui::CreateContext();
@@ -2482,26 +2579,20 @@ void DrawImGui() {
     ImGui_ImplOpenGL3_NewFrame();
     ImGui::NewFrame();
 
-    // "Select a file." screen: the game's own underline is hidden in my_renderMenu, so the mod
-    // draws the same header line the Server Browser / Room menus use.
-    if (g_CurrentMenu == MENU_SAVELOAD && !g_IsMultiplayerMenuActive) {
-        DrawFadingHeaderLine(screen.x * 0.36f, screen.y * 0.0931f, screen.x,
-                             ImGui::GetForegroundDrawList());
+    // Join Room butonu KALDIRILDI. Ayarlar menusundeki giris butonu artik "Multiplayer".
+    // Oyunun kendi "Select a file" cizgisi geri geldi (artik hicbir butonla cakismiyor).
+
+    // Mod secim menusu (Offline / LAN / Server)
+    if (g_ShowModeSelect && g_CurrentMenu == MENU_SAVELOAD && !g_IsMultiplayerMenuActive) {
+        DrawModeSelectMenu(screen);
     }
 
-    if (g_CurrentMenu != MENU_INGAME && !g_IsMultiplayerMenuActive && g_MultiplayerButtonTexture != 0) {
-        const bool isSettings = (g_CurrentMenu == MENU_SETTINGS);
-        const char* entryLabel = isSettings ? "Create Room" : "Join Room";
-        float entryW = isSettings
-                         ? std::min(680.0f, std::max(440.0f, screen.x * 0.36f))
-                         : std::min(620.0f, std::max(420.0f, screen.x * 0.32f));
-        float entryH = isSettings ? entryW / 4.30f : entryW / 2.72f;
-        const float entryX = isSettings
-                             ? (screen.x - entryW) * 0.5f
-                             : -10.0f;
-        const float entryY = isSettings
-                             ? std::max(8.0f, screen.y - entryH - screen.y * 0.075f)
-                             : std::max(3.0f, screen.y * 0.005f);
+    if (g_CurrentMenu == MENU_SETTINGS && !g_IsMultiplayerMenuActive && g_MultiplayerButtonTexture != 0) {
+        const char* entryLabel = "Multiplayer";
+        float entryW = std::min(680.0f, std::max(440.0f, screen.x * 0.36f));
+        float entryH = entryW / 4.30f;
+        const float entryX = (screen.x - entryW) * 0.5f;
+        const float entryY = std::max(8.0f, screen.y - entryH - screen.y * 0.075f);
 
         ImGui::SetNextWindowPos(ImVec2(entryX, entryY), ImGuiCond_Always);
         ImGui::SetNextWindowSize(ImVec2(entryW, entryH), ImGuiCond_Always);
@@ -2511,13 +2602,12 @@ void DrawImGui() {
                      ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove |
                      ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoScrollbar |
                      ImGuiWindowFlags_NoScrollWithMouse);
-        const bool entryClicked = isSettings
-            ? DrawCenteredMirroredGameButton("##RoomEntryCreate", entryLabel, entryW, entryH, 1.80f)
-            : DrawGameStyleButton("##RoomEntryJoin", entryLabel, ImVec2(entryW, entryH), 1.34f, false);
+        const bool entryClicked =
+            DrawCenteredMirroredGameButton("##RoomEntryCreate", entryLabel, entryW, entryH, 1.80f);
         if (entryClicked) {
-            g_CurrentMenu = isSettings ? MENU_SETTINGS : MENU_SAVELOAD;
+            g_CurrentMenu = MENU_SETTINGS;
             g_IsMultiplayerMenuActive = true;
-            g_PendingTouchDown.store(false); // this tap only opens the menu, not the text box behind the button
+            g_PendingTouchDown.store(false); // bu dokunus sadece menuyu acar
         }
         ImGui::End();
         ImGui::PopStyleVar();
@@ -2577,6 +2667,8 @@ void DrawImGui() {
         if (DrawGameStyleButton("##BackButton", "Back", ImVec2(commonButtonW, commonButtonH), 1.34f, true)) {
             if (g_AndroidKeyboardOpen.load()) CloseAndroidKeyboard();
             g_IsMultiplayerMenuActive = false;
+            // LAN menusunden (Server Browser) geri -> mod secim menusu
+            if (g_CurrentMenu == MENU_SAVELOAD) g_ShowModeSelect = true;
         }
 
         const float bottomMargin = std::max(18.0f, screen.y * 0.03f);
@@ -2884,6 +2976,7 @@ void DrawImGui() {
 void my_GameUpdate(void* thiz, float param_1) {
     g_EngineInstance = (uintptr_t)thiz; 
     g_CurrentMenu = MENU_INGAME; 
+    g_ShowModeSelect = false;
     if (orig_GameUpdate) orig_GameUpdate(thiz, param_1);
 }
 
@@ -2942,14 +3035,25 @@ static float* GetNativeTitleUnderline() {
 void* my_renderMenu(void* thiz, void* p1, void* p2, void* p3) {
     g_MenuInstance = (uintptr_t)thiz;
 
+    // Baslik ekranindan "Select a file" ekranina YENI girildi mi?
+    // Bu fonksiyon menu acikken her karede cagrilir; aradaki bosluk 700 ms'den
+    // buyukse menu daha once gorunmuyordu demektir -> mod secim menusunu ac.
+    const long long now = NowMs();
+    if (now - g_LastSaveMenuRenderMs > 700 && !g_IsMultiplayerMenuActive) {
+        g_ShowModeSelect = true;
+    }
+    g_LastSaveMenuRenderMs = now;
+
+    // Oyunun kendi cizgisi sadece bizim tam ekran menulerimizin altinda gizlenir.
     float* underline = GetNativeTitleUnderline();
+    const bool hideUnderline = g_ShowModeSelect || g_IsMultiplayerMenuActive;
     const float savedHeight = underline ? underline[1] : 0.0f;
-    if (underline) underline[1] = 0.0f;
+    if (underline && hideUnderline) underline[1] = 0.0f;
 
     void* ret = nullptr;
     if (orig_renderMenu) ret = orig_renderMenu(thiz, p1, p2, p3);
 
-    if (underline) underline[1] = savedHeight;
+    if (underline && hideUnderline) underline[1] = savedHeight;
     g_CurrentMenu = MENU_SAVELOAD;
     DrawImGui();
     return ret; 
