@@ -134,6 +134,8 @@ uintptr_t g_HUDInstance = 0;
 std::atomic<bool> g_IsHost(false);
 std::atomic<bool> g_IsClient(false);
 std::atomic<bool> g_IsConnected(false);
+std::atomic<bool> g_HostInGame(false);   // client tarafi: host oyuna girdi mi?
+std::atomic<bool> g_LocalInGame(false);  // bu cihaz oyunda mi (Game durumu 6/7)
 
 // SOCKETS
 int g_TcpServerFd = -1; 
@@ -245,6 +247,8 @@ void ClearChat() {
 // Client icin oyunu kayit/zorluk ekranlarini atlayarak baslatir. Asil is my_updateGUI icindeki
 // AutoStartInject()'te yapilir; burada sadece menuler kapatilir ve zaman penceresi acilir.
 static std::atomic<long long> g_AutoStartUntilMs(0);
+static std::atomic<long long> g_KickUntilMs(0);   // >0 iken client oyundan basliga atilir
+static std::atomic<bool> g_ClientPlaying(false);  // client Join Game ile host'un oyununa girdi
 void CloseAndroidKeyboard();
 void AutoStartGameForClient() {
     CloseAndroidKeyboard();
@@ -253,6 +257,7 @@ void AutoStartGameForClient() {
     g_ShowModeSelect = false;
     g_PendingTouchDown.store(false);
     g_AutoStartUntilMs.store(NowMs() + 20000);
+    g_ClientPlaying.store(true);
 }
 
 // ========================================================================
@@ -272,6 +277,17 @@ AInputQueue_getEvent_t orig_AInputQueue_getEvent = nullptr;
 
 typedef void (*GameUpdate_t)(void* thiz, float param_1);
 GameUpdate_t orig_GameUpdate = nullptr;
+
+// Client baska birinin oyununda oldugu icin kaydedemez: SaveGames::startTask(3 = slota kaydet) engellenir.
+typedef void (*SaveStartTask_t)(void* thiz, int cmd, unsigned int slot, int sync);
+static SaveStartTask_t orig_SaveStartTask = nullptr;
+static void my_SaveStartTask(void* thiz, int cmd, unsigned int slot, int sync) {
+    if (cmd == 3 && g_IsClient.load() && g_IsConnected.load()) {
+        ShowNativeToast("Only the host can save the game.");
+        return;
+    }
+    if (orig_SaveStartTask) orig_SaveStartTask(thiz, cmd, slot, sync);
+}
 
 typedef void (*GameUpdateStateBase_t)(void* thiz, float param_1, uint32_t param_2, uint32_t param_3, uint32_t param_4);
 GameUpdateStateBase_t orig_GameUpdateStateBase = nullptr;
@@ -300,6 +316,7 @@ static const uint8_t PACKET_VEHICLE_AUTHORITY = 5;
 static const uint8_t PACKET_VEHICLE_RELEASE = 6;
 static const uint8_t PACKET_VEHICLE_SNAPSHOT = 7;
 static const uint8_t PACKET_PLAYER_INFO = 8;
+static const uint8_t PACKET_HOST_STATE = 9;   // host oyunda mi?
 
 static const uint8_t MAX_PLAYERS = 4;
 static const uint16_t VEHICLE_ID_INVALID = 0xFFFF;
@@ -338,6 +355,11 @@ struct PlayerInfoPacket {
     uint8_t type;
     uint8_t playerId;
     char playerName[32];
+};
+
+struct HostStatePacket {
+    uint8_t type;
+    uint8_t inGame;
 };
 
 struct NetworkPacket {
@@ -1561,6 +1583,7 @@ void NetworkLoop() {
 
     uint8_t recvBuffer[4096];
     size_t bufferedBytes = 0;
+    int lastSentInGame = -1;    // host: oyun durumu degisince client'a bildir
 
     while (g_IsConnected.load()) {
         if (g_TcpSocket < 0) break;
@@ -1594,6 +1617,8 @@ void NetworkLoop() {
                 packetSize = sizeof(SessionWelcomePacket);
             } else if (packetType == PACKET_PLAYER_INFO) {
                 packetSize = sizeof(PlayerInfoPacket);
+            } else if (packetType == PACKET_HOST_STATE) {
+                packetSize = sizeof(HostStatePacket);
             } else if (packetType == PACKET_CHAT) {
                 packetSize = sizeof(NetworkPacket);
             } else if (packetType == PACKET_VEHICLE_POSITION) {
@@ -1639,6 +1664,10 @@ void NetworkLoop() {
                 PlayerInfoPacket pkt;
                 memcpy(&pkt, recvBuffer, sizeof(pkt));
                 HandlePlayerInfoPacket(pkt);
+            } else if (packetType == PACKET_HOST_STATE) {
+                HostStatePacket pkt;
+                memcpy(&pkt, recvBuffer, sizeof(pkt));
+                g_HostInGame.store(pkt.inGame != 0);
             } else if (packetType == PACKET_CHAT) {
                 NetworkPacket pkt;
                 memcpy(&pkt, recvBuffer, sizeof(pkt));
@@ -1688,6 +1717,20 @@ void NetworkLoop() {
             bufferedBytes -= packetSize;
             if (bufferedBytes > 0) {
                 memmove(recvBuffer, recvBuffer + packetSize, bufferedBytes);
+            }
+        }
+
+        if (g_IsHost.load()) {
+            const int cur = g_LocalInGame.load() ? 1 : 0;
+            if (cur != lastSentInGame) {
+                HostStatePacket hs;
+                hs.type = PACKET_HOST_STATE;
+                hs.inGame = (uint8_t)cur;
+                if (!SendAllBytes(g_TcpSocket, &hs, sizeof(hs))) {
+                    g_IsConnected.store(false);
+                    break;
+                }
+                lastSentInGame = cur;
             }
         }
 
@@ -2020,6 +2063,7 @@ void TCPHostThread() {
 }
 
 void TCPClientThread(std::string hostIP) {
+    g_HostInGame.store(false);
     ResetVehicleSyncState();
     ResetPlayerNames();
     g_LocalPlayerId.store(0xFF);
@@ -2568,8 +2612,10 @@ static void DrawRoomTable(float width) {
         d->AddText(font, fs, ImVec2(p.x + pad + 40.0f, y),
                    empty ? IM_COL32(130, 138, 145, 255) : IM_COL32(245, 245, 245, 255),
                    empty ? "Waiting for player..." : names[i].c_str());
-        const float rw = font->CalcTextSizeA(fs, FLT_MAX, 0.0f, kRoles[i]).x;
-        d->AddText(font, fs, ImVec2(p.x + width - pad - rw, y), IM_COL32(150, 160, 168, 255), kRoles[i]);
+        if (!empty) {   // rol, oyuncu baglanmadan gosterilmez
+            const float rw = font->CalcTextSizeA(fs, FLT_MAX, 0.0f, kRoles[i]).x;
+            d->AddText(font, fs, ImVec2(p.x + width - pad - rw, y), IM_COL32(150, 160, 168, 255), kRoles[i]);
+        }
         if (i == 0) d->AddLine(ImVec2(p.x + pad, p.y + headH + rowH),
                                ImVec2(p.x + width - pad, p.y + headH + rowH),
                                IM_COL32(255, 255, 255, 24), 1.0f);
@@ -2717,6 +2763,24 @@ static void MpGoBack() {
     g_PendingTouchDown.store(false);
 }
 
+// Host odayi kapatir (Close Room butonu ve host oyundan cikinca). Client'in baglantisi kopar.
+static void HostCloseRoom() {
+    ClearChat();
+    g_IsHost = false;
+    g_IsConnected = false;
+    if (g_TcpServerFd >= 0) {
+        shutdown(g_TcpServerFd, SHUT_RDWR);
+        close(g_TcpServerFd);
+        g_TcpServerFd = -1;
+    }
+    if (g_TcpSocket >= 0) {
+        shutdown(g_TcpSocket, SHUT_RDWR);
+        close(g_TcpSocket);
+        g_TcpSocket = -1;
+    }
+    g_ConnectedStatus = "Room Closed.";
+}
+
 // LAN odasi hazir (host) ya da odaya baglanildi (client): menuyu kapat, oyunun kendi
 // "Select a file" ekrani gorunsun. Baglanti acik kalir.
 static void MpProceedToGame() {
@@ -2859,15 +2923,6 @@ void DrawImGui() {
                 g_IsMultiplayerMenuActive = true;
             }
         }
-    }
-
-    // Client odaya baglanir baglanmaz kayit secme ekranina otomatik gec.
-    static bool s_autoProceeded = false;
-    if (!g_IsConnected.load()) {
-        s_autoProceeded = false;
-    } else if (g_IsClient.load() && g_MpFromLan && g_IsMultiplayerMenuActive && !s_autoProceeded) {
-        s_autoProceeded = true;
-        AutoStartGameForClient();
     }
 
     if (g_IsMultiplayerMenuActive) {
@@ -3033,20 +3088,7 @@ void DrawImGui() {
             } else {
                 if (DrawGameStyleButton("##CloseRoom", "Close Room",
                                         ImVec2(innerButtonW, innerButtonH), 1.30f, false)) {
-                    ClearChat();
-                    g_IsHost = false;
-                    g_IsConnected = false;
-                    if (g_TcpServerFd >= 0) {
-                        shutdown(g_TcpServerFd, SHUT_RDWR);
-                        close(g_TcpServerFd);
-                        g_TcpServerFd = -1;
-                    }
-                    if (g_TcpSocket >= 0) {
-                        shutdown(g_TcpSocket, SHUT_RDWR);
-                        close(g_TcpSocket);
-                        g_TcpSocket = -1;
-                    }
-                    g_ConnectedStatus = "Room Closed.";
+                    HostCloseRoom();
                 }
             }
 
@@ -3173,14 +3215,18 @@ void DrawImGui() {
 
                 // Bağlıyken sadece Join Game içeride kalır.
                 // Disconnect artık yukarıdaki ana butondadır.
+                // Host oyuna girmeden Join Game calismaz.
+                const bool hostReady = g_HostInGame.load();
+                if (!hostReady) ImGui::BeginDisabled();
                 if (DrawGameStyleButton(
                         "##JoinGame",
-                        "Join Game",
+                        hostReady ? "Join Game" : "Waiting for host...",
                         ImVec2(std::min(commonButtonW, infoW), commonButtonH),
                         1.20f,
-                        false)) {
+                        false) && hostReady) {
                     AutoStartGameForClient();
                 }
+                if (!hostReady) ImGui::EndDisabled();
             }
             ImGui::EndChild();
             ImGui::PopStyleVar();
@@ -3216,6 +3262,24 @@ void DrawImGui() {
 void my_GameUpdate(void* thiz, float param_1) {
     g_EngineInstance = (uintptr_t)thiz; 
     g_CurrentMenu = MENU_INGAME; 
+
+    // Oturum guvenligi: host oyundan cikarsa oda kapanir, client baglantisi kopunca oyundan atilir.
+    {
+        static bool s_prevInGame = false;
+        const int st = *(volatile int*)((uintptr_t)thiz + 0x64);
+        const bool inGame = (st == 6 || st == 7);
+        g_LocalInGame.store(inGame);
+        if (s_prevInGame && !inGame && g_IsHost.load()) HostCloseRoom();
+        if (g_ClientPlaying.load()) {
+            if (st == 1) {
+                g_ClientPlaying.store(false);                       // basliga donuldu
+            } else if (inGame && !g_IsConnected.load() && g_KickUntilMs.load() == 0) {
+                ShowNativeToast("The host left the game. Returning to the menu.");
+                g_KickUntilMs.store(NowMs() + 15000);
+            }
+        }
+        s_prevInGame = inGame;
+    }
     if (orig_GameUpdate) orig_GameUpdate(thiz, param_1);
 }
 
@@ -3244,7 +3308,28 @@ void my_GameUpdateStateBase(void* thiz, float param_1, uint32_t param_2, uint32_
 // Kayit secme ekraninda oyunun kendi "slot tiklandi" kodunu (Game+0x9c20) tetikler:
 // 10+slot = kaydi yukle, 0x10 = (bos slotta) yeni oyun / kolay zorluk. Oyun sonra kendi
 // yukleme akisini calistirip durum 6'ya (oyun) gecer.
+static void* g_SwitchToStateStart = nullptr;   // Game::switchToStateStart() (dlsym)
+
+// Client oyundan basliga atilir: oyunun kendi "ayarlar -> Exit (kaydetmeden)" akisi calistirilir.
+static void KickToTitleInject() {
+    const long long until = g_KickUntilMs.load();
+    if (until == 0 || g_EngineInstance == 0) return;
+    const uintptr_t g = g_EngineInstance;
+    const int state = *(volatile int*)(g + 0x64);
+    if (state == 1 || NowMs() > until) { g_KickUntilMs.store(0); return; }
+    volatile int* clicked = (volatile int*)(g + 0x9c20);
+    if (state == 6) {
+        if (g_SwitchToStateStart) ((void (*)(void*))g_SwitchToStateStart)((void*)g);
+        else g_KickUntilMs.store(0);
+    } else if (state == 7) {
+        const int sub = *(volatile int*)(g + 0x68);
+        if (sub == 0) *clicked = 0x15;          // Exit
+        else if (sub == 7) *clicked = 6;        // "kaydetmeden cik?" -> Evet
+    }
+}
+
 static void AutoStartInject() {
+    KickToTitleInject();
     const long long until = g_AutoStartUntilMs.load();
     if (until == 0 || g_EngineInstance == 0) return;
     const uintptr_t g = g_EngineInstance;
@@ -3368,6 +3453,15 @@ void ModMain() {
     MSHookFunction((void*)gameUpdateAddr, (void*)my_GameUpdate, (void**)&orig_GameUpdate);
     MSHookFunction((void*)updateStateBaseAddr, (void*)my_GameUpdateStateBase, (void**)&orig_GameUpdateStateBase);
     MSHookFunction((void*)inGameMenuAddr, (void*)my_renderStartMenuMain, (void**)&orig_renderStartMenuMain);
+
+    void* appLib = dlopen("libapp.so", RTLD_NOW | RTLD_NOLOAD);
+    if (appLib) {
+        void* saveTask = dlsym(appLib, "_ZN9SaveGames9startTaskENS_17WorkerTaskCommandEjb");
+        g_SwitchToStateStart = dlsym(appLib, "_ZN4Game18switchToStateStartEv");
+        LOGI("startTask symbol: %p, switchToStateStart symbol: %p", saveTask, g_SwitchToStateStart);
+        if (saveTask) MSHookFunction(saveTask, (void*)my_SaveStartTask, (void**)&orig_SaveStartTask);
+        dlclose(appLib);
+    }
 
     void* inputQueueGetEventAddr = dlsym(RTLD_DEFAULT, "AInputQueue_getEvent");
     if (inputQueueGetEventAddr != nullptr) {
