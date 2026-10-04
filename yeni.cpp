@@ -26,6 +26,7 @@
 #include <cerrno>
 #include <math.h>
 #include <algorithm>
+#include <utility>
 
 static bool SendAllBytes(int socketFd, const void* data, size_t size);
 
@@ -395,6 +396,24 @@ static const uint8_t PACKET_PLAYER_INFO = 8;
 static const uint8_t PACKET_HOST_STATE = 9;   // host oyunda mi?
 static const uint8_t PACKET_SAVE_REQUEST = 10; // client -> host: kaydi gonder
 static const uint8_t PACKET_SAVE_CHUNK = 11;   // host -> client: kayit parcasi
+static const uint8_t PACKET_AUTH_TABLE = 12;   // host -> client: TUM arac sahiplikleri (periyodik + istek uzerine)
+static const uint8_t PACKET_SYNC_REQUEST = 13; // client -> host: "bana tam senkron gonder"
+static const uint8_t PACKET_PING = 14;         // canlilik sinyali (TCP ve UDP)
+static const uint8_t PACKET_UDP_HELLO = 15;    // client -> host (UDP): [type][playerId]
+static const uint8_t PACKET_UDP_ACK = 16;      // host -> client (UDP): UDP yolu acildi
+
+// Baglanti sagligi: bu sureden uzun sessizlik = karsi taraf gitti (donmus / zorla kapatilmis).
+static const long long HOST_SILENCE_TIMEOUT_MS = 10000;  // client: host'tan hicbir sey gelmedi
+static const long long PEER_SILENCE_TIMEOUT_MS = 10000;  // host: client'tan hicbir sey gelmedi
+static const long long HOST_ALIVE_WINDOW_MS = 3000;      // host oyun dongusu bu surede calistiysa "canli"
+static const long long PING_INTERVAL_MS = 500;
+static const long long AUTH_TABLE_INTERVAL_MS = 1000;
+static const long long UDP_STALE_MS = 3000;              // UDP yolu bu kadar sessizse TCP'ye don
+
+static std::atomic<long long> g_LastGameUpdateMs(0);     // oyun ana dongusunun son calistigi an
+static std::atomic<bool> g_SyncRequestOut(false);        // client: host'tan tam senkron iste
+static std::atomic<bool> g_HostForceTable(false);        // host: sahiplik tablosunu hemen yayinla
+static std::atomic<bool> g_ForceResendAll(false);        // yerel araclari yeniden gonder
 
 static const uint8_t MAX_PLAYERS = 4;
 static const uint16_t VEHICLE_ID_INVALID = 0xFFFF;
@@ -685,6 +704,13 @@ static void ConfigureLowLatencySocket(int socketFd) {
     if (socketFd < 0) return;
     int one = 1;
     setsockopt(socketFd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
+
+    // Yarim acik baglantiyi (karsi taraf sessizce kayboldu) birkac saniyede yakala.
+    setsockopt(socketFd, SOL_SOCKET, SO_KEEPALIVE, &one, sizeof(one));
+    int idle = 4, intvl = 2, cnt = 3;
+    setsockopt(socketFd, IPPROTO_TCP, TCP_KEEPIDLE, &idle, sizeof(idle));
+    setsockopt(socketFd, IPPROTO_TCP, TCP_KEEPINTVL, &intvl, sizeof(intvl));
+    setsockopt(socketFd, IPPROTO_TCP, TCP_KEEPCNT, &cnt, sizeof(cnt));
 }
 
 static uint64_t GetMonotonicMilliseconds() {
@@ -759,6 +785,11 @@ static void RefreshVehicleTopology(uintptr_t game) {
     }
 
     g_LastKnownVehicleCount = safeVehicleCount;
+
+    // Sahiplik tablosu silindi (oyun yuklendi / arac eklendi-silindi). Bu cihaz tek basina
+    // dogru tabloyu bilemez: client host'tan tam senkron ister, host herkese tabloyu yayinlar.
+    if (g_IsClient.load() && g_IsConnected.load()) g_SyncRequestOut.store(true);
+    if (g_IsHost.load()) g_HostForceTable.store(true);
 }
 
 static bool GetVehicleOwner(uint16_t vehicleId, uint8_t* outOwner) {
@@ -973,6 +1004,12 @@ static void CaptureAndQueueLocalVehicleState(uintptr_t game) {
     g_LastVehicleSync = now;
 
     RefreshVehicleTopology(game);
+
+    // Yeni katilan / senkron isteyen oyuncu icin: aktif ve sahip olunan araclari hemen yeniden gonder.
+    if (g_ForceResendAll.exchange(false)) {
+        std::lock_guard<std::mutex> lock(g_VehicleStateMutex);
+        for (uint16_t i = 0; i < VEHICLE_SLOT_LIMIT; ++i) g_LastSentLocalVehicles[i].valid = false;
+    }
 
     const uint32_t rawVehicleCount = *(uint32_t*)(game + 0xA4);
     const uint32_t vehicleCount =
@@ -1301,7 +1338,10 @@ static void HandleVehicleAuthorityPacket(const VehicleAuthorityPacket& pkt) {
     std::lock_guard<std::mutex> lock(g_VehicleStateMutex);
     VehicleAuthorityState& auth = g_VehicleAuthority[pkt.vehicleId];
 
-    if (auth.generation > pkt.generation) return;
+    // NOT: Eskiden burada "auth.generation > pkt.generation" ise paket yok sayiliyordu. Her cihaz
+    // topoloji degisince kendi generation sayacini 0'a ceviriyordu; host'un yeni (kucuk) numarasi
+    // client'ta reddedilip sahiplik hic guncellenmiyordu. Paketler tek TCP akisinda sirali
+    // geldigi icin bu kontrole gerek yok: gelen her paket en guncel durumdur.
 
     const bool ownerChanged = (auth.ownerId != pkt.ownerId);
     auth.ownerId = pkt.ownerId;
@@ -1322,6 +1362,50 @@ static void HandleVehicleAuthorityPacket(const VehicleAuthorityPacket& pkt) {
          (unsigned)pkt.vehicleId,
          (unsigned)pkt.ownerId,
          (unsigned)pkt.generation);
+}
+
+// Host'un yayinladigi TAM sahiplik tablosu. Tabloda olmayan arac = sahipsiz. Boylece tek tek
+// paketler kaybolsa / yerel tablo silinse bile en gec AUTH_TABLE_INTERVAL_MS icinde duzelir.
+static void HandleAuthorityTable(const uint8_t* entries, uint16_t count) {
+    if (g_IsHost.load()) return;
+
+    uint8_t owners[VEHICLE_SLOT_LIMIT];
+    memset(owners, 0xFF, sizeof(owners));
+    for (uint16_t i = 0; i < count; ++i) {
+        uint16_t id;
+        memcpy(&id, entries + (size_t)i * 3, 2);
+        const uint8_t owner = entries[(size_t)i * 3 + 2];
+        if (id < VEHICLE_SLOT_LIMIT && owner < MAX_PLAYERS) owners[id] = owner;
+    }
+
+    std::lock_guard<std::mutex> lock(g_VehicleStateMutex);
+    for (uint16_t v = 0; v < VEHICLE_SLOT_LIMIT; ++v) {
+        VehicleAuthorityState& auth = g_VehicleAuthority[v];
+        if (auth.ownerId == owners[v]) continue;
+        auth.ownerId = owners[v];
+        auth.generation++;
+        g_ClaimPending[v] = false;
+        memset(&g_RemoteVehicles[v], 0, sizeof(g_RemoteVehicles[v]));
+        memset(&g_LocalSamples[v], 0, sizeof(g_LocalSamples[v]));
+        memset(&g_LastSentLocalVehicles[v], 0, sizeof(g_LastSentLocalVehicles[v]));
+        g_LocalStationarySince[v] = 0;
+        g_RemoteStationarySince[v] = 0;
+    }
+}
+
+// Host: sahipsiz bir arac icin hareket eden bir oyuncudan anlik goruntu geldiyse, o oyuncu
+// aslinda aracin surucusudur (claim paketi kayboldu ya da host tablosu silindi). Beklemeden
+// sahipligi ver; boylece "host o araca ilk dokunana kadar hareket gorunmez" sorunu olmaz.
+static void HostAdoptIfMoving(uint8_t ownerId, uint16_t vehicleId, bool moving) {
+    if (!moving || !g_IsHost.load()) return;
+    if (ownerId >= MAX_PLAYERS || ownerId == g_LocalPlayerId.load()) return;
+    if (vehicleId >= VEHICLE_SLOT_LIMIT) return;
+    uint8_t current = VEHICLE_OWNER_NONE;
+    {
+        std::lock_guard<std::mutex> lock(g_VehicleStateMutex);
+        current = g_VehicleAuthority[vehicleId].ownerId;
+    }
+    if (current == VEHICLE_OWNER_NONE) AssignVehicleAuthority(vehicleId, ownerId, true);
 }
 
 static void StoreRemoteVehicleState(
@@ -1405,6 +1489,7 @@ static void StoreRemoteVehicleState(
 static void HandleVehiclePositionPacket(
     const VehiclePositionPacket& pkt
 ) {
+    HostAdoptIfMoving(pkt.ownerId, pkt.vehicleId, pkt.moving != 0);
     StoreRemoteVehicleState(
         pkt.ownerId,
         pkt.vehicleId,
@@ -1432,6 +1517,7 @@ static void HandleVehicleSnapshotPacket(
             sizeof(entry)
         );
 
+        HostAdoptIfMoving(header.ownerId, entry.vehicleId, entry.moving != 0);
         StoreRemoteVehicleState(
             header.ownerId,
             entry.vehicleId,
@@ -1705,7 +1791,8 @@ static void AppendBytes(std::vector<uint8_t>& dst, const void* data, size_t size
 // Tamponda biriken tam paketleri isler. peerId: client'ta -1, host'ta gonderen oyuncunun id'si.
 // Host'ta oyuncu kimligi (peerId) paketlere zorla yazilir (taklit edilemez) ve diger oyunculara
 // iletilecek paketler `relay`e eklenir. Protokol hatasinda false doner.
-static bool ProcessPackets(uint8_t* buf, size_t& buffered, int peerId, std::vector<uint8_t>* relay) {
+static bool ProcessPackets(uint8_t* buf, size_t& buffered, int peerId, std::vector<uint8_t>* relay,
+                           std::vector<uint8_t>* relayFast = nullptr) {
     while (buffered > 0) {
         const uint8_t type = buf[0];
         size_t size = 0;
@@ -1716,6 +1803,15 @@ static bool ProcessPackets(uint8_t* buf, size_t& buffered, int peerId, std::vect
         else if (type == PACKET_HOST_STATE) size = sizeof(HostStatePacket);
         else if (type == PACKET_SAVE_REQUEST) size = sizeof(SaveRequestPacket);
         else if (type == PACKET_SAVE_CHUNK) size = sizeof(SaveChunkPacket);
+        else if (type == PACKET_SYNC_REQUEST) size = 1;
+        else if (type == PACKET_PING) size = 1;
+        else if (type == PACKET_AUTH_TABLE) {
+            if (buffered < 3) break;
+            uint16_t cnt;
+            memcpy(&cnt, buf + 1, 2);
+            if (cnt > VEHICLE_SLOT_LIMIT) return false;
+            size = 3 + (size_t)cnt * 3;
+        }
         else if (type == PACKET_CHAT) { size = sizeof(NetworkPacket); relayIt = true; }
         else if (type == PACKET_VEHICLE_POSITION) { size = sizeof(VehiclePositionPacket); relayIt = true; }
         else if (type == PACKET_VEHICLE_CLAIM) size = sizeof(VehicleClaimPacket);
@@ -1792,9 +1888,25 @@ static bool ProcessPackets(uint8_t* buf, size_t& buffered, int peerId, std::vect
             memcpy(&pkt, buf, sizeof(pkt));
             if (fromPeer) pkt.ownerId = (uint8_t)peerId;
             HandleVehicleReleasePacket(pkt);
+        } else if (type == PACKET_AUTH_TABLE) {
+            if (!fromPeer && !g_IsHost.load()) {
+                uint16_t cnt;
+                memcpy(&cnt, buf + 1, 2);
+                HandleAuthorityTable(buf + 3, cnt);
+            }
+        } else if (type == PACKET_SYNC_REQUEST) {
+            if (g_IsHost.load() && fromPeer) {
+                g_HostForceTable.store(true);
+                g_ForceResendAll.store(true);
+            }
         }
+        // PACKET_PING: sadece "canlayim" demek, ozel islem yok (alim zamani disarida kaydedilir).
 
-        if (relay && relayIt) AppendBytes(*relay, buf, size);
+        if (relay && relayIt) {
+            const bool fast = (type == PACKET_VEHICLE_SNAPSHOT || type == PACKET_VEHICLE_POSITION);
+            if (relayFast && fast) AppendBytes(*relayFast, buf, size);
+            else AppendBytes(*relay, buf, size);
+        }
 
         buffered -= size;
         if (buffered > 0) memmove(buf, buf + size, buffered);
@@ -1803,7 +1915,7 @@ static bool ProcessPackets(uint8_t* buf, size_t& buffered, int peerId, std::vect
 }
 
 // Bu cihazin gonderecegi her seyi (sohbet, sahiplik, arac anlik goruntusu) tek tamponda toplar.
-static void BuildOutgoing(std::vector<uint8_t>& out) {
+static void BuildOutgoing(std::vector<uint8_t>& out, std::vector<uint8_t>* fast = nullptr) {
     {
         std::lock_guard<std::mutex> lock(g_OutgoingChatMutex);
         for (const std::string& msg : g_OutgoingChats) {
@@ -1861,27 +1973,134 @@ static void BuildOutgoing(std::vector<uint8_t>& out) {
         header.ownerId = g_LocalPlayerId.load();
         header.count = (uint8_t)entries.size();
         header.sequence = (uint32_t)nowMs;
-        AppendBytes(out, &header, sizeof(header));
-        AppendBytes(out, entries.data(), entries.size() * sizeof(VehicleSnapshotEntry));
+        // fast verilmisse arac goruntuleri ayri tamponda toplanir (UDP ile gonderilebilsin diye).
+        std::vector<uint8_t>& dst = fast ? *fast : out;
+        AppendBytes(dst, &header, sizeof(header));
+        AppendBytes(dst, entries.data(), entries.size() * sizeof(VehicleSnapshotEntry));
     }
     g_LastVehicleNetworkSendMs = nowMs;
 }
 
 // ========================================================================
-// CLIENT AG DONGUSU (tek soket: host'a)
+// ILETISIM YARDIMCILARI
+//   - UDP: arac goruntuleri (en yeni durum kazanir; kayip paket bir sonrakiyle telafi olur,
+//     TCP'deki "bas bloklama" yok). Sohbet / sahiplik / kayit hala guvenilir TCP'den gider.
+//   - Host: oyuncu basina engellemeyen gonderim kuyrugu (yavas bir telefon herkesi dondurmaz).
+// ========================================================================
+static void SetLanQos(int fd) {
+#ifdef IP_TOS
+    int tos = 0xB8;   // EF: Wi-Fi'da (WMM) yuksek oncelikli kuyruk
+    setsockopt(fd, IPPROTO_IP, IP_TOS, &tos, sizeof(tos));
+#endif
+}
+
+static int OpenUdpSocket(bool bindToSyncPort) {
+    const int fd = socket(AF_INET, SOCK_DGRAM, 0);
+    if (fd < 0) return -1;
+    if (bindToSyncPort) {
+        int one = 1;
+        setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+        struct sockaddr_in a;
+        memset(&a, 0, sizeof(a));
+        a.sin_family = AF_INET;
+        a.sin_addr.s_addr = INADDR_ANY;
+        a.sin_port = htons(TCP_SYNC_PORT);
+        if (bind(fd, (struct sockaddr*)&a, sizeof(a)) < 0) { close(fd); return -1; }
+    }
+    fcntl(fd, F_SETFL, O_NONBLOCK);
+    SetLanQos(fd);
+    return fd;
+}
+
+// Arac paketlerinden olusan tamponu tek tek paketlere boler (her biri ayri datagram olur).
+static void SplitFastPackets(const std::vector<uint8_t>& v, std::vector<std::pair<size_t, size_t> >& outPk) {
+    size_t off = 0;
+    while (off < v.size()) {
+        const uint8_t type = v[off];
+        size_t size = 0;
+        if (type == PACKET_VEHICLE_POSITION) {
+            size = sizeof(VehiclePositionPacket);
+        } else if (type == PACKET_VEHICLE_SNAPSHOT) {
+            if (off + sizeof(VehicleSnapshotHeader) > v.size()) break;
+            VehicleSnapshotHeader h;
+            memcpy(&h, v.data() + off, sizeof(h));
+            size = sizeof(h) + (size_t)h.count * sizeof(VehicleSnapshotEntry);
+        } else {
+            break;
+        }
+        if (off + size > v.size()) break;
+        outPk.push_back(std::make_pair(off, size));
+        off += size;
+    }
+}
+
+static void SendDatagrams(int fd, const struct sockaddr_in& to, const std::vector<uint8_t>& v) {
+    std::vector<std::pair<size_t, size_t> > pk;
+    SplitFastPackets(v, pk);
+    for (size_t i = 0; i < pk.size(); ++i) {
+        sendto(fd, v.data() + pk[i].first, pk[i].second, MSG_DONTWAIT,
+               (const struct sockaddr*)&to, sizeof(to));
+    }
+}
+
+// Host'un bildigi TUM arac sahiplikleri tek pakette: [type][count u16]{id u16, owner u8}*
+static void AppendAuthorityTable(std::vector<uint8_t>& out) {
+    std::vector<uint8_t> entries;
+    uint16_t count = 0;
+    {
+        std::lock_guard<std::mutex> lock(g_VehicleStateMutex);
+        for (uint16_t v = 0; v < VEHICLE_SLOT_LIMIT; ++v) {
+            const uint8_t owner = g_VehicleAuthority[v].ownerId;
+            if (owner == VEHICLE_OWNER_NONE) continue;
+            AppendBytes(entries, &v, 2);
+            entries.push_back(owner);
+            ++count;
+        }
+    }
+    out.push_back(PACKET_AUTH_TABLE);
+    AppendBytes(out, &count, 2);
+    if (!entries.empty()) AppendBytes(out, entries.data(), entries.size());
+}
+
+// ========================================================================
+// CLIENT AG DONGUSU (TCP: host'a guvenilir kanal, UDP: arac goruntuleri)
 // ========================================================================
 void NetworkLoop() {
     fcntl(g_TcpSocket, F_SETFL, O_NONBLOCK);
 
+    // UDP kanali: host'un TCP adresiyle ayni IP, ayni port numarasi.
+    int udpFd = -1;
+    struct sockaddr_in hostUdp;
+    memset(&hostUdp, 0, sizeof(hostUdp));
+    {
+        struct sockaddr_in peer;
+        socklen_t pl = sizeof(peer);
+        memset(&peer, 0, sizeof(peer));
+        if (getpeername(g_TcpSocket, (struct sockaddr*)&peer, &pl) == 0 && peer.sin_family == AF_INET) {
+            udpFd = OpenUdpSocket(false);
+            hostUdp = peer;
+            hostUdp.sin_port = htons(TCP_SYNC_PORT);
+        }
+    }
+    bool udpReady = false;                       // host UDP'yi onayladi mi?
+    bool udpAnnounced = false;                   // "UDP active" bildirimi baglanti basina bir kez
+    long long lastUdpRxMs = 0, lastUdpPingMs = 0, lastHelloMs = 0, lastPingMs = 0;
+    long long lastRecvMs = NowMs();              // host'tan en son ne zaman bir sey geldi
+    g_SyncRequestOut.store(true);                // baglanir baglanmaz tam senkron iste
+
     uint8_t buf[4096];
     size_t buffered = 0;
-    std::vector<uint8_t> out;
+    std::vector<uint8_t> out, fast;
 
     while (g_IsConnected.load() && g_TcpSocket >= 0) {
+        const long long nowT = NowMs();
+
+        // --- TCP al ---
         if (buffered < sizeof(buf)) {
             const ssize_t n = recv(g_TcpSocket, buf + buffered, sizeof(buf) - buffered, 0);
             if (n > 0) {
                 buffered += (size_t)n;
+                lastRecvMs = nowT;
             } else if (n == 0) {
                 ShowNativeToast("Connection Lost (Other player left)!");
                 g_IsConnected.store(false);
@@ -1893,18 +2112,73 @@ void NetworkLoop() {
             }
         }
 
+        // --- UDP al (sadece host'tan; sadece arac goruntuleri / ping / onay) ---
+        if (udpFd >= 0) {
+            for (int k = 0; k < 64; ++k) {
+                uint8_t dg[1500];
+                struct sockaddr_in from;
+                socklen_t fl = sizeof(from);
+                memset(&from, 0, sizeof(from));
+                const ssize_t n = recvfrom(udpFd, dg, sizeof(dg), MSG_DONTWAIT, (struct sockaddr*)&from, &fl);
+                if (n <= 0) break;
+                if (from.sin_addr.s_addr != hostUdp.sin_addr.s_addr) continue;
+                lastRecvMs = nowT;
+                lastUdpRxMs = nowT;
+                if (dg[0] == PACKET_UDP_ACK) {
+                    if (!udpReady) {
+                        LOGI("[UDP] fast channel active");
+                        if (!udpAnnounced) { udpAnnounced = true; ShowNativeToast("UDP fast channel active"); }  // TEST: istemezsen sil
+                    }
+                    udpReady = true;
+                    continue;
+                }
+                if (dg[0] != PACKET_VEHICLE_SNAPSHOT && dg[0] != PACKET_VEHICLE_POSITION) continue;
+                size_t len = (size_t)n;
+                ProcessPackets(dg, len, -1, nullptr);
+            }
+            if (udpReady && (nowT - lastUdpRxMs) > UDP_STALE_MS) udpReady = false;  // yol bozuldu: TCP'ye don
+        }
+
         if (!ProcessPackets(buf, buffered, -1, nullptr)) {
             g_IsConnected.store(false);
             break;
         }
 
+        // --- Host sessiz kaldi: zorla kapatildi / dondu / ag koptu ---
+        if (nowT - lastRecvMs > HOST_SILENCE_TIMEOUT_MS) {
+            ShowNativeToast("Connection Lost (host is not responding)!");
+            g_IsConnected.store(false);
+            break;
+        }
+
+        // --- UDP el sikisma: onay gelene kadar 250 ms'de bir ---
+        const uint8_t myId = g_LocalPlayerId.load();
+        if (udpFd >= 0 && !udpReady && myId < MAX_PLAYERS && (nowT - lastHelloMs) >= 250) {
+            lastHelloMs = nowT;
+            const uint8_t hello[2] = { PACKET_UDP_HELLO, myId };
+            sendto(udpFd, hello, sizeof(hello), MSG_DONTWAIT, (const struct sockaddr*)&hostUdp, sizeof(hostUdp));
+        }
+        if (udpFd >= 0 && udpReady && (nowT - lastUdpPingMs) >= PING_INTERVAL_MS) {
+            lastUdpPingMs = nowT;
+            const uint8_t ping = PACKET_PING;
+            sendto(udpFd, &ping, 1, MSG_DONTWAIT, (const struct sockaddr*)&hostUdp, sizeof(hostUdp));
+        }
+
+        // --- Gonder ---
         out.clear();
+        fast.clear();
         if (g_SaveRequestOut.exchange(false)) {
             SaveRequestPacket rq;
             rq.type = PACKET_SAVE_REQUEST;
             AppendBytes(out, &rq, sizeof(rq));
         }
-        BuildOutgoing(out);
+        if (g_SyncRequestOut.exchange(false)) out.push_back(PACKET_SYNC_REQUEST);
+        if ((nowT - lastPingMs) >= 1000) { lastPingMs = nowT; out.push_back(PACKET_PING); }
+        BuildOutgoing(out, &fast);
+        if (!fast.empty()) {
+            if (udpFd >= 0 && udpReady) SendDatagrams(udpFd, hostUdp, fast);
+            else AppendBytes(out, fast.data(), fast.size());     // UDP yoksa eskisi gibi TCP
+        }
         if (!out.empty() && !SendAllBytes(g_TcpSocket, out.data(), out.size())) {
             g_IsConnected.store(false);
             break;
@@ -1912,6 +2186,8 @@ void NetworkLoop() {
 
         std::this_thread::sleep_for(std::chrono::milliseconds(1));
     }
+
+    if (udpFd >= 0) close(udpFd);
 }
 
 // ========================================================================
@@ -1923,19 +2199,93 @@ struct HostPeer {
     bool dead;
     size_t buffered;
     uint8_t buf[4096];
+
+    std::vector<uint8_t> sendQ;      // gonderilmeyi bekleyen guvenilir (TCP) veri
+    size_t sendOff;
+    long long lastRecvMs;            // bu oyuncudan en son ne zaman bir sey geldi
+    long long lastProgressMs;        // kuyruktan en son ne zaman veri cikti
+    long long lastUdpMs;             // UDP yolundan en son ne zaman bir sey geldi
+    uint32_t ip;                     // TCP kaynak adresi (UDP kimlik dogrulamasi icin)
+    bool udpReady;
+    struct sockaddr_in udpAddr;
 };
 
 static std::atomic<int> g_HostGen(0);   // yeni oda acilinca eski host dongusu kendiliginden biter
 
+static const size_t PEER_SENDQ_MAX = 8u * 1024u * 1024u;   // kayit aktarimi dahil, bunun uzeri = takilmis
+
+// Veriyi oyuncunun kuyruguna ekler; ASLA beklemez.
+static void PeerQueue(HostPeer* p, const void* data, size_t size) {
+    if (p->dead || size == 0) return;
+    if (p->sendOff >= p->sendQ.size()) {      // kuyruk bos: ilerleme saatini bastan baslat
+        p->sendQ.clear();
+        p->sendOff = 0;
+        p->lastProgressMs = NowMs();
+    }
+    if (p->sendQ.size() - p->sendOff + size > PEER_SENDQ_MAX) { p->dead = true; return; }
+    AppendBytes(p->sendQ, data, size);
+}
+
+// Kuyruktan soketin kabul ettigi kadarini gonderir; dolu ise birakir, sonraki turda devam eder.
+static void PeerFlush(HostPeer* p) {
+    if (p->dead) return;
+    while (p->sendOff < p->sendQ.size()) {
+        const ssize_t n = send(p->fd, p->sendQ.data() + p->sendOff, p->sendQ.size() - p->sendOff,
+                               MSG_NOSIGNAL | MSG_DONTWAIT);
+        if (n > 0) {
+            p->sendOff += (size_t)n;
+            p->lastProgressMs = NowMs();
+            continue;
+        }
+        if (n < 0 && errno == EINTR) continue;
+        if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) break;
+        p->dead = true;
+        return;
+    }
+    if (p->sendOff >= p->sendQ.size()) {
+        p->sendQ.clear();
+        p->sendOff = 0;
+    } else {
+        if (NowMs() - p->lastProgressMs > 5000) { p->dead = true; return; }   // 5 sn hic ilerlemedi
+        if (p->sendOff > 65536) {
+            p->sendQ.erase(p->sendQ.begin(), p->sendQ.begin() + (ptrdiff_t)p->sendOff);
+            p->sendOff = 0;
+        }
+    }
+}
+
+// Arac goruntusu: UDP hazirsa datagram (kayip olursa sorun degil), degilse TCP kuyrugu.
+static void PeerSendFast(HostPeer* p, int udpFd, const uint8_t* pkt, size_t size) {
+    if (p->dead) return;
+    if (p->udpReady && udpFd >= 0) {
+        sendto(udpFd, pkt, size, MSG_DONTWAIT, (const struct sockaddr*)&p->udpAddr, sizeof(p->udpAddr));
+        return;
+    }
+    PeerQueue(p, pkt, size);
+}
+
 static void HostNetworkLoop(int serverFd, int gen) {
     std::vector<HostPeer*> peers;
-    std::vector<uint8_t> out, relay;
+    std::vector<uint8_t> out, fast, relay, relayFast;
     int lastSentInGame = -1;
+    long long lastPingMs = 0, lastTableMs = 0;
+
+    const int udpFd = OpenUdpSocket(true);   // -1 ise her sey TCP'den gider (eskisi gibi)
 
     auto broadcast = [&](const void* data, size_t size, const HostPeer* except) {
         for (HostPeer* p : peers) {
             if (p == except || p->dead) continue;
-            if (!SendAllBytes(p->fd, data, size)) p->dead = true;
+            PeerQueue(p, data, size);
+        }
+    };
+
+    auto broadcastFast = [&](const std::vector<uint8_t>& v, const HostPeer* except) {
+        if (v.empty()) return;
+        std::vector<std::pair<size_t, size_t> > pk;
+        SplitFastPackets(v, pk);
+        for (HostPeer* p : peers) {
+            if (p == except || p->dead) continue;
+            for (size_t k = 0; k < pk.size(); ++k) PeerSendFast(p, udpFd, v.data() + pk[k].first, pk[k].second);
         }
     };
 
@@ -1945,18 +2295,23 @@ static void HostNetworkLoop(int serverFd, int gen) {
         info.type = PACKET_PLAYER_INFO;
         info.playerId = id;
         strncpy(info.playerName, name.c_str(), sizeof(info.playerName) - 1);
-        if (only) { if (!SendAllBytes(only->fd, &info, sizeof(info))) only->dead = true; }
+        if (only) PeerQueue(only, &info, sizeof(info));
         else broadcast(&info, sizeof(info), nullptr);
     };
 
     while (g_IsHost.load() && g_HostGen.load() == gen) {
+        const long long nowT = NowMs();
+
         // 1) Yeni oyuncu kabul et (oda doluysa hemen kapat).
         struct pollfd pfd;
         pfd.fd = serverFd;
         pfd.events = POLLIN;
         pfd.revents = 0;
         if (poll(&pfd, 1, 0) > 0 && (pfd.revents & POLLIN)) {
-            const int fd = accept(serverFd, nullptr, nullptr);
+            struct sockaddr_in ca;
+            socklen_t cl = sizeof(ca);
+            memset(&ca, 0, sizeof(ca));
+            const int fd = accept(serverFd, (struct sockaddr*)&ca, &cl);
             if (fd >= 0) {
                 uint8_t freeId = 0;
                 for (uint8_t id = 1; id < MAX_PLAYERS && freeId == 0; ++id) {
@@ -1974,6 +2329,13 @@ static void HostNetworkLoop(int serverFd, int gen) {
                     peer->id = freeId;
                     peer->dead = false;
                     peer->buffered = 0;
+                    peer->sendOff = 0;
+                    peer->lastRecvMs = nowT;
+                    peer->lastProgressMs = nowT;
+                    peer->lastUdpMs = nowT;
+                    peer->ip = ca.sin_addr.s_addr;
+                    peer->udpReady = false;
+                    memset(&peer->udpAddr, 0, sizeof(peer->udpAddr));
 
                     SessionWelcomePacket welcome;
                     memset(&welcome, 0, sizeof(welcome));
@@ -1983,6 +2345,7 @@ static void HostNetworkLoop(int serverFd, int gen) {
                     HostStatePacket hs;
                     hs.type = PACKET_HOST_STATE;
                     hs.inGame = g_LocalInGame.load() ? 1 : 0;
+                    // Kuyruk henuz bos oldugu icin bu iki dogrudan gonderim akisi bozmaz.
                     if (!SendAllBytes(fd, &welcome, sizeof(welcome)) || !SendAllBytes(fd, &hs, sizeof(hs))) {
                         close(fd);
                         delete peer;
@@ -1996,25 +2359,76 @@ static void HostNetworkLoop(int serverFd, int gen) {
                         g_IsConnected = true;
                         ShowNativeToast("A player joined the room!");
                         QueueAllCurrentAuthorities();
+                        g_HostForceTable.store(true);     // yeni gelen hemen tam sahiplik tablosunu alsin
+                        g_ForceResendAll.store(true);     // host'un araclari hemen yeniden gonderilsin
                     }
                 }
             }
         }
 
-        // 2) Oyunculardan gelenleri al, isle, digerlerine ilet.
+        // 2) Oyunculardan (TCP) gelenleri al, isle, digerlerine ilet.
         for (size_t i = 0; i < peers.size(); ++i) {
             HostPeer* p = peers[i];
             if (p->dead) continue;
             if (p->buffered < sizeof(p->buf)) {
                 const ssize_t n = recv(p->fd, p->buf + p->buffered, sizeof(p->buf) - p->buffered, 0);
-                if (n > 0) p->buffered += (size_t)n;
+                if (n > 0) { p->buffered += (size_t)n; p->lastRecvMs = nowT; }
                 else if (n == 0) p->dead = true;
                 else if (errno != EWOULDBLOCK && errno != EAGAIN && errno != EINTR) p->dead = true;
             }
             if (p->dead) continue;
+            if (nowT - p->lastRecvMs > PEER_SILENCE_TIMEOUT_MS) { p->dead = true; continue; }
             relay.clear();
-            if (!ProcessPackets(p->buf, p->buffered, p->id, &relay)) { p->dead = true; continue; }
+            relayFast.clear();
+            if (!ProcessPackets(p->buf, p->buffered, p->id, &relay, &relayFast)) { p->dead = true; continue; }
             if (!relay.empty()) broadcast(relay.data(), relay.size(), p);
+            broadcastFast(relayFast, p);
+        }
+
+        // 2b) UDP: el sikisma + arac goruntuleri.
+        if (udpFd >= 0) {
+            for (int k = 0; k < 64; ++k) {
+                uint8_t dg[1500];
+                struct sockaddr_in from;
+                socklen_t fl = sizeof(from);
+                memset(&from, 0, sizeof(from));
+                const ssize_t n = recvfrom(udpFd, dg, sizeof(dg), MSG_DONTWAIT, (struct sockaddr*)&from, &fl);
+                if (n <= 0) break;
+
+                if (dg[0] == PACKET_UDP_HELLO) {
+                    if (n < 2) continue;
+                    for (HostPeer* p : peers) {
+                        // Kimlik: oyuncu numarasi + TCP baglantisiyla ayni IP adresi.
+                        if (p->dead || p->id != dg[1] || p->ip != from.sin_addr.s_addr) continue;
+                        p->udpAddr = from;
+                        p->udpReady = true;
+                        p->lastUdpMs = nowT;
+                        const uint8_t ack = PACKET_UDP_ACK;
+                        sendto(udpFd, &ack, 1, MSG_DONTWAIT, (const struct sockaddr*)&from, sizeof(from));
+                    }
+                    continue;
+                }
+
+                HostPeer* src = nullptr;
+                for (HostPeer* p : peers) {
+                    if (!p->dead && p->udpReady && p->udpAddr.sin_addr.s_addr == from.sin_addr.s_addr &&
+                        p->udpAddr.sin_port == from.sin_port) { src = p; break; }
+                }
+                if (!src) continue;
+                src->lastUdpMs = nowT;
+                src->lastRecvMs = nowT;
+                if (dg[0] != PACKET_VEHICLE_SNAPSHOT && dg[0] != PACKET_VEHICLE_POSITION) continue;  // PING vb.
+
+                size_t len = (size_t)n;
+                relay.clear();
+                relayFast.clear();
+                ProcessPackets(dg, len, src->id, &relay, &relayFast);
+                broadcastFast(relayFast, src);
+            }
+            // UDP yolu bozulduysa bu oyuncuya TCP'den gonder (client yeniden el sikisir).
+            for (HostPeer* p : peers) {
+                if (p->udpReady && (nowT - p->lastUdpMs) > UDP_STALE_MS) p->udpReady = false;
+            }
         }
 
         // 3) Host'un kendi giden verisi: hepsine yayinla.
@@ -2027,11 +2441,32 @@ static void HostNetworkLoop(int serverFd, int gen) {
                 broadcast(&hs, sizeof(hs), nullptr);
                 lastSentInGame = cur;
             }
-            out.clear();
-            BuildOutgoing(out);
-            if (!out.empty()) broadcast(out.data(), out.size(), nullptr);
 
-            // Host kaydi: sadece isteyen oyuncuya parca parca gonder.
+            // Host oyun dongusu calisiyorsa "canli": ping + sahiplik tablosu. Oyun zorla kapatilip
+            // surec bir sure yasasa bile bu sinyaller kesilir, client'lar 10 sn icinde atilir.
+            const bool hostAlive = (nowT - g_LastGameUpdateMs.load()) < HOST_ALIVE_WINDOW_MS;
+            out.clear();
+            fast.clear();
+            if (hostAlive && (nowT - lastPingMs) >= PING_INTERVAL_MS) {
+                lastPingMs = nowT;
+                out.push_back(PACKET_PING);
+                if (udpFd >= 0) {
+                    const uint8_t ping = PACKET_PING;
+                    for (HostPeer* p : peers) {
+                        if (!p->dead && p->udpReady)
+                            sendto(udpFd, &ping, 1, MSG_DONTWAIT, (const struct sockaddr*)&p->udpAddr, sizeof(p->udpAddr));
+                    }
+                }
+            }
+            if (g_HostForceTable.exchange(false) || (hostAlive && (nowT - lastTableMs) >= AUTH_TABLE_INTERVAL_MS)) {
+                lastTableMs = nowT;
+                AppendAuthorityTable(out);
+            }
+            BuildOutgoing(out, &fast);
+            if (!out.empty()) broadcast(out.data(), out.size(), nullptr);
+            broadcastFast(fast, nullptr);
+
+            // Host kaydi: sadece isteyen oyuncuya parca parca gonder (kuyruga; host dongusu beklemez).
             if (g_HostBlobReady.load()) {
                 std::vector<uint8_t> blob;
                 uint32_t version = 0;
@@ -2053,11 +2488,14 @@ static void HostNetworkLoop(int serverFd, int gen) {
                         c.version = version;
                         c.len = (uint16_t)std::min<size_t>(SAVE_CHUNK_DATA, blob.size() - off);
                         memcpy(c.data, blob.data() + off, c.len);
-                        if (!SendAllBytes(p->fd, &c, sizeof(c))) p->dead = true;
+                        PeerQueue(p, &c, sizeof(c));
                     }
                 }
             }
         }
+
+        // 3b) Kuyruklari bosalt: her oyuncuya soketin kabul ettigi kadar gonder (asla beklemez).
+        for (HostPeer* p : peers) PeerFlush(p);
 
         // 4) Ayrilan oyunculari temizle: araclari birakilir, isim silinir, herkese duyurulur.
         for (size_t i = 0; i < peers.size();) {
@@ -2100,6 +2538,7 @@ static void HostNetworkLoop(int serverFd, int gen) {
     }
 
     for (HostPeer* p : peers) { shutdown(p->fd, SHUT_RDWR); close(p->fd); delete p; }
+    if (udpFd >= 0) close(udpFd);
 }
 
 void StartPONGResponderThread() {
@@ -3462,6 +3901,7 @@ void DrawImGui() {
 // RENDER HOOKS
 // ========================================================================
 void my_GameUpdate(void* thiz, float param_1) {
+    g_LastGameUpdateMs.store(NowMs());   // host canlilik sinyali icin (oyun dongusu donarsa ping kesilir)
     g_EngineInstance = (uintptr_t)thiz; 
     g_CurrentMenu = MENU_INGAME; 
 
