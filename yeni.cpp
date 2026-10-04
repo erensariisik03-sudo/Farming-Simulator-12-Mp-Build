@@ -142,6 +142,7 @@ std::atomic<bool> g_LocalInGame(false);  // bu cihaz oyunda mi (Game durumu 6/7)
 static std::mutex g_SaveBlobMutex;
 static std::atomic<bool> g_SaveRequestOut(false);        // client: host'tan kayit iste
 static std::atomic<bool> g_SaveCaptureRequested(false);  // host: oyun thread'i kaydi alsin
+static std::atomic<int> g_SaveRequestPeer(-1);           // host: kaydi isteyen oyuncunun id'si
 static std::atomic<bool> g_HostBlobReady(false);         // host: gonderilecek kayit hazir
 static std::vector<uint8_t> g_HostBlob;
 static uint32_t g_HostBlobVersion = 0;
@@ -1694,27 +1695,194 @@ static void QueueAllCurrentAuthorities() {
 // ========================================================================
 // NETWORK THREADS
 // ========================================================================
+// PAKET ISLEME (client ve host ortak)
+// ========================================================================
+static void AppendBytes(std::vector<uint8_t>& dst, const void* data, size_t size) {
+    const uint8_t* p = (const uint8_t*)data;
+    dst.insert(dst.end(), p, p + size);
+}
+
+// Tamponda biriken tam paketleri isler. peerId: client'ta -1, host'ta gonderen oyuncunun id'si.
+// Host'ta oyuncu kimligi (peerId) paketlere zorla yazilir (taklit edilemez) ve diger oyunculara
+// iletilecek paketler `relay`e eklenir. Protokol hatasinda false doner.
+static bool ProcessPackets(uint8_t* buf, size_t& buffered, int peerId, std::vector<uint8_t>* relay) {
+    while (buffered > 0) {
+        const uint8_t type = buf[0];
+        size_t size = 0;
+        bool relayIt = false;
+
+        if (type == PACKET_SESSION_WELCOME) size = sizeof(SessionWelcomePacket);
+        else if (type == PACKET_PLAYER_INFO) { size = sizeof(PlayerInfoPacket); relayIt = true; }
+        else if (type == PACKET_HOST_STATE) size = sizeof(HostStatePacket);
+        else if (type == PACKET_SAVE_REQUEST) size = sizeof(SaveRequestPacket);
+        else if (type == PACKET_SAVE_CHUNK) size = sizeof(SaveChunkPacket);
+        else if (type == PACKET_CHAT) { size = sizeof(NetworkPacket); relayIt = true; }
+        else if (type == PACKET_VEHICLE_POSITION) { size = sizeof(VehiclePositionPacket); relayIt = true; }
+        else if (type == PACKET_VEHICLE_CLAIM) size = sizeof(VehicleClaimPacket);
+        else if (type == PACKET_VEHICLE_AUTHORITY) size = sizeof(VehicleAuthorityPacket);
+        else if (type == PACKET_VEHICLE_RELEASE) size = sizeof(VehicleReleasePacket);
+        else if (type == PACKET_VEHICLE_SNAPSHOT) {
+            if (buffered < sizeof(VehicleSnapshotHeader)) break;
+            VehicleSnapshotHeader header;
+            memcpy(&header, buf, sizeof(header));
+            if (header.count > VEHICLE_SNAPSHOT_MAX_COUNT) return false;
+            size = sizeof(VehicleSnapshotHeader) + (size_t)header.count * sizeof(VehicleSnapshotEntry);
+            relayIt = true;
+        } else {
+            return false;
+        }
+
+        if (buffered < size) break;
+
+        const bool fromPeer = (peerId >= 0);
+        if (type == PACKET_PLAYER_INFO) {
+            PlayerInfoPacket pkt;
+            memcpy(&pkt, buf, sizeof(pkt));
+            if (fromPeer) { pkt.playerId = (uint8_t)peerId; memcpy(buf, &pkt, sizeof(pkt)); }
+            HandlePlayerInfoPacket(pkt);
+        } else if (type == PACKET_SESSION_WELCOME) {
+            SessionWelcomePacket pkt;
+            memcpy(&pkt, buf, sizeof(pkt));
+            HandleSessionWelcome(pkt);
+        } else if (type == PACKET_HOST_STATE) {
+            HostStatePacket pkt;
+            memcpy(&pkt, buf, sizeof(pkt));
+            g_HostInGame.store(pkt.inGame != 0);
+        } else if (type == PACKET_SAVE_REQUEST) {
+            if (g_IsHost.load() && fromPeer) {
+                g_SaveRequestPeer.store(peerId);
+                g_SaveCaptureRequested.store(true);
+            }
+        } else if (type == PACKET_SAVE_CHUNK) {
+            SaveChunkPacket pkt;
+            memcpy(&pkt, buf, sizeof(pkt));
+            HandleSaveChunk(pkt);
+        } else if (type == PACKET_CHAT) {
+            NetworkPacket pkt;
+            memcpy(&pkt, buf, sizeof(pkt));
+            pkt.senderName[sizeof(pkt.senderName) - 1] = '\0';
+            pkt.chatData[sizeof(pkt.chatData) - 1] = '\0';
+            const std::string formatted = std::string(pkt.senderName) + ": " + pkt.chatData;
+            {
+                std::lock_guard<std::mutex> lock(g_ChatMutex);
+                g_ChatMessages.push_back(formatted);
+            }
+            ShowNativeToast(formatted);
+        } else if (type == PACKET_VEHICLE_POSITION) {
+            VehiclePositionPacket pkt;
+            memcpy(&pkt, buf, sizeof(pkt));
+            if (fromPeer) { pkt.ownerId = (uint8_t)peerId; memcpy(buf, &pkt, sizeof(pkt)); }
+            HandleVehiclePositionPacket(pkt);
+        } else if (type == PACKET_VEHICLE_SNAPSHOT) {
+            VehicleSnapshotHeader header;
+            memcpy(&header, buf, sizeof(header));
+            if (fromPeer) { header.ownerId = (uint8_t)peerId; memcpy(buf, &header, sizeof(header)); }
+            HandleVehicleSnapshotPacket(header, buf + sizeof(header));
+        } else if (type == PACKET_VEHICLE_CLAIM) {
+            VehicleClaimPacket pkt;
+            memcpy(&pkt, buf, sizeof(pkt));
+            if (fromPeer) pkt.ownerId = (uint8_t)peerId;
+            HandleVehicleClaimPacket(pkt);
+        } else if (type == PACKET_VEHICLE_AUTHORITY) {
+            VehicleAuthorityPacket pkt;
+            memcpy(&pkt, buf, sizeof(pkt));
+            HandleVehicleAuthorityPacket(pkt);
+        } else if (type == PACKET_VEHICLE_RELEASE) {
+            VehicleReleasePacket pkt;
+            memcpy(&pkt, buf, sizeof(pkt));
+            if (fromPeer) pkt.ownerId = (uint8_t)peerId;
+            HandleVehicleReleasePacket(pkt);
+        }
+
+        if (relay && relayIt) AppendBytes(*relay, buf, size);
+
+        buffered -= size;
+        if (buffered > 0) memmove(buf, buf + size, buffered);
+    }
+    return true;
+}
+
+// Bu cihazin gonderecegi her seyi (sohbet, sahiplik, arac anlik goruntusu) tek tamponda toplar.
+static void BuildOutgoing(std::vector<uint8_t>& out) {
+    {
+        std::lock_guard<std::mutex> lock(g_OutgoingChatMutex);
+        for (const std::string& msg : g_OutgoingChats) {
+            NetworkPacket pkt;
+            memset(&pkt, 0, sizeof(pkt));
+            pkt.type = PACKET_CHAT;
+            strncpy(pkt.senderName, g_Nickname, sizeof(pkt.senderName) - 1);
+            strncpy(pkt.chatData, msg.c_str(), sizeof(pkt.chatData) - 1);
+            AppendBytes(out, &pkt, sizeof(pkt));
+        }
+        g_OutgoingChats.clear();
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(g_VehicleSendMutex);
+        if (g_HasPendingClaimPacket) {
+            AppendBytes(out, &g_PendingClaimPacket, sizeof(g_PendingClaimPacket));
+            g_HasPendingClaimPacket = false;
+        }
+        if (g_HasPendingReleasePacket) {
+            AppendBytes(out, &g_PendingReleasePacket, sizeof(g_PendingReleasePacket));
+            g_HasPendingReleasePacket = false;
+        }
+        for (const VehicleAuthorityPacket& pkt : g_PendingAuthorityPackets) AppendBytes(out, &pkt, sizeof(pkt));
+        g_PendingAuthorityPackets.clear();
+    }
+
+    // Arac trafigi saniyede en fazla 30 anlik goruntu; degisen tum araclar tek mesajda.
+    const uint64_t nowMs = GetMonotonicMilliseconds();
+    if (g_LastVehicleNetworkSendMs != 0 && (nowMs - g_LastVehicleNetworkSendMs) < VEHICLE_NETWORK_INTERVAL_MS) return;
+
+    std::vector<VehicleSnapshotEntry> entries;
+    entries.reserve(VEHICLE_SNAPSHOT_MAX_COUNT);
+    {
+        std::lock_guard<std::mutex> lock(g_VehicleSendMutex);
+        for (uint16_t id = 0; id < VEHICLE_SLOT_LIMIT && entries.size() < VEHICLE_SNAPSHOT_MAX_COUNT; ++id) {
+            if (!g_HasLatestOutgoingVehicle[id]) continue;
+            const VehiclePositionPacket& src = g_LatestOutgoingVehicles[id];
+            VehicleSnapshotEntry entry;
+            memset(&entry, 0, sizeof(entry));
+            entry.vehicleId = src.vehicleId;
+            entry.x = src.x;
+            entry.y = src.y;
+            entry.angle = src.angle;
+            entry.sequence = src.sequence;
+            entry.moving = src.moving;
+            entries.push_back(entry);
+            g_HasLatestOutgoingVehicle[id] = false; // bir kez gonderilir
+        }
+    }
+    if (!entries.empty()) {
+        VehicleSnapshotHeader header;
+        memset(&header, 0, sizeof(header));
+        header.type = PACKET_VEHICLE_SNAPSHOT;
+        header.ownerId = g_LocalPlayerId.load();
+        header.count = (uint8_t)entries.size();
+        header.sequence = (uint32_t)nowMs;
+        AppendBytes(out, &header, sizeof(header));
+        AppendBytes(out, entries.data(), entries.size() * sizeof(VehicleSnapshotEntry));
+    }
+    g_LastVehicleNetworkSendMs = nowMs;
+}
+
+// ========================================================================
+// CLIENT AG DONGUSU (tek soket: host'a)
+// ========================================================================
 void NetworkLoop() {
     fcntl(g_TcpSocket, F_SETFL, O_NONBLOCK);
 
-    uint8_t recvBuffer[4096];
-    size_t bufferedBytes = 0;
-    int lastSentInGame = -1;    // host: oyun durumu degisince client'a bildir
+    uint8_t buf[4096];
+    size_t buffered = 0;
+    std::vector<uint8_t> out;
 
-    while (g_IsConnected.load()) {
-        if (g_TcpSocket < 0) break;
-
-        if (bufferedBytes < sizeof(recvBuffer)) {
-            ssize_t bytesRead = recv(
-                g_TcpSocket,
-                recvBuffer + bufferedBytes,
-                sizeof(recvBuffer) - bufferedBytes,
-                0
-            );
-
-            if (bytesRead > 0) {
-                bufferedBytes += (size_t)bytesRead;
-            } else if (bytesRead == 0) {
+    while (g_IsConnected.load() && g_TcpSocket >= 0) {
+        if (buffered < sizeof(buf)) {
+            const ssize_t n = recv(g_TcpSocket, buf + buffered, sizeof(buf) - buffered, 0);
+            if (n > 0) {
+                buffered += (size_t)n;
+            } else if (n == 0) {
                 ShowNativeToast("Connection Lost (Other player left)!");
                 g_IsConnected.store(false);
                 break;
@@ -1725,340 +1893,213 @@ void NetworkLoop() {
             }
         }
 
-        while (bufferedBytes > 0) {
-            const uint8_t packetType = recvBuffer[0];
-            size_t packetSize = 0;
+        if (!ProcessPackets(buf, buffered, -1, nullptr)) {
+            g_IsConnected.store(false);
+            break;
+        }
 
-            if (packetType == PACKET_SESSION_WELCOME) {
-                packetSize = sizeof(SessionWelcomePacket);
-            } else if (packetType == PACKET_PLAYER_INFO) {
-                packetSize = sizeof(PlayerInfoPacket);
-            } else if (packetType == PACKET_HOST_STATE) {
-                packetSize = sizeof(HostStatePacket);
-            } else if (packetType == PACKET_SAVE_REQUEST) {
-                packetSize = sizeof(SaveRequestPacket);
-            } else if (packetType == PACKET_SAVE_CHUNK) {
-                packetSize = sizeof(SaveChunkPacket);
-            } else if (packetType == PACKET_CHAT) {
-                packetSize = sizeof(NetworkPacket);
-            } else if (packetType == PACKET_VEHICLE_POSITION) {
-                packetSize = sizeof(VehiclePositionPacket);
-            } else if (packetType == PACKET_VEHICLE_CLAIM) {
-                packetSize = sizeof(VehicleClaimPacket);
-            } else if (packetType == PACKET_VEHICLE_AUTHORITY) {
-                packetSize = sizeof(VehicleAuthorityPacket);
-            } else if (packetType == PACKET_VEHICLE_RELEASE) {
-                packetSize = sizeof(VehicleReleasePacket);
-            } else if (packetType == PACKET_VEHICLE_SNAPSHOT) {
-                if (bufferedBytes < sizeof(VehicleSnapshotHeader)) {
-                    break;
+        out.clear();
+        if (g_SaveRequestOut.exchange(false)) {
+            SaveRequestPacket rq;
+            rq.type = PACKET_SAVE_REQUEST;
+            AppendBytes(out, &rq, sizeof(rq));
+        }
+        BuildOutgoing(out);
+        if (!out.empty() && !SendAllBytes(g_TcpSocket, out.data(), out.size())) {
+            g_IsConnected.store(false);
+            break;
+        }
+
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+}
+
+// ========================================================================
+// HOST AG DONGUSU (en fazla MAX_PLAYERS-1 client; yildiz topoloji, host iletir)
+// ========================================================================
+struct HostPeer {
+    int fd;
+    uint8_t id;
+    bool dead;
+    size_t buffered;
+    uint8_t buf[4096];
+};
+
+static std::atomic<int> g_HostGen(0);   // yeni oda acilinca eski host dongusu kendiliginden biter
+
+static void HostNetworkLoop(int serverFd, int gen) {
+    std::vector<HostPeer*> peers;
+    std::vector<uint8_t> out, relay;
+    int lastSentInGame = -1;
+
+    auto broadcast = [&](const void* data, size_t size, const HostPeer* except) {
+        for (HostPeer* p : peers) {
+            if (p == except || p->dead) continue;
+            if (!SendAllBytes(p->fd, data, size)) p->dead = true;
+        }
+    };
+
+    auto sendPlayerInfo = [&](uint8_t id, const std::string& name, HostPeer* only) {
+        PlayerInfoPacket info;
+        memset(&info, 0, sizeof(info));
+        info.type = PACKET_PLAYER_INFO;
+        info.playerId = id;
+        strncpy(info.playerName, name.c_str(), sizeof(info.playerName) - 1);
+        if (only) { if (!SendAllBytes(only->fd, &info, sizeof(info))) only->dead = true; }
+        else broadcast(&info, sizeof(info), nullptr);
+    };
+
+    while (g_IsHost.load() && g_HostGen.load() == gen) {
+        // 1) Yeni oyuncu kabul et (oda doluysa hemen kapat).
+        struct pollfd pfd;
+        pfd.fd = serverFd;
+        pfd.events = POLLIN;
+        pfd.revents = 0;
+        if (poll(&pfd, 1, 0) > 0 && (pfd.revents & POLLIN)) {
+            const int fd = accept(serverFd, nullptr, nullptr);
+            if (fd >= 0) {
+                uint8_t freeId = 0;
+                for (uint8_t id = 1; id < MAX_PLAYERS && freeId == 0; ++id) {
+                    bool used = false;
+                    for (HostPeer* p : peers) if (p->id == id) used = true;
+                    if (!used) freeId = id;
                 }
+                if (freeId == 0) {
+                    close(fd);
+                } else {
+                    ConfigureLowLatencySocket(fd);
+                    fcntl(fd, F_SETFL, O_NONBLOCK);
+                    HostPeer* peer = new HostPeer();
+                    peer->fd = fd;
+                    peer->id = freeId;
+                    peer->dead = false;
+                    peer->buffered = 0;
 
-                VehicleSnapshotHeader header;
-                memcpy(
-                    &header,
-                    recvBuffer,
-                    sizeof(header)
-                );
-
-                if (header.count > VEHICLE_SNAPSHOT_MAX_COUNT) {
-                    g_IsConnected.store(false);
-                    break;
+                    SessionWelcomePacket welcome;
+                    memset(&welcome, 0, sizeof(welcome));
+                    welcome.type = PACKET_SESSION_WELCOME;
+                    welcome.ownerId = freeId;
+                    welcome.maxPlayers = MAX_PLAYERS;
+                    HostStatePacket hs;
+                    hs.type = PACKET_HOST_STATE;
+                    hs.inGame = g_LocalInGame.load() ? 1 : 0;
+                    if (!SendAllBytes(fd, &welcome, sizeof(welcome)) || !SendAllBytes(fd, &hs, sizeof(hs))) {
+                        close(fd);
+                        delete peer;
+                    } else {
+                        // Mevcut oyuncu listesini yeni gelene gonder.
+                        for (uint8_t id = 0; id < MAX_PLAYERS; ++id) {
+                            const std::string name = GetPlayerName(id);
+                            if (!name.empty() && id != freeId) sendPlayerInfo(id, name, peer);
+                        }
+                        peers.push_back(peer);
+                        g_IsConnected = true;
+                        ShowNativeToast("A player joined the room!");
+                        QueueAllCurrentAuthorities();
+                    }
                 }
-
-                packetSize =
-                    sizeof(VehicleSnapshotHeader) +
-                    ((size_t)header.count * sizeof(VehicleSnapshotEntry));
-            } else {
-                g_IsConnected.store(false);
-                break;
-            }
-
-            if (bufferedBytes < packetSize) break;
-
-            if (packetType == PACKET_SESSION_WELCOME) {
-                SessionWelcomePacket pkt;
-                memcpy(&pkt, recvBuffer, sizeof(pkt));
-                HandleSessionWelcome(pkt);
-            } else if (packetType == PACKET_PLAYER_INFO) {
-                PlayerInfoPacket pkt;
-                memcpy(&pkt, recvBuffer, sizeof(pkt));
-                HandlePlayerInfoPacket(pkt);
-            } else if (packetType == PACKET_HOST_STATE) {
-                HostStatePacket pkt;
-                memcpy(&pkt, recvBuffer, sizeof(pkt));
-                g_HostInGame.store(pkt.inGame != 0);
-            } else if (packetType == PACKET_SAVE_REQUEST) {
-                if (g_IsHost.load()) g_SaveCaptureRequested.store(true);
-            } else if (packetType == PACKET_SAVE_CHUNK) {
-                SaveChunkPacket pkt;
-                memcpy(&pkt, recvBuffer, sizeof(pkt));
-                HandleSaveChunk(pkt);
-            } else if (packetType == PACKET_CHAT) {
-                NetworkPacket pkt;
-                memcpy(&pkt, recvBuffer, sizeof(pkt));
-                pkt.senderName[sizeof(pkt.senderName) - 1] = '\0';
-                pkt.chatData[sizeof(pkt.chatData) - 1] = '\0';
-
-                std::string senderStr(pkt.senderName);
-                std::string msgStr(pkt.chatData);
-                std::string formattedMsg = senderStr + ": " + msgStr;
-
-                {
-                    std::lock_guard<std::mutex> lock(g_ChatMutex);
-                    g_ChatMessages.push_back(formattedMsg);
-                }
-
-                ShowNativeToast(formattedMsg);
-            } else if (packetType == PACKET_VEHICLE_POSITION) {
-                VehiclePositionPacket pkt;
-                memcpy(&pkt, recvBuffer, sizeof(pkt));
-                HandleVehiclePositionPacket(pkt);
-            } else if (packetType == PACKET_VEHICLE_SNAPSHOT) {
-                VehicleSnapshotHeader header;
-                memcpy(
-                    &header,
-                    recvBuffer,
-                    sizeof(header)
-                );
-
-                HandleVehicleSnapshotPacket(
-                    header,
-                    recvBuffer + sizeof(header)
-                );
-            } else if (packetType == PACKET_VEHICLE_CLAIM) {
-                VehicleClaimPacket pkt;
-                memcpy(&pkt, recvBuffer, sizeof(pkt));
-                HandleVehicleClaimPacket(pkt);
-            } else if (packetType == PACKET_VEHICLE_AUTHORITY) {
-                VehicleAuthorityPacket pkt;
-                memcpy(&pkt, recvBuffer, sizeof(pkt));
-                HandleVehicleAuthorityPacket(pkt);
-            } else if (packetType == PACKET_VEHICLE_RELEASE) {
-                VehicleReleasePacket pkt;
-                memcpy(&pkt, recvBuffer, sizeof(pkt));
-                HandleVehicleReleasePacket(pkt);
-            }
-
-            bufferedBytes -= packetSize;
-            if (bufferedBytes > 0) {
-                memmove(recvBuffer, recvBuffer + packetSize, bufferedBytes);
             }
         }
 
-        if (g_IsHost.load()) {
+        // 2) Oyunculardan gelenleri al, isle, digerlerine ilet.
+        for (size_t i = 0; i < peers.size(); ++i) {
+            HostPeer* p = peers[i];
+            if (p->dead) continue;
+            if (p->buffered < sizeof(p->buf)) {
+                const ssize_t n = recv(p->fd, p->buf + p->buffered, sizeof(p->buf) - p->buffered, 0);
+                if (n > 0) p->buffered += (size_t)n;
+                else if (n == 0) p->dead = true;
+                else if (errno != EWOULDBLOCK && errno != EAGAIN && errno != EINTR) p->dead = true;
+            }
+            if (p->dead) continue;
+            relay.clear();
+            if (!ProcessPackets(p->buf, p->buffered, p->id, &relay)) { p->dead = true; continue; }
+            if (!relay.empty()) broadcast(relay.data(), relay.size(), p);
+        }
+
+        // 3) Host'un kendi giden verisi: hepsine yayinla.
+        if (!peers.empty()) {
             const int cur = g_LocalInGame.load() ? 1 : 0;
             if (cur != lastSentInGame) {
                 HostStatePacket hs;
                 hs.type = PACKET_HOST_STATE;
                 hs.inGame = (uint8_t)cur;
-                if (!SendAllBytes(g_TcpSocket, &hs, sizeof(hs))) {
-                    g_IsConnected.store(false);
-                    break;
-                }
+                broadcast(&hs, sizeof(hs), nullptr);
                 lastSentInGame = cur;
             }
-        }
+            out.clear();
+            BuildOutgoing(out);
+            if (!out.empty()) broadcast(out.data(), out.size(), nullptr);
 
-        if (!g_IsHost.load() && g_SaveRequestOut.exchange(false)) {
-            SaveRequestPacket rq;
-            rq.type = PACKET_SAVE_REQUEST;
-            if (!SendAllBytes(g_TcpSocket, &rq, sizeof(rq))) {
-                g_IsConnected.store(false);
-                break;
-            }
-        }
-
-        if (g_IsHost.load() && g_HostBlobReady.load()) {
-            std::vector<uint8_t> blob;
-            uint32_t version = 0;
-            {
-                std::lock_guard<std::mutex> lock(g_SaveBlobMutex);
-                blob.swap(g_HostBlob);
-                version = g_HostBlobVersion;
-                g_HostBlobReady.store(false);
-            }
-            bool sendOk = true;
-            for (size_t off = 0; off < blob.size() && sendOk; off += SAVE_CHUNK_DATA) {
-                SaveChunkPacket c;
-                memset(&c, 0, sizeof(c));
-                c.type = PACKET_SAVE_CHUNK;
-                c.total = (uint32_t)blob.size();
-                c.offset = (uint32_t)off;
-                c.version = version;
-                c.len = (uint16_t)std::min<size_t>(SAVE_CHUNK_DATA, blob.size() - off);
-                memcpy(c.data, blob.data() + off, c.len);
-                sendOk = SendAllBytes(g_TcpSocket, &c, sizeof(c));
-            }
-            if (!sendOk) {
-                g_IsConnected.store(false);
-                break;
-            }
-        }
-
-        std::string outMsg;
-        bool hasOutMsg = false;
-        {
-            std::lock_guard<std::mutex> lock(g_OutgoingChatMutex);
-            if (!g_OutgoingChats.empty()) {
-                outMsg = g_OutgoingChats.front();
-                g_OutgoingChats.erase(g_OutgoingChats.begin());
-                hasOutMsg = true;
-            }
-        }
-
-        if (hasOutMsg && g_IsConnected.load()) {
-            NetworkPacket outPkt;
-            memset(&outPkt, 0, sizeof(outPkt));
-            outPkt.type = PACKET_CHAT;
-            strncpy(outPkt.senderName, g_Nickname, sizeof(outPkt.senderName) - 1);
-            strncpy(outPkt.chatData, outMsg.c_str(), sizeof(outPkt.chatData) - 1);
-            if (!SendAllBytes(g_TcpSocket, &outPkt, sizeof(outPkt))) {
-                g_IsConnected.store(false);
-                break;
-            }
-        }
-
-        if (g_IsConnected.load()) {
-            VehicleClaimPacket claimPkt;
-            bool hasClaim = false;
-            {
-                std::lock_guard<std::mutex> lock(g_VehicleSendMutex);
-                if (g_HasPendingClaimPacket) {
-                    claimPkt = g_PendingClaimPacket;
-                    g_HasPendingClaimPacket = false;
-                    hasClaim = true;
-                }
-            }
-
-            if (hasClaim) {
-                if (!SendAllBytes(g_TcpSocket, &claimPkt, sizeof(claimPkt))) {
-                    g_IsConnected.store(false);
-                    break;
-                }
-            }
-        }
-
-        if (g_IsConnected.load()) {
-            VehicleReleasePacket releasePkt;
-            bool hasRelease = false;
-            {
-                std::lock_guard<std::mutex> lock(g_VehicleSendMutex);
-                if (g_HasPendingReleasePacket) {
-                    releasePkt = g_PendingReleasePacket;
-                    g_HasPendingReleasePacket = false;
-                    hasRelease = true;
-                }
-            }
-
-            if (hasRelease) {
-                if (!SendAllBytes(g_TcpSocket, &releasePkt, sizeof(releasePkt))) {
-                    g_IsConnected.store(false);
-                    break;
-                }
-            }
-        }
-
-        if (g_IsConnected.load()) {
-            std::vector<VehicleAuthorityPacket> authorityPackets;
-            {
-                std::lock_guard<std::mutex> lock(g_VehicleSendMutex);
-                authorityPackets.swap(g_PendingAuthorityPackets);
-            }
-
-            for (size_t i = 0; i < authorityPackets.size() && g_IsConnected.load(); ++i) {
-                if (!SendAllBytes(g_TcpSocket, &authorityPackets[i], sizeof(authorityPackets[i]))) {
-                    g_IsConnected.store(false);
-                    break;
-                }
-            }
-        }
-
-        // Vehicle network traffic is capped at 30 snapshots/sec.
-        // All changed local vehicle states are packed into one TCP message.
-        if (g_IsConnected.load()) {
-            const uint64_t nowMs = GetMonotonicMilliseconds();
-
-            if (g_LastVehicleNetworkSendMs == 0 ||
-                (nowMs - g_LastVehicleNetworkSendMs) >= VEHICLE_NETWORK_INTERVAL_MS) {
-
-                std::vector<VehicleSnapshotEntry> entries;
-                entries.reserve(VEHICLE_SNAPSHOT_MAX_COUNT);
-
+            // Host kaydi: sadece isteyen oyuncuya parca parca gonder.
+            if (g_HostBlobReady.load()) {
+                std::vector<uint8_t> blob;
+                uint32_t version = 0;
                 {
-                    std::lock_guard<std::mutex> lock(g_VehicleSendMutex);
-
-                    for (uint16_t vehicleId = 0;
-                         vehicleId < VEHICLE_SLOT_LIMIT &&
-                         entries.size() < VEHICLE_SNAPSHOT_MAX_COUNT;
-                         ++vehicleId) {
-
-                        if (!g_HasLatestOutgoingVehicle[vehicleId]) {
-                            continue;
-                        }
-
-                        const VehiclePositionPacket& srcPkt =
-                            g_LatestOutgoingVehicles[vehicleId];
-
-                        VehicleSnapshotEntry entry;
-                        memset(&entry, 0, sizeof(entry));
-
-                        entry.vehicleId = srcPkt.vehicleId;
-                        entry.x = srcPkt.x;
-                        entry.y = srcPkt.y;
-                        entry.angle = srcPkt.angle;
-                        entry.sequence = srcPkt.sequence;
-                        entry.moving = srcPkt.moving;
-
-                        entries.push_back(entry);
-                        g_HasLatestOutgoingVehicle[vehicleId] = false; // sent once, not repeated
+                    std::lock_guard<std::mutex> lock(g_SaveBlobMutex);
+                    blob.swap(g_HostBlob);
+                    version = g_HostBlobVersion;
+                    g_HostBlobReady.store(false);
+                }
+                const int target = g_SaveRequestPeer.load();
+                for (HostPeer* p : peers) {
+                    if (p->dead || p->id != target) continue;
+                    for (size_t off = 0; off < blob.size() && !p->dead; off += SAVE_CHUNK_DATA) {
+                        SaveChunkPacket c;
+                        memset(&c, 0, sizeof(c));
+                        c.type = PACKET_SAVE_CHUNK;
+                        c.total = (uint32_t)blob.size();
+                        c.offset = (uint32_t)off;
+                        c.version = version;
+                        c.len = (uint16_t)std::min<size_t>(SAVE_CHUNK_DATA, blob.size() - off);
+                        memcpy(c.data, blob.data() + off, c.len);
+                        if (!SendAllBytes(p->fd, &c, sizeof(c))) p->dead = true;
                     }
                 }
-
-                if (!entries.empty()) {
-                    VehicleSnapshotHeader header;
-                    memset(&header, 0, sizeof(header));
-
-                    header.type = PACKET_VEHICLE_SNAPSHOT;
-                    header.ownerId = g_LocalPlayerId.load();
-                    header.count = (uint8_t)entries.size();
-                    header.sequence = (uint32_t)nowMs;
-
-                    std::vector<uint8_t> snapshotBuffer;
-                    snapshotBuffer.resize(
-                        sizeof(header) +
-                        (entries.size() * sizeof(VehicleSnapshotEntry))
-                    );
-
-                    memcpy(
-                        snapshotBuffer.data(),
-                        &header,
-                        sizeof(header)
-                    );
-
-                    memcpy(
-                        snapshotBuffer.data() + sizeof(header),
-                        entries.data(),
-                        entries.size() * sizeof(VehicleSnapshotEntry)
-                    );
-
-                    if (!SendAllBytes(
-                            g_TcpSocket,
-                            snapshotBuffer.data(),
-                            snapshotBuffer.size()
-                        )) {
-
-                        g_IsConnected.store(false);
-                        break;
-                    }
-                }
-
-                g_LastVehicleNetworkSendMs = nowMs;
             }
+        }
+
+        // 4) Ayrilan oyunculari temizle: araclari birakilir, isim silinir, herkese duyurulur.
+        for (size_t i = 0; i < peers.size();) {
+            HostPeer* p = peers[i];
+            if (!p->dead) { ++i; continue; }
+            const uint8_t id = p->id;
+            shutdown(p->fd, SHUT_RDWR);
+            close(p->fd);
+            peers.erase(peers.begin() + i);
+            delete p;
+
+            std::vector<uint16_t> owned;
+            {
+                std::lock_guard<std::mutex> lock(g_VehicleStateMutex);
+                for (uint16_t v = 0; v < VEHICLE_SLOT_LIMIT; ++v)
+                    if (g_VehicleAuthority[v].ownerId == id) owned.push_back(v);
+            }
+            for (uint16_t v : owned) ReleaseVehicleAuthority(v, id, true);
+            const std::string leftName = GetPlayerName(id);
+            SetPlayerName(id, "");
+            sendPlayerInfo(id, "", nullptr);
+            ShowNativeToast((leftName.empty() ? std::string("A player") : leftName) + " left the room.");
+        }
+
+        if (peers.empty()) {
+            if (g_IsConnected.load()) {
+                g_IsConnected = false;
+                ClearChat();
+                ResetVehicleSyncState();
+                lastSentInGame = -1;
+            }
+            g_ConnectedStatus = "Host Started. Waiting for players...";
+        } else {
+            char st[48];
+            snprintf(st, sizeof(st), "%d player(s) connected", (int)peers.size());
+            g_ConnectedStatus = st;
         }
 
         std::this_thread::sleep_for(std::chrono::milliseconds(1));
     }
+
+    for (HostPeer* p : peers) { shutdown(p->fd, SHUT_RDWR); close(p->fd); delete p; }
 }
 
 void StartPONGResponderThread() {
@@ -2156,6 +2197,7 @@ void StartLANDiscoveryThread() {
 }
 
 void TCPHostThread() {
+    const int gen = ++g_HostGen;
     ResetVehicleSyncState();
     ResetPlayerNames();
     g_LocalPlayerId.store(0);
@@ -2168,54 +2210,32 @@ void TCPHostThread() {
         return;
     }
 
-    g_TcpServerFd = socket(AF_INET, SOCK_STREAM, 0);
+    const int serverFd = socket(AF_INET, SOCK_STREAM, 0);
     int opt = 1;
-    setsockopt(g_TcpServerFd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+    setsockopt(serverFd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
     struct sockaddr_in address;
+    memset(&address, 0, sizeof(address));
     address.sin_family = AF_INET;
     address.sin_addr.s_addr = INADDR_ANY;
     address.sin_port = htons(TCP_SYNC_PORT);
-    bind(g_TcpServerFd, (struct sockaddr*)&address, sizeof(address));
-    listen(g_TcpServerFd, 3);
-    
-    g_ConnectedStatus = "Host Started. Waiting for client...";
-    ShowNativeToast("Room Created. Waiting for client...");
-    int addrlen = sizeof(address);
-    
-    g_TcpSocket = accept(g_TcpServerFd, (struct sockaddr*)&address, (socklen_t*)&addrlen);
-    ConfigureLowLatencySocket(g_TcpSocket);
-    
-    if (g_TcpSocket >= 0 && g_IsHost) {
-        SessionWelcomePacket welcome;
-        memset(&welcome, 0, sizeof(welcome));
-        welcome.type = PACKET_SESSION_WELCOME;
-        welcome.ownerId = 1;
-        welcome.maxPlayers = MAX_PLAYERS;
-
-        if (!SendAllBytes(g_TcpSocket, &welcome, sizeof(welcome))) {
-            ShowNativeToast("Error: Failed to initialize multiplayer session.");
-            g_ConnectedStatus = "Connection Error";
-        } else {
-            g_IsConnected = true;
-            g_ConnectedStatus = "Client Connected!";
-            ShowNativeToast("Client Joined the Room!");
-
-            // Share the host name immediately so the client can show real names.
-            PlayerInfoPacket hostInfo;
-            memset(&hostInfo, 0, sizeof(hostInfo));
-            hostInfo.type = PACKET_PLAYER_INFO;
-            hostInfo.playerId = 0;
-            strncpy(hostInfo.playerName, g_Nickname, sizeof(hostInfo.playerName) - 1);
-            SendAllBytes(g_TcpSocket, &hostInfo, sizeof(hostInfo));
-
-            QueueAllCurrentAuthorities();
-            NetworkLoop();
-        }
+    if (serverFd < 0 || bind(serverFd, (struct sockaddr*)&address, sizeof(address)) < 0 ||
+        listen(serverFd, MAX_PLAYERS) < 0) {
+        ShowNativeToast("Error: Could not open the room!");
+        g_ConnectedStatus = "Connection Error";
+        if (serverFd >= 0) close(serverFd);
+        g_IsHost = false;
+        return;
     }
-    
-    if (g_TcpSocket >= 0) { shutdown(g_TcpSocket, SHUT_RDWR); close(g_TcpSocket); g_TcpSocket = -1; }
-    if (g_TcpServerFd >= 0) { shutdown(g_TcpServerFd, SHUT_RDWR); close(g_TcpServerFd); g_TcpServerFd = -1; }
-    
+    g_TcpServerFd = serverFd;
+
+    g_ConnectedStatus = "Host Started. Waiting for players...";
+    ShowNativeToast("Room Created. Waiting for players...");
+
+    HostNetworkLoop(serverFd, gen);
+
+    close(serverFd);
+    if (g_HostGen.load() != gen) return;     // arada yeni oda acildi: ortak durumu bozma
+    g_TcpServerFd = -1;
     g_IsConnected = false;
     g_IsHost = false;
     ClearChat();
@@ -2505,7 +2525,7 @@ static void PlayGameClickSound() {
 }
 
 static bool DrawGameStyleButton(const char* id, const char* label, ImVec2 size,
-                                float textScale = 1.0f, bool rightAligned = false) {
+                                float textScale = 1.0f, bool rightAligned = false, bool playSound = true) {
     ImVec2 pos = ImGui::GetCursorScreenPos();
 
     // Görselin tamamını tıklanabilir yap: texture maskesi dokunma alanını daraltmasın.
@@ -2514,7 +2534,7 @@ static bool DrawGameStyleButton(const char* id, const char* label, ImVec2 size,
     const bool hovered = ImGui::IsItemHovered();
     const bool active = hovered && ImGui::IsItemActive();
     const bool clicked = ImGui::IsItemClicked(ImGuiMouseButton_Left);
-    if (clicked) PlayGameClickSound();
+    if (clicked && playSound) PlayGameClickSound();
 
     ImGui::SetCursorScreenPos(pos);
 
@@ -2745,13 +2765,17 @@ static void DrawTypingBar(const ImVec2& screen) {
 // Kullanici adi alani. editable=false ise salt-okunur (dokunma / klavye yok).
 // Oda tablosu: oda adi, oyuncu sayisi ve oyuncu satirlari (Host / Client).
 static void DrawRoomTable(float width) {
-    const std::string names[2] = { GetPlayerName(0), GetPlayerName(1) };
-    const int count = (names[0].empty() ? 0 : 1) + (names[1].empty() ? 0 : 1);
+    std::string names[MAX_PLAYERS];
+    int count = 0;
+    for (int i = 0; i < MAX_PLAYERS; ++i) {
+        names[i] = GetPlayerName((uint8_t)i);
+        if (!names[i].empty()) ++count;
+    }
     ImFont* font = g_GameUIFont ? g_GameUIFont : ImGui::GetFont();
     ImDrawList* d = ImGui::GetWindowDrawList();
     const ImVec2 p = ImGui::GetCursorScreenPos();
-    const float headH = 52.0f, rowH = 46.0f, pad = 14.0f, fs = 27.0f;
-    const float h = headH + rowH * 2.0f;
+    const float headH = 52.0f, rowH = 42.0f, pad = 14.0f, fs = 26.0f;
+    const float h = headH + rowH * MAX_PLAYERS;
     DrawGamePanel(p, ImVec2(p.x + width, p.y + h), 112);
     d->PushClipRect(p, ImVec2(p.x + width, p.y + h), true);
 
@@ -2759,14 +2783,14 @@ static void DrawRoomTable(float width) {
     const float headY = p.y + (headH - fs) * 0.5f;
     d->AddText(font, fs, ImVec2(p.x + pad, headY), IM_COL32(130, 225, 245, 255), room.c_str());
     char cnt[24];
-    snprintf(cnt, sizeof(cnt), "Players %d/2", count);
+    snprintf(cnt, sizeof(cnt), "Players %d/%d", count, (int)MAX_PLAYERS);
     const float cw = font->CalcTextSizeA(fs, FLT_MAX, 0.0f, cnt).x;
     d->AddText(font, fs, ImVec2(p.x + width - pad - cw, headY), IM_COL32(245, 245, 245, 255), cnt);
     d->AddLine(ImVec2(p.x, p.y + headH), ImVec2(p.x + width, p.y + headH), IM_COL32(255, 255, 255, 40), 1.0f);
 
-    static const char* kRoles[2] = { "Host", "Client" };
-    for (int i = 0; i < 2; ++i) {
-        const float y = p.y + headH + rowH * i + (rowH - fs) * 0.5f;
+    for (int i = 0; i < MAX_PLAYERS; ++i) {
+        const float rowTop = p.y + headH + rowH * i;
+        const float y = rowTop + (rowH - fs) * 0.5f;
         const bool empty = names[i].empty();
         char idx[8];
         snprintf(idx, sizeof(idx), "%d", i + 1);
@@ -2775,12 +2799,13 @@ static void DrawRoomTable(float width) {
                    empty ? IM_COL32(130, 138, 145, 255) : IM_COL32(245, 245, 245, 255),
                    empty ? "Waiting for player..." : names[i].c_str());
         if (!empty) {   // rol, oyuncu baglanmadan gosterilmez
-            const float rw = font->CalcTextSizeA(fs, FLT_MAX, 0.0f, kRoles[i]).x;
-            d->AddText(font, fs, ImVec2(p.x + width - pad - rw, y), IM_COL32(150, 160, 168, 255), kRoles[i]);
+            const char* role = (i == 0) ? "Host" : "Client";
+            const float rw = font->CalcTextSizeA(fs, FLT_MAX, 0.0f, role).x;
+            d->AddText(font, fs, ImVec2(p.x + width - pad - rw, y), IM_COL32(150, 160, 168, 255), role);
         }
-        if (i == 0) d->AddLine(ImVec2(p.x + pad, p.y + headH + rowH),
-                               ImVec2(p.x + width - pad, p.y + headH + rowH),
-                               IM_COL32(255, 255, 255, 24), 1.0f);
+        if (i + 1 < MAX_PLAYERS)
+            d->AddLine(ImVec2(p.x + pad, rowTop + rowH), ImVec2(p.x + width - pad, rowTop + rowH),
+                       IM_COL32(255, 255, 255, 24), 1.0f);
     }
     d->PopClipRect();
     ImGui::Dummy(ImVec2(width, h));
@@ -2895,7 +2920,10 @@ static int DrawChoiceMenu(const char* windowId, const char* title,
     char backId[48];
     snprintf(backId, sizeof(backId), "##%s_back", windowId);
     ImGui::SetCursorPos(ImVec2(-10.0f, screen.y - backH - bottomMargin));
-    if (DrawGameStyleButton(backId, "Back", ImVec2(backW, backH), 1.34f, false)) {
+    // Mod menusunden Back oyunun kendi geri akisini tetikler ve oyun kendi sesini calar:
+    // cift ses olmasin diye burada mod sesi kapali. (LAN menusu oyuna donmez, sesi kalir.)
+    const bool backToTitle = (strcmp(windowId, "##ModeSelectRoot") == 0);
+    if (DrawGameStyleButton(backId, "Back", ImVec2(backW, backH), 1.34f, false, !backToTitle)) {
         backClicked = true;
     }
 
@@ -2941,18 +2969,8 @@ static void ClientLeaveRoom() {
 // Host odayi kapatir (Close Room butonu ve host oyundan cikinca). Client'in baglantisi kopar.
 static void HostCloseRoom() {
     ClearChat();
-    g_IsHost = false;
+    g_IsHost = false;          // host dongusu soketleri kendisi kapatir, oyuncularin baglantisi kopar
     g_IsConnected = false;
-    if (g_TcpServerFd >= 0) {
-        shutdown(g_TcpServerFd, SHUT_RDWR);
-        close(g_TcpServerFd);
-        g_TcpServerFd = -1;
-    }
-    if (g_TcpSocket >= 0) {
-        shutdown(g_TcpSocket, SHUT_RDWR);
-        close(g_TcpSocket);
-        g_TcpSocket = -1;
-    }
     g_ConnectedStatus = "Room Closed.";
 }
 
