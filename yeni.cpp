@@ -65,6 +65,7 @@ bool g_ShowModeSelect = false;   // Offline / LAN / Server menusu
 bool g_ShowLanChoice  = false;   // Create Room / Join Room menusu
 enum MpView { MPV_ROOM = 0, MPV_BROWSER = 1 };
 MpView g_MpView = MPV_BROWSER;   // g_IsMultiplayerMenuActive iken hangi ekran cizilir
+bool g_ReturnToMp = false;       // Select a file'da Back -> Multiplayer menusune don (host Play / client Join)
 bool g_MpFromLan = false;        // Room/Browser LAN menusunden mi acildi? (Back davranisi icin)
 static long long g_LastSaveMenuRenderMs = 0;   // my_renderMenu'nun en son calistigi an
 static long long g_LastServerToastMs = 0;      // Server butonu toast spam korumasi
@@ -136,6 +137,28 @@ std::atomic<bool> g_IsClient(false);
 std::atomic<bool> g_IsConnected(false);
 std::atomic<bool> g_HostInGame(false);   // client tarafi: host oyuna girdi mi?
 std::atomic<bool> g_LocalInGame(false);  // bu cihaz oyunda mi (Game durumu 6/7)
+
+// ---- Host kaydini client'a aktarma (hicbir dosyaya yazilmaz, sadece bellekte tutulur)
+static std::mutex g_SaveBlobMutex;
+static std::atomic<bool> g_SaveRequestOut(false);        // client: host'tan kayit iste
+static std::atomic<bool> g_SaveCaptureRequested(false);  // host: oyun thread'i kaydi alsin
+static std::atomic<bool> g_HostBlobReady(false);         // host: gonderilecek kayit hazir
+static std::vector<uint8_t> g_HostBlob;
+static uint32_t g_HostBlobVersion = 0;
+static std::vector<uint8_t> g_RecvSave;                  // client: parcalar burada birlesir
+static size_t g_RecvSaveGot = 0;
+static uint32_t g_RecvSaveVersion = 0;
+static std::atomic<int> g_SaveProgress(-1);              // client: -1 yok, 0..99 iniyor, 100 tamam
+static std::atomic<long long> g_SaveRequestMs(0);
+static std::atomic<bool> g_ClientSaveReady(false);       // client: kayit indi
+static std::vector<uint8_t> g_ClientSave;                // client: oyuna yuklenecek host kaydi
+static uint32_t g_ClientSaveVersion = 0;
+static std::atomic<bool> g_UseHostSave(false);           // loadSavegame host kaydini kullansin
+static std::atomic<bool> g_CaptureNext(false);           // host: saveFile cagrisini yakala
+static std::vector<uint8_t> g_CaptureBuf;
+static void* g_SaveStartTaskFn = nullptr;                // SaveGames::startTask
+static bool g_SaveHooksOk = false;                       // saveFile + loadSavegame baglandi
+static int g_RestoreSlot = -1;                           // gecici "kayit var" bayragi geri alinacak slot
 
 // SOCKETS
 int g_TcpServerFd = -1; 
@@ -256,6 +279,7 @@ void AutoStartGameForClient() {
     g_ShowLanChoice = false;
     g_ShowModeSelect = false;
     g_PendingTouchDown.store(false);
+    g_ReturnToMp = true;
     g_AutoStartUntilMs.store(NowMs() + 20000);
     g_ClientPlaying.store(true);
 }
@@ -282,11 +306,62 @@ GameUpdate_t orig_GameUpdate = nullptr;
 typedef void (*SaveStartTask_t)(void* thiz, int cmd, unsigned int slot, int sync);
 static SaveStartTask_t orig_SaveStartTask = nullptr;
 static void my_SaveStartTask(void* thiz, int cmd, unsigned int slot, int sync) {
-    if (cmd == 3 && g_IsClient.load() && g_IsConnected.load()) {
-        ShowNativeToast("Only the host can save the game.");
+    // 3 = slota kaydet, 5 = gecici kayit (host dunyasi client'ta diske yazilmasin)
+    if ((cmd == 3 || cmd == 5) && (g_ClientPlaying.load() || (g_IsClient.load() && g_IsConnected.load()))) {
+        if (cmd == 3) ShowNativeToast("Only the host can save the game.");
         return;
     }
     if (orig_SaveStartTask) orig_SaveStartTask(thiz, cmd, slot, sync);
+}
+
+// Host: oyunun kendi gecici kayit akisi (task 5) calisirken saveFile'a giden veriyi yakala.
+typedef int (*SaveFile_t)(void* dev, const char* name, unsigned char* buf, unsigned int size);
+static SaveFile_t orig_SaveFile = nullptr;
+static int my_SaveFile(void* dev, const char* name, unsigned char* buf, unsigned int size) {
+    if (g_CaptureNext.load() && buf && size > 4096 && g_CaptureBuf.empty())
+        g_CaptureBuf.assign(buf, buf + size);
+    return orig_SaveFile ? orig_SaveFile(dev, name, buf, size) : 0;
+}
+
+// Client: Join Game ile baslayan yukleme sirasinda slot dosyasi yerine host kaydini yukle.
+typedef int (*LoadSavegame_t)(void* thiz, const char* name, unsigned int crc, unsigned int ver);
+static LoadSavegame_t orig_LoadSavegame = nullptr;
+static int my_LoadSavegame(void* thiz, const char* name, unsigned int crc, unsigned int ver) {
+    if (g_UseHostSave.load()) {
+        std::vector<uint8_t> copy;
+        uint32_t version = 0;
+        {
+            std::lock_guard<std::mutex> lock(g_SaveBlobMutex);
+            copy = g_ClientSave;
+            version = g_ClientSaveVersion;
+        }
+        void* cb = *(void**)((uintptr_t)thiz + 0x60);          // AppSaveGameCallbackInterface
+        if (cb && !copy.empty()) {
+            typedef void (*Deserialize_t)(void*, const void*, unsigned int, int, unsigned int);
+            Deserialize_t fn = (Deserialize_t)(*(void***)cb)[3];
+            fn(cb, copy.data(), (unsigned int)copy.size(), 0, version);
+            return 1;
+        }
+    }
+    return orig_LoadSavegame ? orig_LoadSavegame(thiz, name, crc, ver) : 0;
+}
+
+// Host: oyun thread'inde client'in istedigi kaydi al (game+0xa374 = SaveGames).
+static void HostCaptureSaveIfRequested() {
+    if (!g_SaveCaptureRequested.exchange(false)) return;
+    if (g_EngineInstance == 0 || !g_SaveStartTaskFn || !g_SaveHooksOk) return;
+    const int st = *(volatile int*)(g_EngineInstance + 0x64);
+    if (st != 6 && st != 7) return;
+    const uintptr_t sg = g_EngineInstance + 0xa374;
+    g_CaptureBuf.clear();
+    g_CaptureNext.store(true);
+    ((SaveStartTask_t)g_SaveStartTaskFn)((void*)sg, 5, *(volatile unsigned int*)(g_EngineInstance + 0xa3f0), 1);
+    g_CaptureNext.store(false);
+    if (g_CaptureBuf.empty()) return;
+    std::lock_guard<std::mutex> lock(g_SaveBlobMutex);
+    g_HostBlob.swap(g_CaptureBuf);
+    g_HostBlobVersion = *(volatile unsigned int*)(sg + 0x58);
+    g_HostBlobReady.store(true);
 }
 
 typedef void (*GameUpdateStateBase_t)(void* thiz, float param_1, uint32_t param_2, uint32_t param_3, uint32_t param_4);
@@ -317,6 +392,8 @@ static const uint8_t PACKET_VEHICLE_RELEASE = 6;
 static const uint8_t PACKET_VEHICLE_SNAPSHOT = 7;
 static const uint8_t PACKET_PLAYER_INFO = 8;
 static const uint8_t PACKET_HOST_STATE = 9;   // host oyunda mi?
+static const uint8_t PACKET_SAVE_REQUEST = 10; // client -> host: kaydi gonder
+static const uint8_t PACKET_SAVE_CHUNK = 11;   // host -> client: kayit parcasi
 
 static const uint8_t MAX_PLAYERS = 4;
 static const uint16_t VEHICLE_ID_INVALID = 0xFFFF;
@@ -360,6 +437,20 @@ struct PlayerInfoPacket {
 struct HostStatePacket {
     uint8_t type;
     uint8_t inGame;
+};
+
+struct SaveRequestPacket {
+    uint8_t type;
+};
+
+static const uint16_t SAVE_CHUNK_DATA = 1000;
+struct SaveChunkPacket {
+    uint8_t type;
+    uint32_t total;
+    uint32_t offset;
+    uint32_t version;
+    uint16_t len;
+    uint8_t data[SAVE_CHUNK_DATA];
 };
 
 struct NetworkPacket {
@@ -1123,6 +1214,31 @@ static void ApplyRemoteVehicleStates(uintptr_t game) {
     }
 }
 
+static void HandleSaveChunk(const SaveChunkPacket& p) {
+    if (g_IsHost.load()) return;
+    if (p.total == 0 || p.total > 4u * 1024u * 1024u || p.len > SAVE_CHUNK_DATA ||
+        p.offset + p.len > p.total) return;
+    if (p.offset == 0) {
+        g_RecvSave.assign(p.total, 0);
+        g_RecvSaveGot = 0;
+        g_RecvSaveVersion = p.version;
+    }
+    if (g_RecvSave.size() != p.total) return;
+    memcpy(g_RecvSave.data() + p.offset, p.data, p.len);
+    g_RecvSaveGot += p.len;
+    if (g_RecvSaveGot < p.total) {
+        g_SaveProgress.store((int)(g_RecvSaveGot * 99 / p.total));
+        return;
+    }
+    {
+        std::lock_guard<std::mutex> lock(g_SaveBlobMutex);
+        g_ClientSave.swap(g_RecvSave);
+        g_ClientSaveVersion = g_RecvSaveVersion;
+    }
+    g_SaveProgress.store(100);
+    g_ClientSaveReady.store(true);
+}
+
 static void HandleSessionWelcome(const SessionWelcomePacket& pkt) {
     if (pkt.ownerId >= MAX_PLAYERS) return;
     g_LocalPlayerId.store(pkt.ownerId);
@@ -1619,6 +1735,10 @@ void NetworkLoop() {
                 packetSize = sizeof(PlayerInfoPacket);
             } else if (packetType == PACKET_HOST_STATE) {
                 packetSize = sizeof(HostStatePacket);
+            } else if (packetType == PACKET_SAVE_REQUEST) {
+                packetSize = sizeof(SaveRequestPacket);
+            } else if (packetType == PACKET_SAVE_CHUNK) {
+                packetSize = sizeof(SaveChunkPacket);
             } else if (packetType == PACKET_CHAT) {
                 packetSize = sizeof(NetworkPacket);
             } else if (packetType == PACKET_VEHICLE_POSITION) {
@@ -1668,6 +1788,12 @@ void NetworkLoop() {
                 HostStatePacket pkt;
                 memcpy(&pkt, recvBuffer, sizeof(pkt));
                 g_HostInGame.store(pkt.inGame != 0);
+            } else if (packetType == PACKET_SAVE_REQUEST) {
+                if (g_IsHost.load()) g_SaveCaptureRequested.store(true);
+            } else if (packetType == PACKET_SAVE_CHUNK) {
+                SaveChunkPacket pkt;
+                memcpy(&pkt, recvBuffer, sizeof(pkt));
+                HandleSaveChunk(pkt);
             } else if (packetType == PACKET_CHAT) {
                 NetworkPacket pkt;
                 memcpy(&pkt, recvBuffer, sizeof(pkt));
@@ -1731,6 +1857,42 @@ void NetworkLoop() {
                     break;
                 }
                 lastSentInGame = cur;
+            }
+        }
+
+        if (!g_IsHost.load() && g_SaveRequestOut.exchange(false)) {
+            SaveRequestPacket rq;
+            rq.type = PACKET_SAVE_REQUEST;
+            if (!SendAllBytes(g_TcpSocket, &rq, sizeof(rq))) {
+                g_IsConnected.store(false);
+                break;
+            }
+        }
+
+        if (g_IsHost.load() && g_HostBlobReady.load()) {
+            std::vector<uint8_t> blob;
+            uint32_t version = 0;
+            {
+                std::lock_guard<std::mutex> lock(g_SaveBlobMutex);
+                blob.swap(g_HostBlob);
+                version = g_HostBlobVersion;
+                g_HostBlobReady.store(false);
+            }
+            bool sendOk = true;
+            for (size_t off = 0; off < blob.size() && sendOk; off += SAVE_CHUNK_DATA) {
+                SaveChunkPacket c;
+                memset(&c, 0, sizeof(c));
+                c.type = PACKET_SAVE_CHUNK;
+                c.total = (uint32_t)blob.size();
+                c.offset = (uint32_t)off;
+                c.version = version;
+                c.len = (uint16_t)std::min<size_t>(SAVE_CHUNK_DATA, blob.size() - off);
+                memcpy(c.data, blob.data() + off, c.len);
+                sendOk = SendAllBytes(g_TcpSocket, &c, sizeof(c));
+            }
+            if (!sendOk) {
+                g_IsConnected.store(false);
+                break;
             }
         }
 
@@ -2763,6 +2925,19 @@ static void MpGoBack() {
     g_PendingTouchDown.store(false);
 }
 
+// Client odadan ayrilir (Leave Room butonu ve client oyundan cikinca).
+static void ClientLeaveRoom() {
+    ClearChat();
+    g_IsClient = false;
+    g_IsConnected = false;
+    if (g_TcpSocket >= 0) {
+        shutdown(g_TcpSocket, SHUT_RDWR);
+        close(g_TcpSocket);
+        g_TcpSocket = -1;
+    }
+    g_ConnectedStatus = "Left the room.";
+}
+
 // Host odayi kapatir (Close Room butonu ve host oyundan cikinca). Client'in baglantisi kopar.
 static void HostCloseRoom() {
     ClearChat();
@@ -2788,6 +2963,7 @@ static void MpProceedToGame() {
     g_IsMultiplayerMenuActive = false;
     g_ShowLanChoice = false;
     g_ShowModeSelect = false;
+    g_ReturnToMp = true;
     g_PendingTouchDown.store(false);
 }
 
@@ -2852,6 +3028,7 @@ void DrawImGui() {
             MpGoBack();                               // -> baslik ekrani
         } else if (c == 0) {                          // Offline: orijinal "Select a file"
             g_OnlineMode = false;
+            g_ReturnToMp = false;
             g_ShowModeSelect = false;
             g_ShowLanChoice = false;
         } else if (c == 1) {                          // LAN: Create Room / Join Room secimi
@@ -3067,15 +3244,7 @@ void DrawImGui() {
             if (g_IsClient && g_IsConnected) {
                 if (DrawGameStyleButton("##LeaveRoom", "Leave Room",
                                         ImVec2(innerButtonW, innerButtonH), 1.30f, false)) {
-                    ClearChat();
-                    g_IsClient = false;
-                    g_IsConnected = false;
-                    if (g_TcpSocket >= 0) {
-                        shutdown(g_TcpSocket, SHUT_RDWR);
-                        close(g_TcpSocket);
-                        g_TcpSocket = -1;
-                    }
-                    g_ConnectedStatus = "Left the room.";
+                    ClientLeaveRoom();
                 }
             } else if (!g_IsHost) {
                 if (DrawGameStyleButton("##HostRoom", "Host Room",
@@ -3217,16 +3386,31 @@ void DrawImGui() {
                 // Disconnect artık yukarıdaki ana butondadır.
                 // Host oyuna girmeden Join Game calismaz.
                 const bool hostReady = g_HostInGame.load();
-                if (!hostReady) ImGui::BeginDisabled();
+                const int dl = g_SaveProgress.load();
+                const bool downloading = (dl >= 0 && dl < 100);
+                char joinLabel[40];
+                if (!hostReady) snprintf(joinLabel, sizeof(joinLabel), "Waiting for host...");
+                else if (downloading) snprintf(joinLabel, sizeof(joinLabel), "Downloading... %d%%", dl);
+                else snprintf(joinLabel, sizeof(joinLabel), "Join Game");
+                const bool joinDisabled = !hostReady || downloading;
+                if (joinDisabled) ImGui::BeginDisabled();
                 if (DrawGameStyleButton(
                         "##JoinGame",
-                        hostReady ? "Join Game" : "Waiting for host...",
+                        joinLabel,
                         ImVec2(std::min(commonButtonW, infoW), commonButtonH),
                         1.20f,
-                        false) && hostReady) {
-                    AutoStartGameForClient();
+                        false) && !joinDisabled) {
+                    if (g_SaveHooksOk) {
+                        // Host'un o anki kaydi istenir; inince oyun otomatik acilir.
+                        g_ClientSaveReady.store(false);
+                        g_SaveProgress.store(0);
+                        g_SaveRequestMs.store(NowMs());
+                        g_SaveRequestOut.store(true);
+                    } else {
+                        AutoStartGameForClient();
+                    }
                 }
-                if (!hostReady) ImGui::EndDisabled();
+                if (joinDisabled) ImGui::EndDisabled();
             }
             ImGui::EndChild();
             ImGui::PopStyleVar();
@@ -3270,6 +3454,28 @@ void my_GameUpdate(void* thiz, float param_1) {
         const bool inGame = (st == 6 || st == 7);
         g_LocalInGame.store(inGame);
         if (s_prevInGame && !inGame && g_IsHost.load()) HostCloseRoom();
+        if (s_prevInGame && !inGame && g_IsClient.load() && g_IsConnected.load()) ClientLeaveRoom();
+        HostCaptureSaveIfRequested();
+
+        // Client: kayit indiyse oyunu baslat; baglanti kopar / host cevap vermezse indirmeyi iptal et.
+        if (g_ClientSaveReady.exchange(false)) {
+            g_UseHostSave.store(true);
+            AutoStartGameForClient();
+        }
+        const int dl = g_SaveProgress.load();
+        if (dl >= 0 && dl < 100 &&
+            (!g_IsConnected.load() || NowMs() - g_SaveRequestMs.load() > 15000)) {
+            g_SaveProgress.store(-1);
+            ShowNativeToast("Could not download the host's game.");
+        }
+        if (dl == 100 && !g_ClientPlaying.load()) g_SaveProgress.store(-1);
+
+        // Gecici "kayit var" bayragini geri al (kalici hale gelmesin).
+        if (g_RestoreSlot >= 0 && (st == 6 || g_AutoStartUntilMs.load() == 0)) {
+            *(volatile uint8_t*)((uintptr_t)thiz + 0xa374 + g_RestoreSlot * 0x18 + 8) = 0;
+            g_RestoreSlot = -1;
+        }
+        if (g_UseHostSave.load() && (st == 6 || g_AutoStartUntilMs.load() == 0)) g_UseHostSave.store(false);
         if (g_ClientPlaying.load()) {
             if (st == 1) {
                 g_ClientPlaying.store(false);                       // basliga donuldu
@@ -3328,8 +3534,28 @@ static void KickToTitleInject() {
     }
 }
 
+// "Select a file" ekraninda Back (dokunma ya da donanim tusu) basliga degil, bir onceki
+// mod penceresine (Mode select ya da Multiplayer menusu) goturur.
+static void SaveMenuBackIntercept() {
+    if (g_EngineInstance == 0) return;
+    const uintptr_t g = g_EngineInstance;
+    if (*(volatile int*)(g + 0x64) != 3 || *(volatile int*)(g + 0x68) != 0) return;
+    if (g_ShowModeSelect || g_ShowLanChoice || g_IsMultiplayerMenuActive) return;
+    if (g_AutoStartUntilMs.load() != 0 || g_KickUntilMs.load() != 0) return;
+    volatile int* clicked = (volatile int*)(g + 0x9c20);
+    const uintptr_t dev = *(volatile uintptr_t*)(g + 0x7c);
+    volatile uint8_t* backFlag = dev ? (volatile uint8_t*)(dev + 0xcc) : nullptr;
+    if (!(*clicked == 9 || (backFlag && *backFlag))) return;
+    *clicked = 0;
+    if (backFlag) *backFlag = 0;
+    if (g_ReturnToMp && g_MpFromLan) g_IsMultiplayerMenuActive = true;
+    else g_ShowModeSelect = true;
+    g_PendingTouchDown.store(false);
+}
+
 static void AutoStartInject() {
     KickToTitleInject();
+    SaveMenuBackIntercept();
     const long long until = g_AutoStartUntilMs.load();
     if (until == 0 || g_EngineInstance == 0) return;
     const uintptr_t g = g_EngineInstance;
@@ -3337,7 +3563,13 @@ static void AutoStartInject() {
     if (state == 6 || NowMs() > until) { g_AutoStartUntilMs.store(0); return; }
     if (*(volatile int*)(g + 0x68) != 0) return;          // yukleme / diyalog suruyor
     volatile int* clicked = (volatile int*)(g + 0x9c20);
-    if (state == 3) {                                      // kayit secme
+    if (state == 3 && g_UseHostSave.load()) {              // host kaydi: slot dosyasi okunmaz
+        int slot = *(volatile int*)(g + 0xa3f0);
+        if ((unsigned)slot > 2) slot = 0;
+        volatile uint8_t* exists = (volatile uint8_t*)(g + 0xa374 + slot * 0x18 + 8);
+        if (!*exists) { *exists = 1; g_RestoreSlot = slot; }
+        *clicked = 10 + slot;
+    } else if (state == 3) {                               // kayit secme
         int slot = *(volatile int*)(g + 0xa3f0);           // son kullanilan slot
         if ((unsigned)slot > 2 || !*(volatile uint8_t*)(g + 0x8a0c + slot)) {
             slot = 0;
@@ -3397,6 +3629,7 @@ void* my_renderMenu(void* thiz, void* p1, void* p2, void* p3) {
     const long long now = NowMs();
     if (now - g_LastSaveMenuRenderMs > 700 && !g_IsMultiplayerMenuActive && !g_ShowLanChoice) {
         g_ShowModeSelect = true;
+        g_ReturnToMp = false;
     }
     g_LastSaveMenuRenderMs = now;
 
@@ -3459,7 +3692,18 @@ void ModMain() {
         void* saveTask = dlsym(appLib, "_ZN9SaveGames9startTaskENS_17WorkerTaskCommandEjb");
         g_SwitchToStateStart = dlsym(appLib, "_ZN4Game18switchToStateStartEv");
         LOGI("startTask symbol: %p, switchToStateStart symbol: %p", saveTask, g_SwitchToStateStart);
-        if (saveTask) MSHookFunction(saveTask, (void*)my_SaveStartTask, (void**)&orig_SaveStartTask);
+        void* saveFile = dlsym(appLib, "_ZN27AndroidHandheldSystemDevice8saveFileEPKcPhj");
+        void* loadSave = dlsym(appLib, "_ZN9SaveGames12loadSavegameEPKcjj");
+        LOGI("saveFile symbol: %p, loadSavegame symbol: %p", saveFile, loadSave);
+        if (saveTask) {
+            g_SaveStartTaskFn = saveTask;
+            MSHookFunction(saveTask, (void*)my_SaveStartTask, (void**)&orig_SaveStartTask);
+        }
+        if (saveTask && saveFile && loadSave) {
+            MSHookFunction(saveFile, (void*)my_SaveFile, (void**)&orig_SaveFile);
+            MSHookFunction(loadSave, (void*)my_LoadSavegame, (void**)&orig_LoadSavegame);
+            g_SaveHooksOk = true;
+        }
         dlclose(appLib);
     }
 
