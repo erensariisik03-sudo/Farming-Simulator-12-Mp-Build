@@ -242,9 +242,17 @@ void ClearChat() {
     g_ClearChatInputPending.store(true);
 }
 
+// Client icin oyunu kayit/zorluk ekranlarini atlayarak baslatir. Asil is my_updateGUI icindeki
+// AutoStartInject()'te yapilir; burada sadece menuler kapatilir ve zaman penceresi acilir.
+static std::atomic<long long> g_AutoStartUntilMs(0);
+void CloseAndroidKeyboard();
 void AutoStartGameForClient() {
+    CloseAndroidKeyboard();
     g_IsMultiplayerMenuActive = false;
-    ShowNativeToast("Switching to game. Please start the game manually.");
+    g_ShowLanChoice = false;
+    g_ShowModeSelect = false;
+    g_PendingTouchDown.store(false);
+    g_AutoStartUntilMs.store(NowMs() + 20000);
 }
 
 // ========================================================================
@@ -2529,6 +2537,47 @@ static void DrawTypingBar(const ImVec2& screen) {
 // MODE SELECT MENU  (Offline / LAN / Server)
 // ========================================================================
 // Kullanici adi alani. editable=false ise salt-okunur (dokunma / klavye yok).
+// Oda tablosu: oda adi, oyuncu sayisi ve oyuncu satirlari (Host / Client).
+static void DrawRoomTable(float width) {
+    const std::string names[2] = { GetPlayerName(0), GetPlayerName(1) };
+    const int count = (names[0].empty() ? 0 : 1) + (names[1].empty() ? 0 : 1);
+    ImFont* font = g_GameUIFont ? g_GameUIFont : ImGui::GetFont();
+    ImDrawList* d = ImGui::GetWindowDrawList();
+    const ImVec2 p = ImGui::GetCursorScreenPos();
+    const float headH = 52.0f, rowH = 46.0f, pad = 14.0f, fs = 27.0f;
+    const float h = headH + rowH * 2.0f;
+    DrawGamePanel(p, ImVec2(p.x + width, p.y + h), 112);
+    d->PushClipRect(p, ImVec2(p.x + width, p.y + h), true);
+
+    const std::string room = (names[0].empty() ? std::string(g_Nickname) : names[0]) + "'s Room";
+    const float headY = p.y + (headH - fs) * 0.5f;
+    d->AddText(font, fs, ImVec2(p.x + pad, headY), IM_COL32(130, 225, 245, 255), room.c_str());
+    char cnt[24];
+    snprintf(cnt, sizeof(cnt), "Players %d/2", count);
+    const float cw = font->CalcTextSizeA(fs, FLT_MAX, 0.0f, cnt).x;
+    d->AddText(font, fs, ImVec2(p.x + width - pad - cw, headY), IM_COL32(245, 245, 245, 255), cnt);
+    d->AddLine(ImVec2(p.x, p.y + headH), ImVec2(p.x + width, p.y + headH), IM_COL32(255, 255, 255, 40), 1.0f);
+
+    static const char* kRoles[2] = { "Host", "Client" };
+    for (int i = 0; i < 2; ++i) {
+        const float y = p.y + headH + rowH * i + (rowH - fs) * 0.5f;
+        const bool empty = names[i].empty();
+        char idx[8];
+        snprintf(idx, sizeof(idx), "%d", i + 1);
+        d->AddText(font, fs, ImVec2(p.x + pad, y), IM_COL32(150, 160, 168, 255), idx);
+        d->AddText(font, fs, ImVec2(p.x + pad + 40.0f, y),
+                   empty ? IM_COL32(130, 138, 145, 255) : IM_COL32(245, 245, 245, 255),
+                   empty ? "Waiting for player..." : names[i].c_str());
+        const float rw = font->CalcTextSizeA(fs, FLT_MAX, 0.0f, kRoles[i]).x;
+        d->AddText(font, fs, ImVec2(p.x + width - pad - rw, y), IM_COL32(150, 160, 168, 255), kRoles[i]);
+        if (i == 0) d->AddLine(ImVec2(p.x + pad, p.y + headH + rowH),
+                               ImVec2(p.x + width - pad, p.y + headH + rowH),
+                               IM_COL32(255, 255, 255, 24), 1.0f);
+    }
+    d->PopClipRect();
+    ImGui::Dummy(ImVec2(width, h));
+}
+
 static void DrawNicknameField(float infoW, bool editable) {
     ImGui::Text("Username");
     const float nickInputW = std::max(180.0f, infoW * 0.56f);
@@ -2818,7 +2867,7 @@ void DrawImGui() {
         s_autoProceeded = false;
     } else if (g_IsClient.load() && g_MpFromLan && g_IsMultiplayerMenuActive && !s_autoProceeded) {
         s_autoProceeded = true;
-        MpProceedToGame();
+        AutoStartGameForClient();
     }
 
     if (g_IsMultiplayerMenuActive) {
@@ -3015,17 +3064,10 @@ void DrawImGui() {
             ImGui::SetCursorPos(ImVec2(infoX, bodyTop + 12.0f));
             DrawGameSectionTitle("Room Info", infoW);
             DrawGameStatusText("Status:", g_ConnectedStatus, infoW);
-            DrawNicknameField(infoW, CanEditNickname());
+            // Oda kurulunca / baglaninca isim kutusu tamamen gizlenir.
+            if (!g_IsHost.load() && !g_IsConnected.load()) DrawNicknameField(infoW, CanEditNickname());
             ImGui::Spacing();
-            ImGui::Text("Room");
-            ImGui::TextDisabled("%s's Room", g_Nickname);
-            const std::string player1Name = GetPlayerName(0);
-            const std::string player2Name = GetPlayerName(1);
-            if (!player1Name.empty()) ImGui::Text("%s", player1Name.c_str());
-            if (!player2Name.empty()) ImGui::Text("%s", player2Name.c_str());
-            if (player1Name.empty() && player2Name.empty()) {
-                ImGui::TextDisabled("Waiting for players...");
-            }
+            DrawRoomTable(infoW);
 
             RenderChatUI(chatX, bodyTop, chatW, bodyBottom - bodyTop);
         } else if (g_MpView == MPV_BROWSER) {
@@ -3066,7 +3108,7 @@ void DrawImGui() {
             ImGui::SetCursorPos(ImVec2(infoX, bodyTop + 12.0f));
             DrawGameSectionTitle("Player", infoW);
             DrawGameStatusText("Network:", g_ConnectedStatus, infoW);
-            DrawNicknameField(infoW, CanEditNickname());
+            if (!g_IsConnected.load()) DrawNicknameField(infoW, CanEditNickname());
 
 
             ImGui::SetCursorPos(ImVec2(infoX, bodyTop + 200.0f));
@@ -3199,6 +3241,29 @@ void my_GameUpdateStateBase(void* thiz, float param_1, uint32_t param_2, uint32_
     }
 }
 
+// Kayit secme ekraninda oyunun kendi "slot tiklandi" kodunu (Game+0x9c20) tetikler:
+// 10+slot = kaydi yukle, 0x10 = (bos slotta) yeni oyun / kolay zorluk. Oyun sonra kendi
+// yukleme akisini calistirip durum 6'ya (oyun) gecer.
+static void AutoStartInject() {
+    const long long until = g_AutoStartUntilMs.load();
+    if (until == 0 || g_EngineInstance == 0) return;
+    const uintptr_t g = g_EngineInstance;
+    const int state = *(volatile int*)(g + 0x64);
+    if (state == 6 || NowMs() > until) { g_AutoStartUntilMs.store(0); return; }
+    if (*(volatile int*)(g + 0x68) != 0) return;          // yukleme / diyalog suruyor
+    volatile int* clicked = (volatile int*)(g + 0x9c20);
+    if (state == 3) {                                      // kayit secme
+        int slot = *(volatile int*)(g + 0xa3f0);           // son kullanilan slot
+        if ((unsigned)slot > 2 || !*(volatile uint8_t*)(g + 0x8a0c + slot)) {
+            slot = 0;
+            for (int i = 0; i < 3; ++i) if (*(volatile uint8_t*)(g + 0x8a0c + i)) { slot = i; break; }
+        }
+        *clicked = 10 + slot;
+    } else if (state == 5) {                               // zorluk secimi (bos slot)
+        *clicked = 0x10;
+    }
+}
+
 void* my_updateGUI(void* thiz, void* p1, void* p2, void* p3, void* p4) {
     g_HUDInstance = (uintptr_t)thiz;
 
@@ -3215,7 +3280,9 @@ void* my_updateGUI(void* thiz, void* p1, void* p2, void* p3, void* p4) {
         g_GameMenuBackgroundLoaded = (g_GameMenuBackgroundTexture != 0);
     }
 
-    return orig_updateGUI ? orig_updateGUI(thiz, p1, p2, p3, p4) : nullptr;
+    void* ret = orig_updateGUI ? orig_updateGUI(thiz, p1, p2, p3, p4) : nullptr;
+    AutoStartInject();
+    return ret;
 }
 
 // The game draws every title underline from one global overlay description
