@@ -1849,29 +1849,42 @@ void NetworkLoop() {
 }
 
 void StartPONGResponderThread() {
-    int sockfd = socket(AF_INET, SOCK_DGRAM, 0);
-    int opt = 1;
-    setsockopt(sockfd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
-    struct sockaddr_in server_addr, client_addr;
-    server_addr.sin_family = AF_INET;
-    server_addr.sin_addr.s_addr = INADDR_ANY;
-    server_addr.sin_port = htons(DISCOVERY_PORT);
-    bind(sockfd, (struct sockaddr*)&server_addr, sizeof(server_addr));
-    
-    char buffer[256];
-    socklen_t client_len = sizeof(client_addr);
+    // Ag kopsa / soket hata verse bile islemciyi bos donguyle yememesi icin: hata olursa
+    // bekle ve soketi yeniden ac. recvfrom zaman asimli, bos beklemez.
     while (true) {
-        int n = recvfrom(sockfd, buffer, sizeof(buffer)-1, 0, (struct sockaddr*)&client_addr, &client_len);
-        if (n > 0) {
-            buffer[n] = '\0';
-            if (strcmp(buffer, "FS14_PING") == 0) {
-                if (g_IsHost.load()) {
-                    std::string roomName = std::string(g_Nickname) + "'s Room";
-                    std::string reply = "FS14_PONG|" + roomName;
+        int sockfd = socket(AF_INET, SOCK_DGRAM, 0);
+        if (sockfd < 0) { std::this_thread::sleep_for(std::chrono::seconds(2)); continue; }
+        int opt = 1;
+        setsockopt(sockfd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+        struct timeval tv; tv.tv_sec = 2; tv.tv_usec = 0;
+        setsockopt(sockfd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+        struct sockaddr_in server_addr, client_addr;
+        memset(&server_addr, 0, sizeof(server_addr));
+        server_addr.sin_family = AF_INET;
+        server_addr.sin_addr.s_addr = INADDR_ANY;
+        server_addr.sin_port = htons(DISCOVERY_PORT);
+        if (bind(sockfd, (struct sockaddr*)&server_addr, sizeof(server_addr)) < 0) {
+            close(sockfd);
+            std::this_thread::sleep_for(std::chrono::seconds(3));
+            continue;
+        }
+
+        char buffer[256];
+        while (true) {
+            socklen_t client_len = sizeof(client_addr);
+            int n = recvfrom(sockfd, buffer, sizeof(buffer)-1, 0, (struct sockaddr*)&client_addr, &client_len);
+            if (n > 0) {
+                buffer[n] = '\0';
+                if (strcmp(buffer, "FS14_PING") == 0 && g_IsHost.load()) {
+                    std::string reply = "FS14_PONG|" + std::string(g_Nickname) + "'s Room";
                     sendto(sockfd, reply.c_str(), reply.length(), 0, (struct sockaddr*)&client_addr, client_len);
                 }
+            } else if (errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR) {
+                break;   // soket bozuldu -> yeniden olustur
             }
         }
+        close(sockfd);
+        std::this_thread::sleep_for(std::chrono::seconds(1));
     }
 }
 
@@ -2990,9 +3003,9 @@ void DrawImGui() {
 
             // Host: oda acikken oyuna gec (kayit secme ekrani acilir).
             if (g_MpFromLan && g_IsHost.load()) {
-                ImGui::SetCursorPos(ImVec2((screen.x - innerButtonW) * 0.5f, buttonY));
-                if (DrawGameStyleButton("##PlayGame", "Play",
-                                        ImVec2(innerButtonW, innerButtonH), 1.30f, false)) {
+                const float playW = std::min(innerButtonH * 4.30f, screen.x - innerButtonW * 2.0f - 24.0f);
+                ImGui::SetCursorPos(ImVec2((screen.x - playW) * 0.5f, buttonY));
+                if (DrawCenteredMirroredGameButton("##PlayGame", "Play", playW, innerButtonH, 1.80f)) {
                     MpProceedToGame();
                 }
             }
@@ -3177,19 +3190,13 @@ void my_GameUpdateStateBase(void* thiz, float param_1, uint32_t param_2, uint32_
     // and the network is independently capped at 30 snapshots/sec.
     ApplyRemoteVehicleStates(g_EngineInstance);
     CaptureAndQueueLocalVehicleState(g_EngineInstance);
-}
 
-// Oyun ici cizim noktasi: sahne ve oyunun kendi arayuzu renderQueues'ta cizildikten sonra,
-// ekran takasindan (waitVSync) hemen once. Menulerde eski kancalar kullanilir.
-typedef void (*WaitVSync_t)();
-static WaitVSync_t orig_WaitVSync = nullptr;
-static void my_WaitVSync() {
-    if (g_EngineInstance != 0 && *(volatile int*)(g_EngineInstance + 0x64) == 6 &&
-        (g_OnlineMode || g_IsMultiplayerMenuActive)) {
+    // Oyun ici ImGui cizimi: ekran renderQueues'ta (presentGLESFramebuffer) ekrana verilir,
+    // yani cizim ondan ONCE yapilmali. Bu fonksiyon sadece oyun durumu 6'da cagrilir.
+    if (g_OnlineMode || g_IsMultiplayerMenuActive) {
         g_CurrentMenu = MENU_INGAME;
         DrawImGui();
     }
-    if (orig_WaitVSync) orig_WaitVSync();
 }
 
 void* my_updateGUI(void* thiz, void* p1, void* p2, void* p3, void* p4) {
@@ -3294,12 +3301,6 @@ void ModMain() {
     MSHookFunction((void*)gameUpdateAddr, (void*)my_GameUpdate, (void**)&orig_GameUpdate);
     MSHookFunction((void*)updateStateBaseAddr, (void*)my_GameUpdateStateBase, (void**)&orig_GameUpdateStateBase);
     MSHookFunction((void*)inGameMenuAddr, (void*)my_renderStartMenuMain, (void**)&orig_renderStartMenuMain);
-
-    void* appLib = dlopen("libapp.so", RTLD_NOW | RTLD_NOLOAD);
-    void* waitVSyncAddr = appLib ? dlsym(appLib, "_ZN24GLESHandheldRenderDevice9waitVSyncEv") : nullptr;
-    LOGI("waitVSync symbol: %p", waitVSyncAddr);
-    if (waitVSyncAddr) MSHookFunction(waitVSyncAddr, (void*)my_WaitVSync, (void**)&orig_WaitVSync);
-    if (appLib) dlclose(appLib);
 
     void* inputQueueGetEventAddr = dlsym(RTLD_DEFAULT, "AInputQueue_getEvent");
     if (inputQueueGetEventAddr != nullptr) {
