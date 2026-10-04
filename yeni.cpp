@@ -2655,6 +2655,16 @@ static void MpGoBack() {
     g_PendingTouchDown.store(false);
 }
 
+// LAN odasi hazir (host) ya da odaya baglanildi (client): menuyu kapat, oyunun kendi
+// "Select a file" ekrani gorunsun. Baglanti acik kalir.
+static void MpProceedToGame() {
+    if (g_AndroidKeyboardOpen.load()) CloseAndroidKeyboard();
+    g_IsMultiplayerMenuActive = false;
+    g_ShowLanChoice = false;
+    g_ShowModeSelect = false;
+    g_PendingTouchDown.store(false);
+}
+
 void DrawImGui() {
     if (!g_ImGuiInitialized) {
         ImGui::CreateContext();
@@ -2787,6 +2797,15 @@ void DrawImGui() {
                 g_IsMultiplayerMenuActive = true;
             }
         }
+    }
+
+    // Client odaya baglanir baglanmaz kayit secme ekranina otomatik gec.
+    static bool s_autoProceeded = false;
+    if (!g_IsConnected.load()) {
+        s_autoProceeded = false;
+    } else if (g_IsClient.load() && g_MpFromLan && g_IsMultiplayerMenuActive && !s_autoProceeded) {
+        s_autoProceeded = true;
+        MpProceedToGame();
     }
 
     if (g_IsMultiplayerMenuActive) {
@@ -2966,6 +2985,15 @@ void DrawImGui() {
                         g_TcpSocket = -1;
                     }
                     g_ConnectedStatus = "Room Closed.";
+                }
+            }
+
+            // Host: oda acikken oyuna gec (kayit secme ekrani acilir).
+            if (g_MpFromLan && g_IsHost.load()) {
+                ImGui::SetCursorPos(ImVec2((screen.x - innerButtonW) * 0.5f, buttonY));
+                if (DrawGameStyleButton("##PlayGame", "Play",
+                                        ImVec2(innerButtonW, innerButtonH), 1.30f, false)) {
+                    MpProceedToGame();
                 }
             }
 
