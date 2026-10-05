@@ -21,6 +21,8 @@
 #include <arpa/inet.h>
 #include <unistd.h>
 #include <fcntl.h>
+#include <sys/stat.h>
+#include <strings.h>
 #include <sys/ioctl.h>
 #include <net/if.h>
 #include <cerrno>
@@ -114,6 +116,132 @@ static bool g_GameUIFontInitialized = false;
 // USER NICKNAME
 char g_Nickname[32] = "Player"; 
 
+// ========================================================================
+// KALICI OYUNCU PROFILI (JSON)
+// Dosya uygulamanin OZEL dahili deposunda tutulur: /data/data/<paket>/files/mp_profile.json
+// (Android/data gibi kullanicinin dosya yoneticisiyle erisebildigi bir yer degil; root'suz
+// erisilemez). Icerik: {"defaultName":"Player123456","nickname":"Player123456"}
+// ========================================================================
+static char g_DefaultName[32] = "";      // bu cihaza ozgu, kalici varsayilan isim
+static char g_SavedNickname[32] = "";    // diske en son yazilan isim
+static std::string g_ProfilePath;
+
+static bool IsDefaultStyleName(const char* n) {   // "Player" + 6 rakam
+    if (strncmp(n, "Player", 6) != 0 || strlen(n) != 12) return false;
+    for (int i = 6; i < 12; ++i) if (n[i] < '0' || n[i] > '9') return false;
+    return true;
+}
+
+static void MakeRandomDefaultName(char* out, size_t size) {
+    uint32_t r = 0;
+    const int fd = open("/dev/urandom", O_RDONLY);
+    if (fd >= 0) { if (read(fd, &r, sizeof(r)) != (ssize_t)sizeof(r)) r = 0; close(fd); }
+    if (r == 0) {   // yedek: zaman + pid karisimi
+        struct timespec ts; clock_gettime(CLOCK_REALTIME, &ts);
+        r = (uint32_t)ts.tv_nsec * 2654435761u ^ (uint32_t)ts.tv_sec ^ ((uint32_t)getpid() << 16);
+    }
+    snprintf(out, size, "Player%06u", 100000u + (r % 900000u));
+}
+
+static void BuildProfilePath() {
+    if (!g_ProfilePath.empty()) return;
+    char pkg[128] = {0};
+    FILE* f = fopen("/proc/self/cmdline", "r");
+    if (f) { if (!fgets(pkg, sizeof(pkg) - 1, f)) pkg[0] = 0; fclose(f); }
+    if (pkg[0] == 0 || strchr(pkg, '/')) return;
+    const std::string dir = std::string("/data/data/") + pkg + "/files";
+    mkdir(dir.c_str(), 0700);   // zaten varsa hata verir, sorun degil
+    g_ProfilePath = dir + "/mp_profile.json";
+}
+
+static void JsonEscapeInto(std::string& dst, const char* s) {
+    for (; *s; ++s) {
+        const unsigned char c = (unsigned char)*s;
+        if (c == '"' || c == '\\') { dst += '\\'; dst += (char)c; }
+        else if (c < 0x20) dst += ' ';
+        else dst += (char)c;
+    }
+}
+
+static bool JsonGetString(const std::string& js, const char* key, char* out, size_t size) {
+    const std::string k = std::string("\"") + key + "\"";
+    size_t p = js.find(k);
+    if (p == std::string::npos) return false;
+    p = js.find(':', p + k.size());
+    if (p == std::string::npos) return false;
+    p = js.find('"', p);
+    if (p == std::string::npos) return false;
+    size_t o = 0;
+    for (++p; p < js.size() && js[p] != '"'; ++p) {
+        char c = js[p];
+        if (c == '\\' && p + 1 < js.size()) c = js[++p];
+        if (o + 1 < size) out[o++] = c;
+    }
+    out[o] = 0;
+    return true;
+}
+
+static void SaveProfile() {
+    BuildProfilePath();
+    if (g_ProfilePath.empty()) return;
+    std::string js = "{\"defaultName\":\"";
+    JsonEscapeInto(js, g_DefaultName);
+    js += "\",\"nickname\":\"";
+    JsonEscapeInto(js, g_Nickname);
+    js += "\"}\n";
+    const std::string tmp = g_ProfilePath + ".tmp";
+    FILE* f = fopen(tmp.c_str(), "wb");
+    if (!f) return;
+    const bool ok = fwrite(js.data(), 1, js.size(), f) == js.size();
+    fclose(f);
+    if (ok && rename(tmp.c_str(), g_ProfilePath.c_str()) == 0) {
+        strncpy(g_SavedNickname, g_Nickname, sizeof(g_SavedNickname) - 1);
+    } else {
+        remove(tmp.c_str());
+    }
+}
+
+// Acilista bir kez: profili oku; yoksa/bozuksa rastgele "Player######" uret ve kaydet.
+static void LoadOrCreateProfile() {
+    static bool done = false;
+    if (done) return;
+    done = true;
+    BuildProfilePath();
+    std::string js;
+    if (!g_ProfilePath.empty()) {
+        FILE* f = fopen(g_ProfilePath.c_str(), "rb");
+        if (f) {
+            char tmp[512]; size_t n;
+            while ((n = fread(tmp, 1, sizeof(tmp), f)) > 0 && js.size() < 4096) js.append(tmp, n);
+            fclose(f);
+        }
+    }
+    char nick[32] = {0};
+    JsonGetString(js, "defaultName", g_DefaultName, sizeof(g_DefaultName));
+    JsonGetString(js, "nickname", nick, sizeof(nick));
+    if (!IsDefaultStyleName(g_DefaultName)) MakeRandomDefaultName(g_DefaultName, sizeof(g_DefaultName));
+    if (nick[0] == 0) strncpy(nick, g_DefaultName, sizeof(nick) - 1);
+    strncpy(g_Nickname, nick, sizeof(g_Nickname) - 1);
+    g_Nickname[sizeof(g_Nickname) - 1] = 0;
+    SaveProfile();   // ilk calistirmada dosyayi olustur
+    LOGI("[PROFILE] nickname=%s path=%s", g_Nickname, g_ProfilePath.c_str());
+}
+
+// Her karede: isim kutusu duzenlenmiyorsa bos ismi varsayilana cevir, degistiyse diske yaz.
+static void PersistNicknameIfChanged(bool editingNick) {
+    if (editingNick) return;
+    // bastaki/sondaki bosluklari at
+    size_t len = strlen(g_Nickname), st = 0;
+    while (st < len && g_Nickname[st] == ' ') ++st;
+    while (len > st && g_Nickname[len - 1] == ' ') --len;
+    if (st > 0 || len < strlen(g_Nickname)) {
+        memmove(g_Nickname, g_Nickname + st, len - st);
+        g_Nickname[len - st] = 0;
+    }
+    if (g_Nickname[0] == 0) strncpy(g_Nickname, g_DefaultName, sizeof(g_Nickname) - 1);
+    if (strcmp(g_Nickname, g_SavedNickname) != 0) SaveProfile();
+}
+
 enum ActiveMenuType {
     MENU_NONE = 0,
     MENU_SETTINGS = 1,
@@ -190,6 +318,7 @@ static const float kTypingBarBottom = 0.38f;
 // ========================================================================
 JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM* vm, void* reserved) {
     g_GlobalJavaVM = vm;
+    LoadOrCreateProfile();
     return JNI_VERSION_1_6;
 }
 
@@ -568,6 +697,43 @@ static std::string GetPlayerName(uint8_t playerId) {
     std::lock_guard<std::mutex> lock(g_PlayerNamesMutex);
     return std::string(g_PlayerNames[playerId]);
 }
+
+// Host: baska bir oyuncuyla ayni isim gelirse benzersiz hale getirir. "Player######" ise yeni
+// rakamlar uretilir, ozel isimse sonuna 2..99 eklenir. true donerse isim degisti.
+static bool NameTakenByOther(uint8_t playerId, const char* name) {
+    std::lock_guard<std::mutex> lock(g_PlayerNamesMutex);
+    for (int i = 0; i < 4; ++i) {
+        if (i == playerId || g_PlayerNames[i][0] == 0) continue;
+        if (strcasecmp(g_PlayerNames[i], name) == 0) return true;
+    }
+    return false;
+}
+
+static bool MakeNameUnique(uint8_t playerId, char* name, size_t size) {
+    if (name[0] == 0 || !NameTakenByOther(playerId, name)) return false;
+    if (IsDefaultStyleName(name)) {
+        for (int t = 0; t < 20; ++t) {
+            MakeRandomDefaultName(name, size);
+            if (!NameTakenByOther(playerId, name)) return true;
+        }
+        return true;
+    }
+    char base[32];
+    strncpy(base, name, sizeof(base) - 1);
+    base[sizeof(base) - 1] = 0;
+    for (int n = 2; n < 100; ++n) {
+        char suffix[8];
+        snprintf(suffix, sizeof(suffix), "%d", n);
+        const size_t room = size - 1 - strlen(suffix);
+        snprintf(name, size, "%.*s%s", (int)room, base, suffix);
+        if (!NameTakenByOther(playerId, name)) return true;
+    }
+    return true;
+}
+
+// Host, bir client'in ismini degistirdiyse duzeltilmis paket sender'a da geri gonderilir.
+static std::atomic<int> g_NameFixPeer(-1);
+static PlayerInfoPacket g_NameFixPkt;
 
 static void SendLocalPlayerInfo() {
     if (!g_IsConnected.load() || g_TcpSocket < 0) return;
@@ -1297,6 +1463,13 @@ static void HandlePlayerInfoPacket(const PlayerInfoPacket& pkt) {
     memcpy(safeName, pkt.playerName, sizeof(safeName));
     safeName[sizeof(safeName) - 1] = '\0';
     SetPlayerName(pkt.playerId, safeName);
+    // Host ismimizi cakistigi icin degistirdiyse onu benimse (varsayilan tarzda ise kalici yap).
+    if (!g_IsHost.load() && pkt.playerId == g_LocalPlayerId.load() && safeName[0] != 0 &&
+        strcmp(safeName, g_Nickname) != 0) {
+        strncpy(g_Nickname, safeName, sizeof(g_Nickname) - 1);
+        g_Nickname[sizeof(g_Nickname) - 1] = 0;
+        if (IsDefaultStyleName(g_Nickname)) strncpy(g_DefaultName, g_Nickname, sizeof(g_DefaultName) - 1);
+    }
     LOGI("[PLAYERS] player=%u name=%s", (unsigned)pkt.playerId, safeName);
 }
 
@@ -1834,7 +2007,15 @@ static bool ProcessPackets(uint8_t* buf, size_t& buffered, int peerId, std::vect
         if (type == PACKET_PLAYER_INFO) {
             PlayerInfoPacket pkt;
             memcpy(&pkt, buf, sizeof(pkt));
-            if (fromPeer) { pkt.playerId = (uint8_t)peerId; memcpy(buf, &pkt, sizeof(pkt)); }
+            if (fromPeer) {
+                pkt.playerId = (uint8_t)peerId;
+                pkt.playerName[sizeof(pkt.playerName) - 1] = '\0';
+                if (g_IsHost.load() && MakeNameUnique(pkt.playerId, pkt.playerName, sizeof(pkt.playerName))) {
+                    g_NameFixPkt = pkt;               // sender'a duzeltilmis ismi geri bildir
+                    g_NameFixPeer.store(peerId);
+                }
+                memcpy(buf, &pkt, sizeof(pkt));
+            }
             HandlePlayerInfoPacket(pkt);
         } else if (type == PACKET_SESSION_WELCOME) {
             SessionWelcomePacket pkt;
@@ -2083,7 +2264,10 @@ void NetworkLoop() {
         }
     }
     bool udpReady = false;                       // host UDP'yi onayladi mi?
-    bool udpAnnounced = false;                   // "UDP active" bildirimi baglanti basina bir kez
+    bool udpWarned = false;                      // "UDP desteklenmiyor" uyarisi baglanti basina bir kez
+    const long long connStartMs = NowMs();
+    const char* kUdpWarn = "UDP is not supported on this device. The game may not run properly.";
+    if (udpFd < 0) { udpWarned = true; ShowNativeToast(kUdpWarn); }
     long long lastUdpRxMs = 0, lastUdpPingMs = 0, lastHelloMs = 0, lastPingMs = 0;
     long long lastRecvMs = NowMs();              // host'tan en son ne zaman bir sey geldi
     g_SyncRequestOut.store(true);                // baglanir baglanmaz tam senkron iste
@@ -2127,7 +2311,6 @@ void NetworkLoop() {
                 if (dg[0] == PACKET_UDP_ACK) {
                     if (!udpReady) {
                         LOGI("[UDP] fast channel active");
-                        if (!udpAnnounced) { udpAnnounced = true; ShowNativeToast("UDP fast channel active"); }  // TEST: istemezsen sil
                     }
                     udpReady = true;
                     continue;
@@ -2150,6 +2333,9 @@ void NetworkLoop() {
             g_IsConnected.store(false);
             break;
         }
+
+        // UDP yolu ilk 6 sn icinde hic acilmadiysa (cihaz/ag UDP'yi desteklemiyor) bir kez uyar.
+        if (!udpWarned && !udpReady && (nowT - connStartMs) > 6000) { udpWarned = true; ShowNativeToast(kUdpWarn); }
 
         // --- UDP el sikisma: onay gelene kadar 250 ms'de bir ---
         const uint8_t myId = g_LocalPlayerId.load();
@@ -2271,6 +2457,7 @@ static void HostNetworkLoop(int serverFd, int gen) {
     long long lastPingMs = 0, lastTableMs = 0;
 
     const int udpFd = OpenUdpSocket(true);   // -1 ise her sey TCP'den gider (eskisi gibi)
+    if (udpFd < 0) ShowNativeToast("UDP is not supported on this device. The game may not run properly.");
 
     auto broadcast = [&](const void* data, size_t size, const HostPeer* except) {
         for (HostPeer* p : peers) {
@@ -2383,6 +2570,10 @@ static void HostNetworkLoop(int serverFd, int gen) {
             if (!ProcessPackets(p->buf, p->buffered, p->id, &relay, &relayFast)) { p->dead = true; continue; }
             if (!relay.empty()) broadcast(relay.data(), relay.size(), p);
             broadcastFast(relayFast, p);
+            if (g_NameFixPeer.load() == p->id) {      // isim cakisti: duzeltilmisini sender'a da gonder
+                PeerQueue(p, &g_NameFixPkt, sizeof(g_NameFixPkt));
+                g_NameFixPeer.store(-1);
+            }
         }
 
         // 2b) UDP: el sikisma + arac goruntuleri.
@@ -3425,6 +3616,8 @@ static void MpProceedToGame() {
 }
 
 void DrawImGui() {
+    LoadOrCreateProfile();
+    PersistNicknameIfChanged(g_AndroidKeyboardOpen.load() && g_KeyboardFieldMode.load() == 1);
     if (!g_ImGuiInitialized) {
         ImGui::CreateContext();
         InitGameUIFont();
