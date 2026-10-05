@@ -23,6 +23,7 @@
 #include <fcntl.h>
 #include <sys/stat.h>
 #include <strings.h>
+#include <elf.h>
 #include <sys/ioctl.h>
 #include <net/if.h>
 #include <cerrno>
@@ -384,6 +385,63 @@ uintptr_t GetLibraryBase(const char* libName) {
     }
     fclose(fp);
     return baseAddress;
+}
+
+// dlsym'in bulamadigi semboller icin yedek: libapp.so'yu diskten okuyup .symtab/.dynsym icinde
+// verilen on ekle baslayan ilk sembolu arar (parametre yazimi tutmasa bile bulur).
+static std::string GetLibraryPath(const char* lib) {
+    std::string path;
+    FILE* fp = fopen("/proc/self/maps", "r");
+    if (!fp) return path;
+    char line[512];
+    while (fgets(line, sizeof(line), fp)) {
+        if (!strstr(line, lib)) continue;
+        const char* sl = strchr(line, '/');
+        if (!sl) continue;
+        path = sl;
+        while (!path.empty() && (path.back() == '\n' || path.back() == ' ')) path.pop_back();
+        break;
+    }
+    fclose(fp);
+    return path;
+}
+
+static void* FindElfSymbolByPrefix(const char* lib, const char* prefix) {
+    const uintptr_t base = GetLibraryBase(lib);
+    const std::string path = GetLibraryPath(lib);
+    if (!base || path.empty()) return nullptr;
+    FILE* f = fopen(path.c_str(), "rb");
+    if (!f) return nullptr;
+    void* result = nullptr;
+    Elf32_Ehdr eh;
+    if (fread(&eh, sizeof(eh), 1, f) == 1 && memcmp(eh.e_ident, ELFMAG, SELFMAG) == 0 &&
+        eh.e_shentsize == sizeof(Elf32_Shdr) && eh.e_shnum > 0 && eh.e_shnum < 256) {
+        std::vector<Elf32_Shdr> sh(eh.e_shnum);
+        fseek(f, (long)eh.e_shoff, SEEK_SET);
+        if (fread(sh.data(), sizeof(Elf32_Shdr), sh.size(), f) == sh.size()) {
+            const size_t plen = strlen(prefix);
+            for (size_t i = 0; i < sh.size() && !result; ++i) {
+                if (sh[i].sh_type != SHT_SYMTAB && sh[i].sh_type != SHT_DYNSYM) continue;
+                if (sh[i].sh_link >= sh.size()) continue;
+                const Elf32_Shdr& str = sh[sh[i].sh_link];
+                std::vector<char> strtab(str.sh_size + 1, 0);
+                fseek(f, (long)str.sh_offset, SEEK_SET);
+                if (fread(strtab.data(), 1, str.sh_size, f) != str.sh_size) continue;
+                std::vector<Elf32_Sym> syms(sh[i].sh_size / sizeof(Elf32_Sym));
+                fseek(f, (long)sh[i].sh_offset, SEEK_SET);
+                if (fread(syms.data(), sizeof(Elf32_Sym), syms.size(), f) != syms.size()) continue;
+                for (size_t k = 0; k < syms.size(); ++k) {
+                    if (syms[k].st_value == 0 || syms[k].st_name >= str.sh_size) continue;
+                    if (strncmp(&strtab[syms[k].st_name], prefix, plen) == 0) {
+                        result = (void*)(base + syms[k].st_value);   // Thumb biti st_value'da zaten var
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    fclose(f);
+    return result;
 }
 
 void ClearChat() {
@@ -1084,7 +1142,12 @@ static void RefreshVehicleTopology(uintptr_t game) {
         }
         g_VehNetArmed.store(true);
         g_NetMapDirty.store(true);
-        LOGI("[VEHNET] armed, vehicles=%u", n);
+        LOGI("[VEHNET] armed, vehicles=%u hooksOk=%d", n, (int)g_VehicleHooksOk);
+        static bool s_hookWarned = false;
+        if (!g_VehicleHooksOk && !s_hookWarned) {
+            s_hookWarned = true;
+            ShowNativeToast("Vehicle buy/sell sync is unavailable (game hooks not found).");
+        }
         if (g_IsClient.load()) g_SyncRequestOut.store(true);
         if (g_IsHost.load()) g_HostForceTable.store(true);
     } else {
@@ -1175,6 +1238,33 @@ static void my_Game_removeVehicle(void* game, uint32_t idx) {
     orig_Game_removeVehicle(game, idx);
 }
 
+// Client oyunu host'un: client araclara bakabilir ama alim/satim yapamaz.
+typedef uint32_t (*Game_buyItem_t)(void* game, uint32_t item, uint32_t a, uint32_t b);
+typedef void (*Game_sellItem_t)(void* game, uint32_t item);
+static Game_buyItem_t orig_Game_buyItem = nullptr;
+static Game_sellItem_t orig_Game_sellItem = nullptr;
+static long long g_LastShopBlockToastMs = 0;
+
+static bool ClientShopBlocked() {
+    if (!(g_IsClient.load() && g_IsConnected.load())) return false;
+    const long long now = NowMs();
+    if (now - g_LastShopBlockToastMs > 2000) {
+        g_LastShopBlockToastMs = now;
+        ShowNativeToast("Only the host can buy or sell items.");
+    }
+    return true;
+}
+
+static uint32_t my_Game_buyItem(void* game, uint32_t item, uint32_t a, uint32_t b) {
+    if (ClientShopBlocked()) return 0;          // 0 = satin alma basarisiz (oyun bunu zaten yonetiyor)
+    return orig_Game_buyItem(game, item, a, b);
+}
+
+static void my_Game_sellItem(void* game, uint32_t item) {
+    if (ClientShopBlocked()) return;
+    orig_Game_sellItem(game, item);
+}
+
 // Diger cihazlardan gelen arac ekle/sil olaylarini oyun thread'inde uygular.
 static void ApplyPendingVehicleOps(uintptr_t game) {
     if (game == 0 || !g_IsConnected.load()) return;
@@ -1186,12 +1276,11 @@ static void ApplyPendingVehicleOps(uintptr_t game) {
         if (g_PendingVehicleOps.empty()) return;
         ops.swap(g_PendingVehicleOps);
     }
-    if (!orig_Game_addVehicle || !orig_Game_removeVehicle || !g_VehicleDestroyFn) return;   // kancalar yok
-
     for (const PendingVehicleOp& op : ops) {
         if (op.netId != 0xFFFF && op.netId >= VEHICLE_SLOT_LIMIT) continue;
 
         if (op.kind == 2) {                          // REMOVE
+            if (!orig_Game_removeVehicle || !g_VehicleDestroyFn) { LOGI("[VEHNET] remove: kanca yok"); continue; }
             const uintptr_t p = (op.netId < VEHICLE_SLOT_LIMIT) ? g_KnownVehiclePointers[op.netId] : 0;
             const int idx = p ? SlotIndexOfVehicle(game, p) : -1;
             if (idx < 0) {
@@ -1220,6 +1309,7 @@ static void ApplyPendingVehicleOps(uintptr_t game) {
         }
 
         // SPAWN (kind 0: host, client istegini uyguluyor / kind 1: host netId atamis)
+        if (!orig_Game_addVehicle) { LOGI("[VEHNET] spawn: addVehicle kancasi yok"); continue; }
         if (op.kind == 1 && op.originId == g_LocalPlayerId.load()) {
             // Bu cihazda zaten alinmisti: sirada bekleyen yerel araci host'un verdigi netId'ye bagla.
             while (!g_UnboundLocalVehicles.empty()) {
@@ -4708,14 +4798,19 @@ void ModMain() {
         void* loadSave = dlsym(appLib, "_ZN9SaveGames12loadSavegameEPKcjj");
         LOGI("saveFile symbol: %p, loadSavegame symbol: %p", saveFile, loadSave);
         void* addVeh = dlsym(appLib, "_ZN4Game10addVehicleEN13EntityManager8VEHICLESERK7Vector3fj");
+        if (!addVeh) addVeh = FindElfSymbolByPrefix("libapp.so", "_ZN4Game10addVehicleE");
         void* remVeh = dlsym(appLib, "_ZN4Game13removeVehicleEj");
         g_VehicleDestroyFn = (Vehicle_destroy_t)dlsym(appLib, "_ZN7Vehicle7destroyEv");
-        LOGI("vehicle hooks: addVehicle=%p removeVehicle=%p Vehicle::destroy=%p", addVeh, remVeh, (void*)g_VehicleDestroyFn);
-        if (addVeh && remVeh && g_VehicleDestroyFn) {
-            MSHookFunction(addVeh, (void*)my_Game_addVehicle, (void**)&orig_Game_addVehicle);
-            MSHookFunction(remVeh, (void*)my_Game_removeVehicle, (void**)&orig_Game_removeVehicle);
-            g_VehicleHooksOk = true;
-        }
+        if (!g_VehicleDestroyFn) g_VehicleDestroyFn = (Vehicle_destroy_t)FindElfSymbolByPrefix("libapp.so", "_ZN7Vehicle7destroyEv");
+        void* buyItem = dlsym(appLib, "_ZN4Game7buyItemEjbb");
+        void* sellItem = dlsym(appLib, "_ZN4Game8sellItemEj");
+        LOGI("vehicle hooks: addVehicle=%p removeVehicle=%p Vehicle::destroy=%p buyItem=%p sellItem=%p",
+             addVeh, remVeh, (void*)g_VehicleDestroyFn, buyItem, sellItem);
+        if (addVeh) MSHookFunction(addVeh, (void*)my_Game_addVehicle, (void**)&orig_Game_addVehicle);
+        if (remVeh) MSHookFunction(remVeh, (void*)my_Game_removeVehicle, (void**)&orig_Game_removeVehicle);
+        if (buyItem) MSHookFunction(buyItem, (void*)my_Game_buyItem, (void**)&orig_Game_buyItem);
+        if (sellItem) MSHookFunction(sellItem, (void*)my_Game_sellItem, (void**)&orig_Game_sellItem);
+        g_VehicleHooksOk = addVeh && remVeh && g_VehicleDestroyFn;
         if (saveTask) {
             g_SaveStartTaskFn = saveTask;
             MSHookFunction(saveTask, (void*)my_SaveStartTask, (void**)&orig_SaveStartTask);
