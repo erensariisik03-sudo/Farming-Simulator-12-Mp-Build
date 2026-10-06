@@ -869,6 +869,8 @@ static uintptr_t g_KnownVehiclePointers[VEHICLE_SLOT_LIMIT];
 static uint32_t g_NetIdVehicleType[VEHICLE_SLOT_LIMIT];   // netId'ye bagli aracin tipi (Vehicle+0x10)
 // 1: arac senkronunda ne oldugunu ekranda kucuk bildirimle goster (sorun giderme). 0: kapat.
 #define VEHNET_DEBUG_TOAST 1
+// Eski NDK'da std::to_string yok; snprintf ile yaz.
+static std::string NumStr(unsigned v) { char b[16]; snprintf(b, sizeof(b), "%u", v); return std::string(b); }
 static bool g_ClaimPending[VEHICLE_SLOT_LIMIT];
 static uint64_t g_LocalStationarySince[VEHICLE_SLOT_LIMIT];
 static uint64_t g_RemoteStationarySince[VEHICLE_SLOT_LIMIT];
@@ -1116,7 +1118,7 @@ static void VehicleTopologyWatch(uintptr_t game) {
             QueueVehicleEvent(&pkt, sizeof(pkt));
             LOGI("[VEHNET] arac satildi/kayboldu netId=%u -> REMOVE gonderildi", (unsigned)id);
 #if VEHNET_DEBUG_TOAST
-            ShowNativeToast("[VEH] sold #" + std::to_string(id) + " sent");
+            ShowNativeToast("[VEH] sold #" + NumStr(id) + " sent");
 #endif
         }
         { std::lock_guard<std::mutex> lock(g_VehicleStateMutex); ClearVehicleStateSlot(id); }
@@ -1149,7 +1151,7 @@ static void VehicleTopologyWatch(uintptr_t game) {
             QueueVehicleEvent(&pkt, sizeof(pkt));
             LOGI("[VEHNET] yeni arac type=%u netId=%d idx=%u -> SPAWN gonderildi", (unsigned)pkt.vehicleType, id, i);
 #if VEHNET_DEBUG_TOAST
-            ShowNativeToast("[VEH] bought #" + std::to_string(id) + " sent");
+            ShowNativeToast("[VEH] bought #" + NumStr(id) + " sent");
 #endif
             changed = true;
         }
@@ -1320,7 +1322,7 @@ static void ApplyPendingVehicleOps(uintptr_t game) {
         if (op.netId >= VEHICLE_SLOT_LIMIT) continue;
 
         if (op.kind == 2) {                          // REMOVE
-            VehNetToast("[VEH] remove #" + std::to_string(op.netId) + " received");
+            VehNetToast("[VEH] remove #" + NumStr(op.netId) + " received");
             if (!orig_Game_removeVehicle || !g_VehicleDestroyFn) {
                 LOGI("[VEHNET] remove: fonksiyon bulunamadi");
                 VehNetToast("[VEH] remove failed: symbols missing");
@@ -1348,12 +1350,12 @@ static void ApplyPendingVehicleOps(uintptr_t game) {
             g_VehicleDestroyFn((void*)p);
             g_ApplyingRemoteVehicleOp = false;
             g_NetMapDirty.store(true);
-            VehNetToast("[VEH] vehicle #" + std::to_string(op.netId) + " removed");
+            VehNetToast("[VEH] vehicle #" + NumStr(op.netId) + " removed");
             continue;
         }
 
         if (op.kind == 1) {                          // SPAWN (host netId atamis)
-            VehNetToast("[VEH] spawn #" + std::to_string(op.netId) + " received");
+            VehNetToast("[VEH] spawn #" + NumStr(op.netId) + " received");
             if (!orig_Game_addVehicle) { VehNetToast("[VEH] spawn failed: symbol missing"); continue; }
             if (VehicleCount(game) >= 30) { LOGI("[VEHNET] spawn atlandi: arac siniri"); continue; }
             const float pos[3] = { op.x, op.y, op.z };
