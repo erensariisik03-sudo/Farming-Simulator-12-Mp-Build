@@ -866,6 +866,9 @@ static VehicleRemoteState g_RemoteVehicles[VEHICLE_SLOT_LIMIT];
 static VehicleSampleState g_LocalSamples[VEHICLE_SLOT_LIMIT];
 static VehicleSampleState g_LastSentLocalVehicles[VEHICLE_SLOT_LIMIT];
 static uintptr_t g_KnownVehiclePointers[VEHICLE_SLOT_LIMIT];
+static uint32_t g_NetIdVehicleType[VEHICLE_SLOT_LIMIT];   // netId'ye bagli aracin tipi (Vehicle+0x10)
+// 1: arac senkronunda ne oldugunu ekranda kucuk bildirimle goster (sorun giderme). 0: kapat.
+#define VEHNET_DEBUG_TOAST 1
 static bool g_ClaimPending[VEHICLE_SLOT_LIMIT];
 static uint64_t g_LocalStationarySince[VEHICLE_SLOT_LIMIT];
 static uint64_t g_RemoteStationarySince[VEHICLE_SLOT_LIMIT];
@@ -907,7 +910,6 @@ struct PendingVehicleOp {
 static std::atomic<bool> g_VehNetArmed(false);          // netId tablosu kuruldu, olaylar aktif
 static std::atomic<bool> g_NetMapDirty(false);          // host: netmap paketi yeniden uretilmeli
 static bool g_ApplyingRemoteVehicleOp = false;          // sadece oyun thread'i: uzaktan uygulanan islem
-static std::vector<uintptr_t> g_UnboundLocalVehicles;   // bu cihazda alinip host'tan netId bekleyenler (FIFO)
 static std::mutex g_VehicleEventMutex;                  // asagidaki 5 degiskeni korur
 static std::vector<uint8_t> g_VehicleEventOut;          // BuildOutgoing'in gonderecegi arac olaylari
 static std::vector<PendingVehicleOp> g_PendingVehicleOps;
@@ -1086,9 +1088,76 @@ static void DisarmVehicleNet() {
         for (uint16_t i = 0; i < VEHICLE_SLOT_LIMIT; ++i) ClearVehicleStateSlot(i);
     }
     g_VehNetArmed.store(false);
-    g_UnboundLocalVehicles.clear();
     std::lock_guard<std::mutex> lock(g_VehicleEventMutex);
     g_HostNetMapBytes.clear();
+}
+
+// Oyunun arac dizisini izler (kanca yok): satilan/yeni alinan araci fark eder.
+//  - Host: araç kayboldu -> REMOVE, yeni arac belirdi -> netId ata + SPAWN yayinla.
+//  - Client: sadece kaybolan araclarin kaydini temizler (yeni arac mudahalesi ClientShopGuard'da).
+// Her karede my_GameUpdate'ten (oyun durumu 6 veya 7: magaza dahil) cagrilir.
+static void VehicleTopologyWatch(uintptr_t game) {
+    if (game == 0 || !g_VehNetArmed.load() || g_ApplyingRemoteVehicleOp || !g_IsConnected.load()) return;
+    const uint32_t state = *(uint32_t*)(game + 0x64);
+    if (state != 6 && state != 7) return;
+    const bool host = g_IsHost.load();
+    bool changed = false;
+
+    // 1) Kaybolan / yerine baska tip gelen araclar
+    for (uint16_t id = 0; id < VEHICLE_SLOT_LIMIT; ++id) {
+        const uintptr_t p = g_KnownVehiclePointers[id];
+        if (p == 0) continue;
+        if (SlotIndexOfVehicle(game, p) >= 0 && *(uint32_t*)(p + 0x10) == g_NetIdVehicleType[id]) continue;
+        if (host) {
+            VehicleRemovePacket pkt;
+            pkt.type = PACKET_VEHICLE_REMOVE;
+            pkt.originId = g_LocalPlayerId.load();
+            pkt.netId = id;
+            QueueVehicleEvent(&pkt, sizeof(pkt));
+            LOGI("[VEHNET] arac satildi/kayboldu netId=%u -> REMOVE gonderildi", (unsigned)id);
+#if VEHNET_DEBUG_TOAST
+            ShowNativeToast("[VEH] sold #" + std::to_string(id) + " sent");
+#endif
+        }
+        { std::lock_guard<std::mutex> lock(g_VehicleStateMutex); ClearVehicleStateSlot(id); }
+        changed = true;
+    }
+
+    // 2) Yeni belirmis araclar (sadece host netId verir)
+    if (host && g_VehicleGetPosition) {
+        const uint32_t n = VehicleCount(game);
+        for (uint32_t i = 0; i < n; ++i) {
+            const uintptr_t p = RawVehicleSlot(game, i);
+            if (p == 0 || NetIdOfVehicle(p) >= 0) continue;
+            const int id = AllocNetId();
+            if (id < 0) break;
+            float x = 0.0f, y = 0.0f;
+            g_VehicleGetPosition((void*)p, &x, &y);
+            {
+                std::lock_guard<std::mutex> lock(g_VehicleStateMutex);
+                g_KnownVehiclePointers[id] = p;
+                g_NetIdVehicleType[id] = *(uint32_t*)(p + 0x10);
+            }
+            VehicleSpawnPacket pkt;
+            memset(&pkt, 0, sizeof(pkt));
+            pkt.type = PACKET_VEHICLE_SPAWN;
+            pkt.originId = g_LocalPlayerId.load();
+            pkt.netId = (uint16_t)id;
+            pkt.vehicleType = (uint16_t)g_NetIdVehicleType[id];
+            pkt.x = x; pkt.y = 0.0f; pkt.z = y;          // Vector3: (x, yukseklik, 2B-y)
+            pkt.angleBits = 0xbfc90fda;                   // buyItem'in kullandigi sabit aci
+            QueueVehicleEvent(&pkt, sizeof(pkt));
+            LOGI("[VEHNET] yeni arac type=%u netId=%d idx=%u -> SPAWN gonderildi", (unsigned)pkt.vehicleType, id, i);
+#if VEHNET_DEBUG_TOAST
+            ShowNativeToast("[VEH] bought #" + std::to_string(id) + " sent");
+#endif
+            changed = true;
+        }
+    }
+    if (changed) {
+        g_NetMapDirty.store(true);
+        if (host) g_HostForceTable.store(true);
+    }
 }
 
 // Her karede (oyun thread'i): netId tablosunu kurar / yok olan araclari temizler.
@@ -1131,9 +1200,12 @@ static void RefreshVehicleTopology(uintptr_t game) {
             std::lock_guard<std::mutex> lock(g_VehicleStateMutex);
             for (uint16_t i = 0; i < VEHICLE_SLOT_LIMIT; ++i) ClearVehicleStateSlot(i);
             for (uint32_t i = 0; i < n && i < map.size(); ++i)
-                if (map[i] < VEHICLE_SLOT_LIMIT) g_KnownVehiclePointers[map[i]] = RawVehicleSlot(game, i);
+                if (map[i] < VEHICLE_SLOT_LIMIT) {
+                    const uintptr_t vp = RawVehicleSlot(game, i);
+                    g_KnownVehiclePointers[map[i]] = vp;
+                    g_NetIdVehicleType[map[i]] = *(uint32_t*)(vp + 0x10);
+                }
         }
-        g_UnboundLocalVehicles.clear();
         {   // netmap'ten ESKI olan bekleyen olaylari at (zaten kayitta/tabloda var)
             std::lock_guard<std::mutex> lock(g_VehicleEventMutex);
             std::vector<PendingVehicleOp> keep;
@@ -1146,126 +1218,92 @@ static void RefreshVehicleTopology(uintptr_t game) {
         static bool s_hookWarned = false;
         if (!g_VehicleHooksOk && !s_hookWarned) {
             s_hookWarned = true;
-            ShowNativeToast("Vehicle buy/sell sync is unavailable (game hooks not found).");
+            ShowNativeToast("Vehicle buy/sell sync is unavailable (game functions not found).");
         }
         if (g_IsClient.load()) g_SyncRequestOut.store(true);
         if (g_IsHost.load()) g_HostForceTable.store(true);
     } else {
-        // Yok olan araclari temizle (satildi / kayit degisti).
-        bool changed = false;
-        for (uint16_t id = 0; id < VEHICLE_SLOT_LIMIT; ++id) {
-            const uintptr_t p = g_KnownVehiclePointers[id];
-            if (p != 0 && SlotIndexOfVehicle(game, p) < 0) {
-                std::lock_guard<std::mutex> lock(g_VehicleStateMutex);
-                ClearVehicleStateSlot(id);
-                changed = true;
-            }
-        }
-        for (size_t i = g_UnboundLocalVehicles.size(); i-- > 0;)
-            if (SlotIndexOfVehicle(game, g_UnboundLocalVehicles[i]) < 0)
-                g_UnboundLocalVehicles.erase(g_UnboundLocalVehicles.begin() + i);
-        if (changed) {
-            g_NetMapDirty.store(true);
-            if (g_IsHost.load()) g_HostForceTable.store(true);
-        }
+        VehicleTopologyWatch(game);
     }
     if (g_IsHost.load() && g_NetMapDirty.load()) BuildHostNetMap(game);
 }
 
-// ---- Oyundaki arac ekleme/silme kancalari (Game::addVehicle / Game::removeVehicle) ----
+// ---- Oyunun arac fonksiyonlari: KANCA YOK, sadece cagrilir (dlsym ile bulunur) ----
+// (buyItem'in ilk komutlari PC-gorelidir; Substrate hook'u bunu bozup oyunu cokertiyordu.)
 typedef uint32_t (*Game_addVehicle_t)(void* game, int type, const float* pos, uint32_t angleBits, uint32_t extra);
 typedef void (*Game_removeVehicle_t)(void* game, uint32_t idx);
 typedef void (*Vehicle_destroy_t)(void* vehicle);
+typedef void (*GuiResetDialog_t)(void* guiDesc);
 static Game_addVehicle_t orig_Game_addVehicle = nullptr;
 static Game_removeVehicle_t orig_Game_removeVehicle = nullptr;
 static Vehicle_destroy_t g_VehicleDestroyFn = nullptr;
+static GuiResetDialog_t g_ResetDialogFn = nullptr;
+static long long g_LastShopToastMs = 0;
 
-static uint32_t my_Game_addVehicle(void* game, int type, const float* pos, uint32_t angleBits, uint32_t extra) {
-    const uint32_t idx = orig_Game_addVehicle(game, type, pos, angleBits, extra);
-    const uintptr_t g = (uintptr_t)game;
-    if (g_ApplyingRemoteVehicleOp || !g_VehNetArmed.load() || !g_IsConnected.load()) return idx;
-    if (idx >= VehicleCount(g) || pos == nullptr) return idx;
-    const uintptr_t p = RawVehicleSlot(g, idx);
-    if (p == 0) return idx;
-
-    VehicleSpawnPacket pkt;
-    memset(&pkt, 0, sizeof(pkt));
-    pkt.type = PACKET_VEHICLE_SPAWN;
-    pkt.originId = g_LocalPlayerId.load();
-    pkt.vehicleType = (uint16_t)type;
-    pkt.x = pos[0]; pkt.y = pos[1]; pkt.z = pos[2];
-    pkt.angleBits = angleBits;
-    if (g_IsHost.load()) {
-        const int id = AllocNetId();
-        if (id < 0) return idx;
-        { std::lock_guard<std::mutex> lock(g_VehicleStateMutex); g_KnownVehiclePointers[id] = p; }
-        pkt.netId = (uint16_t)id;
-        g_NetMapDirty.store(true);
-        g_HostForceTable.store(true);
-    } else {
-        g_UnboundLocalVehicles.push_back(p);    // host netId verince baglanir
-        pkt.netId = 0xFFFF;
-    }
-    QueueVehicleEvent(&pkt, sizeof(pkt));
-    LOGI("[VEHNET] add type=%d idx=%u netId=%u", type, idx, (unsigned)pkt.netId);
-    return idx;
-}
-
-static void my_Game_removeVehicle(void* game, uint32_t idx) {
-    const uintptr_t g = (uintptr_t)game;
-    int netId = -1;
-    if (g_VehNetArmed.load() && g_IsConnected.load() && idx < VehicleCount(g)) {
-        const uintptr_t p = RawVehicleSlot(g, idx);
-        netId = NetIdOfVehicle(p);
-        for (size_t i = g_UnboundLocalVehicles.size(); i-- > 0;)
-            if (g_UnboundLocalVehicles[i] == p) g_UnboundLocalVehicles.erase(g_UnboundLocalVehicles.begin() + i);
-        if (netId >= 0) {
-            // Arac yok edilmeden ONCE tum kayitlari temizle: artik hicbir yerde bu arac kalmaz.
-            std::lock_guard<std::mutex> lock(g_VehicleStateMutex);
-            ClearVehicleStateSlot((uint16_t)netId);
-        }
-        g_NetMapDirty.store(true);
-        if (g_IsHost.load()) g_HostForceTable.store(true);
-    }
-    if (netId >= 0 && !g_ApplyingRemoteVehicleOp) {
-        VehicleRemovePacket pkt;
-        pkt.type = PACKET_VEHICLE_REMOVE;
-        pkt.originId = g_LocalPlayerId.load();
-        pkt.netId = (uint16_t)netId;
-        QueueVehicleEvent(&pkt, sizeof(pkt));
-        LOGI("[VEHNET] remove idx=%u netId=%d", idx, netId);
-    }
-    orig_Game_removeVehicle(game, idx);
-}
-
-// Client oyunu host'un: client araclara bakabilir ama alim/satim yapamaz.
-typedef uint32_t (*Game_buyItem_t)(void* game, uint32_t item, uint32_t a, uint32_t b);
-typedef void (*Game_sellItem_t)(void* game, uint32_t item);
-static Game_buyItem_t orig_Game_buyItem = nullptr;
-static Game_sellItem_t orig_Game_sellItem = nullptr;
-static long long g_LastShopBlockToastMs = 0;
-
-static bool ClientShopBlocked() {
-    if (!(g_IsClient.load() && g_IsConnected.load())) return false;
+static void ShopBlockedToast() {
     const long long now = NowMs();
-    if (now - g_LastShopBlockToastMs > 2000) {
-        g_LastShopBlockToastMs = now;
-        ShowNativeToast("Only the host can buy or sell items.");
+    if (now - g_LastShopToastMs < 2000) return;
+    g_LastShopToastMs = now;
+    ShowNativeToast("Only the host can buy or sell items.");
+}
+
+static void VehNetToast(const std::string& msg) {
+#if VEHNET_DEBUG_TOAST
+    ShowNativeToast(msg);
+#else
+    (void)msg;
+#endif
+}
+
+// Client alim/satim yapamaz. Her karede (my_GameUpdate): yeni belirmis (netId'siz) araci geri alir,
+// parayi bir onceki karedeki degere dondurur; satis onay penceresi acilirsa kapatir.
+static void ClientShopGuard(uintptr_t game) {
+    static std::vector<uintptr_t> s_prev;
+    static double s_prevMoney = 0.0;
+    static bool s_havePrev = false;
+
+    if (game == 0 || !(g_IsClient.load() && g_IsConnected.load()) || !g_VehNetArmed.load() ||
+        g_ApplyingRemoteVehicleOp) { s_havePrev = false; return; }
+    const uint32_t state = *(uint32_t*)(game + 0x64);
+    if (state != 6 && state != 7) { s_havePrev = false; return; }
+
+    const uint32_t n = VehicleCount(game);
+    std::vector<uintptr_t> cur;
+    for (uint32_t i = 0; i < n; ++i) cur.push_back(RawVehicleSlot(game, i));
+
+    if (s_havePrev && orig_Game_removeVehicle && g_VehicleDestroyFn && n > 1) {
+        for (uintptr_t p : cur) {
+            if (std::find(s_prev.begin(), s_prev.end(), p) != s_prev.end()) continue;   // eskiden vardi
+            if (NetIdOfVehicle(p) >= 0) continue;                                       // host'un verdigi arac
+            if (*(uintptr_t*)(p + 0x55C) != 0 || *(uintptr_t*)(p + 0x560) != 0) continue;
+            const int idx = SlotIndexOfVehicle(game, p);
+            if (idx < 0) continue;
+            g_ApplyingRemoteVehicleOp = true;
+            orig_Game_removeVehicle((void*)game, (uint32_t)idx);
+            g_VehicleDestroyFn((void*)p);
+            g_ApplyingRemoteVehicleOp = false;
+            memcpy((void*)(game + 0x6A0), &s_prevMoney, sizeof(double));   // parayi geri ver
+            ShopBlockedToast();
+            LOGI("[VEHNET] client alimi geri alindi");
+            cur.clear();
+            const uint32_t n2 = VehicleCount(game);
+            for (uint32_t i = 0; i < n2; ++i) cur.push_back(RawVehicleSlot(game, i));
+            break;
+        }
     }
-    return true;
+    s_prev.swap(cur);
+    memcpy(&s_prevMoney, (const void*)(game + 0x6A0), sizeof(double));
+    s_havePrev = true;
+
+    // Satis onay penceresi (alt durum 0x10): acilir acilmaz kapat, onaylanamasin.
+    if (*(volatile int*)(game + 0x68) == 0x10 && g_ResetDialogFn) {
+        *(volatile int*)(game + 0x68) = 0;
+        g_ResetDialogFn((void*)(game + 0x8910));
+        ShopBlockedToast();
+    }
 }
 
-static uint32_t my_Game_buyItem(void* game, uint32_t item, uint32_t a, uint32_t b) {
-    if (ClientShopBlocked()) return 0;          // 0 = satin alma basarisiz (oyun bunu zaten yonetiyor)
-    return orig_Game_buyItem(game, item, a, b);
-}
-
-static void my_Game_sellItem(void* game, uint32_t item) {
-    if (ClientShopBlocked()) return;
-    orig_Game_sellItem(game, item);
-}
-
-// Diger cihazlardan gelen arac ekle/sil olaylarini oyun thread'inde uygular.
+// Host'tan gelen arac ekle/sil olaylarini client'ta oyun thread'inde uygular.
 static void ApplyPendingVehicleOps(uintptr_t game) {
     if (game == 0 || !g_IsConnected.load()) return;
     RefreshVehicleTopology(game);
@@ -1276,83 +1314,62 @@ static void ApplyPendingVehicleOps(uintptr_t game) {
         if (g_PendingVehicleOps.empty()) return;
         ops.swap(g_PendingVehicleOps);
     }
+    if (g_IsHost.load()) return;                     // host olaylari uretir, uygulamaz
+
     for (const PendingVehicleOp& op : ops) {
-        if (op.netId != 0xFFFF && op.netId >= VEHICLE_SLOT_LIMIT) continue;
+        if (op.netId >= VEHICLE_SLOT_LIMIT) continue;
 
         if (op.kind == 2) {                          // REMOVE
-            if (!orig_Game_removeVehicle || !g_VehicleDestroyFn) { LOGI("[VEHNET] remove: kanca yok"); continue; }
-            const uintptr_t p = (op.netId < VEHICLE_SLOT_LIMIT) ? g_KnownVehiclePointers[op.netId] : 0;
+            VehNetToast("[VEH] remove #" + std::to_string(op.netId) + " received");
+            if (!orig_Game_removeVehicle || !g_VehicleDestroyFn) {
+                LOGI("[VEHNET] remove: fonksiyon bulunamadi");
+                VehNetToast("[VEH] remove failed: symbols missing");
+                continue;
+            }
+            const uintptr_t p = g_KnownVehiclePointers[op.netId];
             const int idx = p ? SlotIndexOfVehicle(game, p) : -1;
             if (idx < 0) {
+                VehNetToast("[VEH] remove failed: vehicle not found");
                 std::lock_guard<std::mutex> lock(g_VehicleStateMutex);
                 ClearVehicleStateSlot(op.netId);
                 continue;
             }
-            // Baglanti (romork/alet) varsa guvenli sekilde ayirmak icin ek kanca gerekir: simdilik atla.
+            // Baglanti (romork/alet) varsa guvenli ayirma icin ek is gerekir: simdilik atla.
             if (*(uintptr_t*)(p + 0x55C) != 0 || *(uintptr_t*)(p + 0x560) != 0) {
                 LOGI("[VEHNET] remove netId=%u atlandi (romork/alet bagli)", (unsigned)op.netId);
+                VehNetToast("[VEH] remove skipped: trailer/tool attached");
                 std::lock_guard<std::mutex> lock(g_VehicleStateMutex);
                 ClearVehicleStateSlot(op.netId);
                 continue;
             }
-            {
-                std::lock_guard<std::mutex> lock(g_VehicleStateMutex);
-                ClearVehicleStateSlot(op.netId);
-            }
+            { std::lock_guard<std::mutex> lock(g_VehicleStateMutex); ClearVehicleStateSlot(op.netId); }
             g_ApplyingRemoteVehicleOp = true;
             orig_Game_removeVehicle((void*)game, (uint32_t)idx);
             g_VehicleDestroyFn((void*)p);
             g_ApplyingRemoteVehicleOp = false;
             g_NetMapDirty.store(true);
-            if (g_IsHost.load()) g_HostForceTable.store(true);
+            VehNetToast("[VEH] vehicle #" + std::to_string(op.netId) + " removed");
             continue;
         }
 
-        // SPAWN (kind 0: host, client istegini uyguluyor / kind 1: host netId atamis)
-        if (!orig_Game_addVehicle) { LOGI("[VEHNET] spawn: addVehicle kancasi yok"); continue; }
-        if (op.kind == 1 && op.originId == g_LocalPlayerId.load()) {
-            // Bu cihazda zaten alinmisti: sirada bekleyen yerel araci host'un verdigi netId'ye bagla.
-            while (!g_UnboundLocalVehicles.empty()) {
-                const uintptr_t p = g_UnboundLocalVehicles.front();
-                g_UnboundLocalVehicles.erase(g_UnboundLocalVehicles.begin());
-                if (SlotIndexOfVehicle(game, p) < 0) continue;
+        if (op.kind == 1) {                          // SPAWN (host netId atamis)
+            VehNetToast("[VEH] spawn #" + std::to_string(op.netId) + " received");
+            if (!orig_Game_addVehicle) { VehNetToast("[VEH] spawn failed: symbol missing"); continue; }
+            if (VehicleCount(game) >= 30) { LOGI("[VEHNET] spawn atlandi: arac siniri"); continue; }
+            const float pos[3] = { op.x, op.y, op.z };
+            g_ApplyingRemoteVehicleOp = true;
+            const uint32_t idx = orig_Game_addVehicle((void*)game, (int)op.vehicleType, pos, op.angleBits, 0);
+            g_ApplyingRemoteVehicleOp = false;
+            if (idx >= VehicleCount(game)) continue;
+            {
                 std::lock_guard<std::mutex> lock(g_VehicleStateMutex);
-                g_KnownVehiclePointers[op.netId] = p;
-                break;
+                const uintptr_t vp = RawVehicleSlot(game, idx);
+                g_KnownVehiclePointers[op.netId] = vp;
+                g_NetIdVehicleType[op.netId] = *(uint32_t*)(vp + 0x10);
             }
             g_NetMapDirty.store(true);
-            continue;
+            LOGI("[VEHNET] spawn uygulandi type=%u netId=%u idx=%u", (unsigned)op.vehicleType, (unsigned)op.netId, idx);
         }
-        if (VehicleCount(game) >= 30) { LOGI("[VEHNET] spawn atlandi: arac siniri"); continue; }
-        int netId = op.netId;
-        if (op.kind == 0) {
-            if (!g_IsHost.load()) continue;
-            netId = AllocNetId();
-            if (netId < 0) continue;
-        }
-        const float pos[3] = { op.x, op.y, op.z };
-        g_ApplyingRemoteVehicleOp = true;
-        const uint32_t idx = orig_Game_addVehicle((void*)game, (int)op.vehicleType, pos, op.angleBits, 0);
-        g_ApplyingRemoteVehicleOp = false;
-        if (idx >= VehicleCount(game)) continue;
-        {
-            std::lock_guard<std::mutex> lock(g_VehicleStateMutex);
-            g_KnownVehiclePointers[netId] = RawVehicleSlot(game, idx);
-        }
-        g_NetMapDirty.store(true);
-        if (op.kind == 0) {                          // host: herkese (istegi yapan dahil) netId'yi bildir
-            VehicleSpawnPacket pkt;
-            memset(&pkt, 0, sizeof(pkt));
-            pkt.type = PACKET_VEHICLE_SPAWN;
-            pkt.originId = op.originId;
-            pkt.netId = (uint16_t)netId;
-            pkt.vehicleType = op.vehicleType;
-            pkt.x = op.x; pkt.y = op.y; pkt.z = op.z;
-            pkt.angleBits = op.angleBits;
-            QueueVehicleEvent(&pkt, sizeof(pkt));
-            g_HostForceTable.store(true);
-        }
-        LOGI("[VEHNET] spawn uygulandi type=%u netId=%d idx=%u", (unsigned)op.vehicleType, netId, idx);
     }
 }
 
@@ -2374,7 +2391,7 @@ static bool ProcessPackets(uint8_t* buf, size_t& buffered, int peerId, std::vect
         else if (type == PACKET_SAVE_REQUEST) size = sizeof(SaveRequestPacket);
         else if (type == PACKET_SAVE_CHUNK) size = sizeof(SaveChunkPacket);
         else if (type == PACKET_VEHICLE_SPAWN) size = sizeof(VehicleSpawnPacket);
-        else if (type == PACKET_VEHICLE_REMOVE) { size = sizeof(VehicleRemovePacket); relayIt = true; }
+        else if (type == PACKET_VEHICLE_REMOVE) size = sizeof(VehicleRemovePacket);
         else if (type == PACKET_VEHICLE_NETMAP) {
             if (buffered < 3) break;
             uint16_t cnt;
@@ -2484,25 +2501,22 @@ static bool ProcessPackets(uint8_t* buf, size_t& buffered, int peerId, std::vect
         } else if (type == PACKET_VEHICLE_SPAWN) {
             VehicleSpawnPacket pkt;
             memcpy(&pkt, buf, sizeof(pkt));
-            PendingVehicleOp op;
-            memset(&op, 0, sizeof(op));
-            op.originId = pkt.originId; op.netId = pkt.netId; op.vehicleType = pkt.vehicleType;
-            op.x = pkt.x; op.y = pkt.y; op.z = pkt.z; op.angleBits = pkt.angleBits;
-            if (fromPeer && g_IsHost.load()) {            // client'in alim istegi
-                op.kind = 0; op.originId = (uint8_t)peerId; op.netId = 0xFFFF;
-                PushVehicleOp(op);
-            } else if (!fromPeer && !g_IsHost.load()) {   // host'tan: netId atanmis spawn
-                op.kind = 1;
+            if (!fromPeer && !g_IsHost.load()) {          // sadece host'tan (netId atanmis)
+                PendingVehicleOp op;
+                memset(&op, 0, sizeof(op));
+                op.kind = 1; op.originId = pkt.originId; op.netId = pkt.netId; op.vehicleType = pkt.vehicleType;
+                op.x = pkt.x; op.y = pkt.y; op.z = pkt.z; op.angleBits = pkt.angleBits;
                 PushVehicleOp(op);
             }
         } else if (type == PACKET_VEHICLE_REMOVE) {
             VehicleRemovePacket pkt;
             memcpy(&pkt, buf, sizeof(pkt));
-            if (fromPeer) { pkt.originId = (uint8_t)peerId; memcpy(buf, &pkt, sizeof(pkt)); }
-            PendingVehicleOp op;
-            memset(&op, 0, sizeof(op));
-            op.kind = 2; op.originId = pkt.originId; op.netId = pkt.netId;
-            PushVehicleOp(op);
+            if (!fromPeer && !g_IsHost.load()) {
+                PendingVehicleOp op;
+                memset(&op, 0, sizeof(op));
+                op.kind = 2; op.originId = pkt.originId; op.netId = pkt.netId;
+                PushVehicleOp(op);
+            }
         } else if (type == PACKET_VEHICLE_NETMAP) {
             if (!fromPeer && !g_IsHost.load()) {
                 uint16_t cnt;
@@ -4548,6 +4562,8 @@ void my_GameUpdate(void* thiz, float param_1) {
     g_LastGameUpdateMs.store(NowMs());   // host canlilik sinyali icin (oyun dongusu donarsa ping kesilir)
     g_EngineInstance = (uintptr_t)thiz; 
     g_CurrentMenu = MENU_INGAME; 
+    VehicleTopologyWatch((uintptr_t)thiz);
+    ClientShopGuard((uintptr_t)thiz);
 
     // Oturum guvenligi: host oyundan cikarsa oda kapanir, client baglantisi kopunca oyundan atilir.
     {
@@ -4800,17 +4816,15 @@ void ModMain() {
         void* addVeh = dlsym(appLib, "_ZN4Game10addVehicleEN13EntityManager8VEHICLESERK7Vector3fj");
         if (!addVeh) addVeh = FindElfSymbolByPrefix("libapp.so", "_ZN4Game10addVehicleE");
         void* remVeh = dlsym(appLib, "_ZN4Game13removeVehicleEj");
+        if (!remVeh) remVeh = FindElfSymbolByPrefix("libapp.so", "_ZN4Game13removeVehicleEj");
         g_VehicleDestroyFn = (Vehicle_destroy_t)dlsym(appLib, "_ZN7Vehicle7destroyEv");
         if (!g_VehicleDestroyFn) g_VehicleDestroyFn = (Vehicle_destroy_t)FindElfSymbolByPrefix("libapp.so", "_ZN7Vehicle7destroyEv");
-        void* buyItem = dlsym(appLib, "_ZN4Game7buyItemEjbb");
-        void* sellItem = dlsym(appLib, "_ZN4Game8sellItemEj");
-        LOGI("vehicle hooks: addVehicle=%p removeVehicle=%p Vehicle::destroy=%p buyItem=%p sellItem=%p",
-             addVeh, remVeh, (void*)g_VehicleDestroyFn, buyItem, sellItem);
-        if (addVeh) MSHookFunction(addVeh, (void*)my_Game_addVehicle, (void**)&orig_Game_addVehicle);
-        if (remVeh) MSHookFunction(remVeh, (void*)my_Game_removeVehicle, (void**)&orig_Game_removeVehicle);
-        if (buyItem) MSHookFunction(buyItem, (void*)my_Game_buyItem, (void**)&orig_Game_buyItem);
-        if (sellItem) MSHookFunction(sellItem, (void*)my_Game_sellItem, (void**)&orig_Game_sellItem);
+        g_ResetDialogFn = (GuiResetDialog_t)dlsym(appLib, "_ZN16GUIInterfaceDesc11resetDialogEv");
+        orig_Game_addVehicle = (Game_addVehicle_t)addVeh;          // KANCA DEGIL: dogrudan cagrilir
+        orig_Game_removeVehicle = (Game_removeVehicle_t)remVeh;
         g_VehicleHooksOk = addVeh && remVeh && g_VehicleDestroyFn;
+        LOGI("vehicle symbols (kancasiz): addVehicle=%p removeVehicle=%p Vehicle::destroy=%p resetDialog=%p",
+             addVeh, remVeh, (void*)g_VehicleDestroyFn, (void*)g_ResetDialogFn);
         if (saveTask) {
             g_SaveStartTaskFn = saveTask;
             MSHookFunction(saveTask, (void*)my_SaveStartTask, (void**)&orig_SaveStartTask);
