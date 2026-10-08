@@ -1159,7 +1159,9 @@ static void RefreshVehicleTopology(uintptr_t game) {
     if (game == 0) return;
     const uint32_t state = *(uint32_t*)(game + 0x64);
     const uint32_t n = VehicleCount(game);
-    if (state != 6 || n == 0 || !g_IsConnected.load()) {
+    // Durum 6 = oyun, durum 7 = oyun ici menu (magaza/ayarlar). Alim/satim durum 7'de olur;
+    // ag orada kapanirsa satis/alim hic bildirilmez (host logunda "armed=0" olarak goruldu).
+    if ((state != 6 && state != 7) || n == 0 || !g_IsConnected.load()) {
         if (g_VehNetArmed.load()) DisarmVehicleNet();
         return;
     }
@@ -4691,8 +4693,14 @@ void my_GameUpdateStateBase(void* thiz, float param_1, uint32_t param_2, uint32_
     // Game::update() ends with waitVSync(), so this hook must not try to force
     // the engine to 120 FPS. We sample at up to 120 Hz when callbacks allow it,
     // and the network is independently capped at 30 snapshots/sec.
-    ApplyRemoteVehicleStates(g_EngineInstance);
-    CaptureAndQueueLocalVehicleState(g_EngineInstance);
+    if (*(volatile uint32_t*)(g_EngineInstance + 0x64) == 6) {
+        ApplyRemoteVehicleStates(g_EngineInstance);
+        CaptureAndQueueLocalVehicleState(g_EngineInstance);
+    } else {
+        // Oyun ici menu (magaza): konum esitleme yok, ama arac tablosu acik kalir ve
+        // magazadan alinan/satilan araclar hemen diger cihazlara bildirilir.
+        RefreshVehicleTopology(g_EngineInstance);
+    }
 
     // Oyun ici ImGui cizimi: ekran renderQueues'ta (presentGLESFramebuffer) ekrana verilir,
     // yani cizim ondan ONCE yapilmali. Bu fonksiyon sadece oyun durumu 6'da cagrilir.
@@ -4772,6 +4780,29 @@ static void AutoStartInject() {
     }
 }
 
+// Game::buyItem bazen urun numarasi olarak bir float bit deseni (0x42800000 = 64.0f) aliyor ve
+// this+(numara+0x23c8)*4 adresine erisirken cokuyor (adb: buyItem+18, fault addr 0xf95c8f34).
+// Numara GUI yoneticisinin +0x583c alanindan ve Game+0x9c24'ten geliyor. Gecerli aralik 0..0x11.
+// Burada bozuk deger gorulurse duzeltilir / tiklama iptal edilir ve LOG'a yazilir (nedeni ararken).
+static void GuardShopSelection(void* gui) {
+    if (g_EngineInstance == 0 || gui == nullptr) return;
+    const uintptr_t g = g_EngineInstance;
+    if (*(volatile uint32_t*)(g + 0x64) != 7) return;        // sadece oyun ici menu
+    volatile uint32_t* sel = (volatile uint32_t*)((uintptr_t)gui + 0x583c);
+    if (*sel > 0x11) {
+        LOGI("[SHOP] GUI secili urun bozuk: 0x%08x -> 0", (unsigned)*sel);
+        *sel = 0;
+    }
+    const uint32_t ev = *(volatile uint32_t*)(g + 0x9c20);
+    if (ev >= 0x19 && ev <= 0x1d) {
+        const uint32_t idx = *(volatile uint32_t*)(g + 0x9c24);
+        if (idx > 0x11) {
+            LOGI("[SHOP] bozuk urun numarasi 0x%08x (olay=0x%x): tiklama iptal edildi", (unsigned)idx, (unsigned)ev);
+            *(volatile uint32_t*)(g + 0x9c20) = 0;
+        }
+    }
+}
+
 void* my_updateGUI(void* thiz, void* p1, void* p2, void* p3, void* p4) {
     g_HUDInstance = (uintptr_t)thiz;
 
@@ -4789,6 +4820,7 @@ void* my_updateGUI(void* thiz, void* p1, void* p2, void* p3, void* p4) {
     }
 
     void* ret = orig_updateGUI ? orig_updateGUI(thiz, p1, p2, p3, p4) : nullptr;
+    GuardShopSelection(thiz);
     AutoStartInject();
     return ret;
 }
