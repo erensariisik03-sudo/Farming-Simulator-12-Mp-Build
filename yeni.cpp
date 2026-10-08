@@ -591,6 +591,8 @@ static const uint8_t PACKET_UDP_HELLO = 15;    // client -> host (UDP): [type][p
 static const uint8_t PACKET_VEHICLE_SPAWN = 17;   // arac eklendi (client->host: istek netId=0xFFFF; host->herkes: netId atanmis)
 static const uint8_t PACKET_VEHICLE_REMOVE = 18;  // arac satildi/silindi (netId)
 static const uint8_t PACKET_VEHICLE_NETMAP = 19;  // host -> client: oyundaki arac sirasi -> netId esleme tablosu
+static const uint8_t PACKET_MONEY_DELTA = 20;     // para degisimi (+/-): client->host, host->herkes
+static const uint8_t PACKET_MONEY_SET = 21;       // host -> client: mutlak para (oyuncu odaya katilinca)
 static const uint8_t PACKET_UDP_ACK = 16;      // host -> client (UDP): UDP yolu acildi
 
 // Baglanti sagligi: bu sureden uzun sessizlik = karsi taraf gitti (donmus / zorla kapatilmis).
@@ -739,6 +741,11 @@ struct VehicleRemovePacket {
     uint8_t type;
     uint8_t originId;
     uint16_t netId;
+};
+struct MoneyPacket {
+    uint8_t type;
+    uint8_t originId;
+    double value;
 };
 
 #pragma pack(pop)
@@ -970,6 +977,90 @@ static void QueueVehicleEvent(const void* pkt, size_t size) {
     if (g_VehicleEventOut.size() > 4096) g_VehicleEventOut.clear();
     const uint8_t* b = (const uint8_t*)pkt;
     g_VehicleEventOut.insert(g_VehicleEventOut.end(), b, b + size);
+}
+
+// ========================================================================
+// ORTAK PARA (Game+0x6a0 = double)
+// Oyun parayi alim/satim/yakit/maas/hasat satisi gibi pek cok yerde degistirir. Bu yuzden
+// degisimler tek tek kancalanmaz: her karede "simdiki - son bilinen" farki hesaplanir (delta),
+// birikip 300 ms'de bir gonderilir. Gelen deltalar yerel paraya eklenir. Host araya girip iletir.
+// Sadece delta kullanildigi icin es zamanli degisiklikler kaybolmaz. Katilan oyuncuya host
+// mutlak degeri (MONEY_SET) bir kez gonderir.
+// kSharedMoney=false yaparsan her oyuncu kendi parasini kullanir.
+// ========================================================================
+static const bool kSharedMoney = true;
+static std::mutex g_MoneyMutex;
+static std::vector<double> g_MoneyIncoming;
+static bool g_MoneySetPending = false;
+static double g_MoneySetValue = 0.0;
+static std::atomic<bool> g_MoneySendSet(false);
+static bool g_MoneyInit = false;
+static double g_MoneyLast = 0.0, g_MoneyAccum = 0.0;
+static long long g_MoneyLastSendMs = 0;
+
+static double ReadMoney(uintptr_t g) { double d; memcpy(&d, (const void*)(g + 0x6a0), sizeof(d)); return d; }
+static void WriteMoney(uintptr_t g, double d) { memcpy((void*)(g + 0x6a0), &d, sizeof(d)); }
+static bool MoneyOk(double d) { return d == d && d > -1e12 && d < 1e12; }
+
+// Oyun thread'i, HER karede (tum oyun durumlarinda) cagrilir.
+static void MoneyFrame(uintptr_t g) {
+    if (!kSharedMoney || g == 0) return;
+    const uint32_t st = *(volatile uint32_t*)(g + 0x64);
+    const bool connected = g_IsConnected.load();
+    if (!connected || (st != 6 && st != 7)) {
+        // Oyun disi: son bilinen degeri birakma (menude/yuklemede para sicrar, delta sayilmasin).
+        g_MoneyInit = false;
+        g_MoneyAccum = 0.0;
+        if (!connected) {
+            std::lock_guard<std::mutex> lock(g_MoneyMutex);
+            g_MoneyIncoming.clear();
+            g_MoneySetPending = false;
+        }
+        return;
+    }
+
+    double cur = ReadMoney(g);
+    if (!g_MoneyInit) { g_MoneyInit = true; g_MoneyLast = cur; g_MoneyAccum = 0.0; }
+
+    // 1) yerel degisim (oyunun kendi alim/satim/gideri)
+    g_MoneyAccum += cur - g_MoneyLast;
+    g_MoneyLast = cur;
+
+    // 2) diger oyunculardan gelenler
+    double inc = 0.0, setVal = 0.0;
+    bool haveSet = false;
+    {
+        std::lock_guard<std::mutex> lock(g_MoneyMutex);
+        for (size_t i = 0; i < g_MoneyIncoming.size(); ++i) inc += g_MoneyIncoming[i];
+        g_MoneyIncoming.clear();
+        if (g_MoneySetPending) { haveSet = true; setVal = g_MoneySetValue; g_MoneySetPending = false; }
+    }
+    if (haveSet && MoneyOk(setVal)) {
+        WriteMoney(g, setVal);
+        cur = setVal; g_MoneyLast = setVal; g_MoneyAccum = 0.0;
+        LOGI("[MONEY] host parasi alindi: %.2f", setVal);
+    } else if (inc != 0.0 && MoneyOk(cur + inc)) {
+        cur += inc;
+        WriteMoney(g, cur);
+        g_MoneyLast = cur;                      // bu degisim yerel sayilmasin
+    }
+
+    // 3) host: yeni katilana mutlak degeri gonder
+    if (g_IsHost.load() && g_MoneySendSet.exchange(false)) {
+        MoneyPacket p; memset(&p, 0, sizeof(p));
+        p.type = PACKET_MONEY_SET; p.originId = g_LocalPlayerId.load(); p.value = cur;
+        QueueVehicleEvent(&p, sizeof(p));
+    }
+
+    // 4) yerel degisimleri gonder
+    const long long now = NowMs();
+    if (fabs(g_MoneyAccum) > 1e-6 && (now - g_MoneyLastSendMs) >= 300) {
+        MoneyPacket p; memset(&p, 0, sizeof(p));
+        p.type = PACKET_MONEY_DELTA; p.originId = g_LocalPlayerId.load(); p.value = g_MoneyAccum;
+        QueueVehicleEvent(&p, sizeof(p));
+        g_MoneyAccum = 0.0;
+        g_MoneyLastSendMs = now;
+    }
 }
 
 static void PushVehicleOp(PendingVehicleOp op) {
@@ -2467,6 +2558,8 @@ static bool ProcessPackets(uint8_t* buf, size_t& buffered, int peerId, std::vect
         else if (type == PACKET_SAVE_CHUNK) size = sizeof(SaveChunkPacket);
         else if (type == PACKET_VEHICLE_SPAWN) size = sizeof(VehicleSpawnPacket);
         else if (type == PACKET_VEHICLE_REMOVE) { size = sizeof(VehicleRemovePacket); relayIt = true; }
+        else if (type == PACKET_MONEY_DELTA) { size = sizeof(MoneyPacket); relayIt = true; }
+        else if (type == PACKET_MONEY_SET) size = sizeof(MoneyPacket);
         else if (type == PACKET_VEHICLE_NETMAP) {
             if (buffered < 3) break;
             uint16_t cnt;
@@ -2586,6 +2679,21 @@ static bool ProcessPackets(uint8_t* buf, size_t& buffered, int peerId, std::vect
             } else if (!fromPeer && !g_IsHost.load()) {   // host'tan: netId atanmis spawn
                 op.kind = 1;
                 PushVehicleOp(op);
+            }
+        } else if (type == PACKET_MONEY_DELTA) {
+            MoneyPacket mp;
+            memcpy(&mp, buf, sizeof(mp));
+            if (kSharedMoney && mp.originId != g_LocalPlayerId.load() && MoneyOk(mp.value)) {
+                std::lock_guard<std::mutex> lock(g_MoneyMutex);
+                if (g_MoneyIncoming.size() < 1024) g_MoneyIncoming.push_back(mp.value);
+            }
+        } else if (type == PACKET_MONEY_SET) {
+            MoneyPacket mp;
+            memcpy(&mp, buf, sizeof(mp));
+            if (kSharedMoney && !g_IsHost.load() && !fromPeer && MoneyOk(mp.value)) {
+                std::lock_guard<std::mutex> lock(g_MoneyMutex);
+                g_MoneySetPending = true;
+                g_MoneySetValue = mp.value;
             }
         } else if (type == PACKET_VEHICLE_REMOVE) {
             VehicleRemovePacket pkt;
@@ -3090,6 +3198,7 @@ static void HostNetworkLoop(int serverFd, int gen) {
                         QueueAllCurrentAuthorities();
                         g_HostForceTable.store(true);     // yeni gelen hemen tam sahiplik tablosunu alsin
                         g_ForceResendAll.store(true);     // host'un araclari hemen yeniden gonderilsin
+                        g_MoneySendSet.store(true);       // yeni oyuncu host'un parasini alsin
                     }
                 }
             }
@@ -4641,6 +4750,7 @@ void my_GameUpdate(void* thiz, float param_1) {
     g_LastGameUpdateMs.store(NowMs());   // host canlilik sinyali icin (oyun dongusu donarsa ping kesilir)
     g_EngineInstance = (uintptr_t)thiz; 
     g_CurrentMenu = MENU_INGAME; 
+    MoneyFrame((uintptr_t)thiz);         // ortak para (her kare, tum oyun durumlarinda)
 
     // Oturum guvenligi: host oyundan cikarsa oda kapanir, client baglantisi kopunca oyundan atilir.
     {
@@ -4890,7 +5000,7 @@ void* my_renderStartMenuMain(void* thiz, void* p1, void* p2, void* p3) {
 // ========================================================================
 __attribute__((constructor))
 void ModMain() {
-    LOGI(">>> MULTIPLAYER MOD STARTING <<< build=shopfix-3 (RepairShopClick, state7-armed, no addVehicle hook)");
+    LOGI(">>> MULTIPLAYER MOD STARTING <<< build=shopfix-4+money (shared money, RepairShopClick, state7-armed)");
 
     ResetVehicleSyncState();
     std::thread(StartPONGResponderThread).detach();
