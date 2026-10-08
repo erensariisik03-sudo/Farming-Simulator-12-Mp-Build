@@ -261,6 +261,7 @@ uintptr_t g_EngineInstance = 0;
 uintptr_t g_MenuInstance = 0;
 uintptr_t g_StartMenuInstance = 0;
 uintptr_t g_HUDInstance = 0;
+static void RepairShopClick(void* gui, const char* where);   // tanim my_updateGUI oncesinde
 
 std::atomic<bool> g_IsHost(false);
 std::atomic<bool> g_IsClient(false);
@@ -4636,6 +4637,7 @@ void DrawImGui() {
 // RENDER HOOKS
 // ========================================================================
 void my_GameUpdate(void* thiz, float param_1) {
+    if (g_HUDInstance != 0) RepairShopClick((void*)g_HUDInstance, "gameUpdate");   // tiklama bu karede islenmeden once
     g_LastGameUpdateMs.store(NowMs());   // host canlilik sinyali icin (oyun dongusu donarsa ping kesilir)
     g_EngineInstance = (uintptr_t)thiz; 
     g_CurrentMenu = MENU_INGAME; 
@@ -4780,28 +4782,30 @@ static void AutoStartInject() {
     }
 }
 
-// Game::buyItem bazen urun numarasi olarak bir float bit deseni (0x42800000 = 64.0f) aliyor ve
-// this+(numara+0x23c8)*4 adresine erisirken cokuyor (adb: buyItem+18, fault addr 0xf95c8f34).
-// Numara GUI yoneticisinin +0x583c alanindan ve Game+0x9c24'ten geliyor. Gecerli aralik 0..0x11.
-// Burada bozuk deger gorulurse duzeltilir / tiklama iptal edilir ve LOG'a yazilir (nedeni ararken).
-static void GuardShopSelection(void* gui) {
+// Oyunun kendi koduna gore (GenericGUIManager::updateGuiButtons, case 0x20/0x21/0x22) magaza
+// alim/satim olaylarinda (0x19..0x1d) urun numarasi GUI yoneticisinin +0x583c alanindan
+// Game+0x9c24'e yazilir. Logda Game+0x9c24'un bu olaylarda hep 0x42800000 (float 64.0)
+// oldugu goruldu (+0x583c ise saglam) ve buyItem bu numarayla cokuyordu.
+// Cozum: numaray oyunun kendi kaynagindan (+0x583c) geri yaz. Gecerli aralik 0..0x11.
+static void RepairShopClick(void* gui, const char* where) {
     if (g_EngineInstance == 0 || gui == nullptr) return;
     const uintptr_t g = g_EngineInstance;
     if (*(volatile uint32_t*)(g + 0x64) != 7) return;        // sadece oyun ici menu
-    volatile uint32_t* sel = (volatile uint32_t*)((uintptr_t)gui + 0x583c);
-    if (*sel > 0x11) {
-        LOGI("[SHOP] GUI secili urun bozuk: 0x%08x -> 0", (unsigned)*sel);
-        *sel = 0;
+    volatile uint32_t* selp = (volatile uint32_t*)((uintptr_t)gui + 0x583c);
+    if (*selp > 0x11) {
+        LOGI("[SHOP] %s: GUI secili urun bozuk: 0x%08x -> 0", where, (unsigned)*selp);
+        *selp = 0;
     }
     const uint32_t ev = *(volatile uint32_t*)(g + 0x9c20);
-    if (ev >= 0x19 && ev <= 0x1d) {
-        const uint32_t idx = *(volatile uint32_t*)(g + 0x9c24);
-        if (idx > 0x11) {
-            LOGI("[SHOP] bozuk urun numarasi 0x%08x (olay=0x%x): tiklama iptal edildi", (unsigned)idx, (unsigned)ev);
-            *(volatile uint32_t*)(g + 0x9c20) = 0;
-        }
+    if (ev < 0x19 || ev > 0x1d) return;
+    const uint32_t sel = *selp;
+    volatile uint32_t* idxp = (volatile uint32_t*)(g + 0x9c24);
+    if (*idxp != sel) {
+        LOGI("[SHOP] %s: olay=0x%x urun numarasi 0x%08x -> %u (GUI secimi)", where, (unsigned)ev, (unsigned)*idxp, (unsigned)sel);
+        *idxp = sel;
     }
 }
+static void GuardShopSelection(void* gui) { RepairShopClick(gui, "updateGUI"); }
 
 void* my_updateGUI(void* thiz, void* p1, void* p2, void* p3, void* p4) {
     g_HUDInstance = (uintptr_t)thiz;
@@ -4886,7 +4890,7 @@ void* my_renderStartMenuMain(void* thiz, void* p1, void* p2, void* p3) {
 // ========================================================================
 __attribute__((constructor))
 void ModMain() {
-    LOGI(">>> MULTIPLAYER MOD STARTING <<<");
+    LOGI(">>> MULTIPLAYER MOD STARTING <<< build=shopfix-3 (RepairShopClick, state7-armed, no addVehicle hook)");
 
     ResetVehicleSyncState();
     std::thread(StartPONGResponderThread).detach();
