@@ -595,6 +595,8 @@ static const uint8_t PACKET_MONEY_DELTA = 20;     // para degisimi (+/-): client
 static const uint8_t PACKET_ACTIVE_VEHICLE = 22;  // "su an bu aracin icindeyim" (oyuncu basina, host iletir)
 static const uint8_t PACKET_MONEY_SET = 21;       // host -> client: mutlak para (oyuncu odaya katilinca)
 static const uint8_t PACKET_UDP_ACK = 16;      // host -> client (UDP): UDP yolu acildi
+static const uint8_t PACKET_TRAILER_ATTACH = 23;  // romork takildi/cikarildi (olay, guvenilir)
+static const uint8_t PACKET_ENTITY_STATE = 24;    // romork doluluk / bicer tank, calisma, kesici durumu
 
 // Baglanti sagligi: bu sureden uzun sessizlik = karsi taraf gitti (donmus / zorla kapatilmis).
 static const long long HOST_SILENCE_TIMEOUT_MS = 10000;  // client: host'tan hicbir sey gelmedi
@@ -1820,11 +1822,49 @@ static bool TryClaimLocalVehicle(uint16_t vehicleId) {
 // ve yerelde surdugu araca bagli degilse yerlestirir (alim/satim sonrasi kayma yanlis romorku oynatmaz).
 // Yeni kanca YOK; sadece okuma + b2Body::SetTransform (zaten kullaniliyor).
 // ========================================================================
+static void SetRemoteBodyVelocity(uintptr_t body, float vx, float vy, float w);
 static const uint16_t TRAILER_ID_BASE = 256;
 static const uint16_t TRAILER_WIRE_FLAG = 0x8000;
 static const uint32_t TRAILER_MAX = 0x1e;
 static bool g_TrailerMine[256];                // bu cihaz bu romorkun konumunu yayinliyor
 static uint8_t g_RemoteTrailerType[256];       // uzaktan gelen son tip (dogrulama icin)
+
+// ---- Romork takma/cikarma olayi ve varlik durumu (doluluk, bicer) paketleri ----
+struct __attribute__((packed)) TrailerAttachPacket {
+    uint8_t type;
+    uint8_t ownerId;        // host'ta peerId ile ezilir
+    uint8_t attach;         // 1 = takildi, 0 = cikarildi
+    uint8_t trIdx;          // romork sirasi (game+0x1a0..)
+    uint8_t trType;         // romork tipi (dogrulama)
+    uint16_t vehNetId;      // bagli oldugu aracin netId'si
+    float vx, vy, va;       // gonderenin arac konumu/acisi (takma aninda)
+    float tx, ty, ta;       // gonderenin romork konumu/acisi
+};
+struct __attribute__((packed)) EntityStatePacket {
+    uint8_t type;
+    uint8_t ownerId;
+    uint8_t kind;           // 1 = romork, 2 = bicerdover/arac
+    uint16_t id;            // romork sirasi ya da arac netId
+    uint8_t sub;            // romork: tip
+    uint32_t wa;            // romork: seviye (float bitleri) | arac: Vehicle+0x440
+    uint32_t wb;            // romork: dolgu tipi            | arac: Vehicle+0x448
+    uint8_t flags;          // arac: 1 = bicer calisiyor, 2 = kesici/alet aktif, 4 = alet bagli, 8 = isci (AI) acik
+};
+static std::vector<TrailerAttachPacket> g_PendingTrailerAttach;   // g_VehicleEventMutex ile korunur
+static std::vector<EntityStatePacket> g_PendingEntityStates;      // g_VehicleEventMutex ile korunur
+static std::atomic<bool> g_EntityResendAll(false);                // host: yeni oyuncu icin tum durumlari tekrar yolla
+static bool g_ApplyingRemoteTrailerOp = false;                    // sadece oyun thread'i
+
+typedef void (*Vehicle_attachTrailer_t)(void* vehicle, void* trailer, void* world);
+typedef void (*Entity_toggle_t)(void* self);
+static Vehicle_attachTrailer_t g_VehicleAttachTrailerFn = nullptr;
+static Entity_toggle_t g_CombineToggleFn = nullptr;               // Vehicle::toggleCombineIsTurnedOn
+static Entity_toggle_t g_ToolToggleActiveFn = nullptr;            // Tool::toogleActive
+
+struct TrailerTrack { uintptr_t tp; uintptr_t av; uint32_t levelWord; uint32_t typeWord; uint64_t lastMs; };
+static TrailerTrack g_TrTrack[64];
+struct CombineTrack { bool valid; uint32_t wa, wb; uint8_t flags; uint64_t lastMs; };
+static CombineTrack g_CbTrack[VEHICLE_SLOT_LIMIT];
 
 static uint32_t TrailerCount(uintptr_t game) {
     const uint32_t n = *(uint32_t*)(game + 0x19C);
@@ -1856,6 +1896,243 @@ static void QueueTrailerPosition(uint32_t idx, uint32_t type, float x, float y, 
     std::lock_guard<std::mutex> lock(g_VehicleSendMutex);
     g_LatestOutgoingVehicles[slot] = pkt;
     g_HasLatestOutgoingVehicle[slot] = true;
+}
+
+static void QueueEntityState(uint8_t kind, uint16_t id, uint8_t sub, uint32_t wa, uint32_t wb, uint8_t flags) {
+    if (!g_IsConnected.load()) return;
+    EntityStatePacket p;
+    memset(&p, 0, sizeof(p));
+    p.type = PACKET_ENTITY_STATE;
+    p.ownerId = g_LocalPlayerId.load();
+    p.kind = kind; p.id = id; p.sub = sub; p.wa = wa; p.wb = wb; p.flags = flags;
+    QueueVehicleEvent(&p, sizeof(p));
+}
+
+static float WordToFloat(uint32_t w) { float f; memcpy(&f, &w, 4); return f; }
+
+static TrailerTrack* TrackForTrailer(uintptr_t tp, bool* fresh) {
+    *fresh = false;
+    TrailerTrack* freeSlot = nullptr;
+    for (size_t k = 0; k < 64; ++k) {
+        if (g_TrTrack[k].tp == tp) return &g_TrTrack[k];
+        if (g_TrTrack[k].tp == 0 && !freeSlot) freeSlot = &g_TrTrack[k];
+    }
+    if (!freeSlot) return nullptr;
+    memset(freeSlot, 0, sizeof(*freeSlot));
+    freeSlot->tp = tp;
+    *fresh = true;
+    return freeSlot;
+}
+
+// Her ornekte (oyun thread'i): romorkun takildi/cikarildigini ve doluluk degisimini yakalar.
+// Olay yalnizca BU cihazda olduysa gonderilir; uzaktan uygulanan degisiklik kayda islenir (yankilanmaz).
+static void TrackTrailerAttachAndFill(uintptr_t game, uint64_t nowMs) {
+    const uint32_t n = TrailerCount(game);
+    const bool live = g_VehNetArmed.load() && g_IsConnected.load();
+    const bool resend = g_EntityResendAll.load();
+    // Artik dizide olmayan romork kayitlarini sil (satildi / yer degisti).
+    for (size_t k = 0; k < 64; ++k) {
+        if (g_TrTrack[k].tp == 0) continue;
+        bool present = false;
+        for (uint32_t i = 0; i < n; ++i) if (RawTrailerSlot(game, i) == g_TrTrack[k].tp) { present = true; break; }
+        if (!present) memset(&g_TrTrack[k], 0, sizeof(g_TrTrack[k]));
+    }
+    for (uint32_t i = 0; i < n; ++i) {
+        const uintptr_t tp = RawTrailerSlot(game, i);
+        if (tp == 0) continue;
+        bool fresh = false;
+        TrailerTrack* t = TrackForTrailer(tp, &fresh);
+        if (!t) continue;
+        uintptr_t av = *(uintptr_t*)(tp + 0x184);
+        if (av != 0 && SlotIndexOfVehicle(game, av) < 0) av = 0;           // gecersiz adres: bagli sayma
+        const uint32_t levelWord = *(uint32_t*)(tp + 0x388);
+        const uint32_t typeWord = *(uint32_t*)(tp + 0x390);
+        const uint32_t type = *(uint32_t*)(tp + 0x10);
+        const uintptr_t body = *(uintptr_t*)(tp + 0x180);
+        if (fresh) { t->av = av; t->levelWord = levelWord; t->typeWord = typeWord; t->lastMs = nowMs; continue; }
+
+        // ---- takma / cikarma ----
+        if (live && body != 0 && type <= 0x3F && (av != t->av || (resend && av != 0))) {
+            TrailerAttachPacket pk;
+            memset(&pk, 0, sizeof(pk));
+            pk.type = PACKET_TRAILER_ATTACH;
+            pk.ownerId = g_LocalPlayerId.load();
+            pk.trIdx = (uint8_t)i; pk.trType = (uint8_t)type;
+            pk.tx = *(float*)(body + 0x0C); pk.ty = *(float*)(body + 0x10); pk.ta = *(float*)(body + 0x40);
+            if (av != t->av && t->av != 0) {                                // eski araca bagliydi: once cikar
+                const int oldId = NetIdOfVehicle(t->av);
+                if (oldId >= 0) {
+                    pk.attach = 0; pk.vehNetId = (uint16_t)oldId;
+                    QueueVehicleEvent(&pk, sizeof(pk));
+                    LOGI("[TRAILER] cikarildi: romork=%u arac=%d", (unsigned)i, oldId);
+                }
+            }
+            if (av != 0) {
+                const int newId = NetIdOfVehicle(av);
+                const uintptr_t vb = *(uintptr_t*)(av + 0x528);
+                if (newId >= 0 && vb != 0) {
+                    pk.attach = 1; pk.vehNetId = (uint16_t)newId;
+                    pk.vx = *(float*)(vb + 0x0C); pk.vy = *(float*)(vb + 0x10); pk.va = *(float*)(vb + 0x40);
+                    QueueVehicleEvent(&pk, sizeof(pk));
+                    LOGI("[TRAILER] takildi: romork=%u arac=%d", (unsigned)i, newId);
+                }
+            }
+        }
+        t->av = av;
+
+        // ---- doluluk ----
+        const float level = WordToFloat(levelWord);
+        if (!(level == level) || level < -1.0f || level > 1.0e7f) continue;        // NaN / sacma deger
+        if (live && type <= 0x3F && (nowMs - t->lastMs >= 250 || resend) &&
+            (levelWord != t->levelWord || typeWord != t->typeWord || resend)) {
+            if (resend || fabsf(level - WordToFloat(t->levelWord)) > 0.05f || typeWord != t->typeWord) {
+                QueueEntityState(1, (uint16_t)i, (uint8_t)type, levelWord, typeWord, 0);
+                t->levelWord = levelWord; t->typeWord = typeWord; t->lastMs = nowMs;
+            }
+        }
+    }
+}
+
+// Bicerdover (Vehicle+0x328): tank/doluluk, calisma durumu, kesici (bagli alet) aktif mi, isci (AI) acik mi.
+// Sadece bu cihazin surdugu / sahip oldugu / isciye verdigi araclar yayinlanir.
+static void CaptureAndQueueCombineStates(uintptr_t game, uint8_t localOwner, uint64_t nowMs, uint16_t activeVehicleId) {
+    if (!g_VehNetArmed.load() || !g_IsConnected.load()) return;
+    const bool resend = g_EntityResendAll.load();
+    for (uint16_t id = 0; id < VEHICLE_SLOT_LIMIT; ++id) {
+        if (g_KnownVehiclePointers[id] == 0) continue;
+        const uintptr_t v = GetVehicleFromIndex(game, id);
+        if (v == 0 || *(uint8_t*)(v + 0x328) == 0) continue;               // bicerdover degil
+        const bool ai = *(uint32_t*)(v + 0x730) != 0;
+        uint8_t owner = VEHICLE_OWNER_NONE;
+        { std::lock_guard<std::mutex> lock(g_VehicleStateMutex); owner = g_VehicleAuthority[id].ownerId; }
+        if (!(id == activeVehicleId || owner == localOwner || ai)) continue;
+
+        uint8_t flags = 0;
+        if (*(uint8_t*)(v + 0x498)) flags |= 1;
+        const uintptr_t tool = *(uintptr_t*)(v + 0x560);
+        if (tool != 0 && *(uintptr_t*)(tool + 0x23C) != 0) {
+            flags |= 4;
+            if (*(uint8_t*)(tool + 0x230)) flags |= 2;
+        }
+        if (ai) flags |= 8;
+        const uint32_t wa = *(uint32_t*)(v + 0x440);
+        const uint32_t wb = *(uint32_t*)(v + 0x448);
+        CombineTrack& c = g_CbTrack[id];
+        const bool changed = !c.valid || c.wa != wa || c.wb != wb || c.flags != flags || resend;
+        const bool keepAlive = c.valid && (nowMs - c.lastMs) >= 3000;
+        if ((changed && (!c.valid || nowMs - c.lastMs >= 250 || c.flags != flags)) || keepAlive) {
+            QueueEntityState(2, id, 0, wa, wb, flags);
+            if (c.valid && c.flags != flags)
+                LOGI("[COMBINE] durum degisti netId=%u calisiyor=%d kesici=%d isci=%d", (unsigned)id,
+                     (int)(flags & 1), (int)((flags >> 1) & 1), (int)((flags >> 3) & 1));
+            c.valid = true; c.wa = wa; c.wb = wb; c.flags = flags; c.lastMs = nowMs;
+        }
+    }
+}
+
+// Diger cihazdan gelen romork takma/cikarma ve durum paketlerini oyun thread'inde uygular.
+static void ApplyPendingTrailerEvents(uintptr_t game, uint8_t localOwner, uint64_t nowMs) {
+    std::vector<TrailerAttachPacket> attaches;
+    std::vector<EntityStatePacket> states;
+    {
+        std::lock_guard<std::mutex> lock(g_VehicleEventMutex);
+        if (g_PendingTrailerAttach.empty() && g_PendingEntityStates.empty()) return;
+        if (!g_VehNetArmed.load()) return;               // netId tablosu hazir degil: bekle
+        attaches.swap(g_PendingTrailerAttach);
+        states.swap(g_PendingEntityStates);
+    }
+    void* world = *(void**)(game + 0xA0);
+    const uint32_t tn = TrailerCount(game);
+
+    for (const TrailerAttachPacket& pk : attaches) {
+        if (pk.ownerId == localOwner || pk.trIdx >= tn || world == nullptr) continue;
+        const uintptr_t tp = RawTrailerSlot(game, pk.trIdx);
+        const uintptr_t veh = GetVehicleFromIndex(game, pk.vehNetId);
+        if (tp == 0 || veh == 0 || *(uint32_t*)(tp + 0x10) != pk.trType) {
+            LOGI("[TRAILER] olay atlandi: romork=%u arac=%u (esleme yok)", (unsigned)pk.trIdx, (unsigned)pk.vehNetId);
+            continue;
+        }
+        const uintptr_t tbody = *(uintptr_t*)(tp + 0x180);
+        const uintptr_t vbody = *(uintptr_t*)(veh + 0x528);
+        if (tbody == 0 || vbody == 0 || !g_VehicleDetachTrailerFn) continue;
+        const uintptr_t cur = *(uintptr_t*)(tp + 0x184);
+        g_ApplyingRemoteTrailerOp = true;
+        if (pk.attach == 0) {
+            if (cur == veh) g_VehicleDetachTrailerFn((void*)veh, world);
+            LOGI("[TRAILER] uzaktan cikarma uygulandi: romork=%u", (unsigned)pk.trIdx);
+        } else if (cur != veh) {
+            if (!g_VehicleAttachTrailerFn || *(uintptr_t*)(veh + 0x560) != 0 || *(uint32_t*)(veh + 0x730) != 0) {
+                LOGI("[TRAILER] takma atlandi: alet bagli / isci acik / fonksiyon yok");
+            } else {
+                if (cur != 0 && SlotIndexOfVehicle(game, cur) >= 0) g_VehicleDetachTrailerFn((void*)cur, world);
+                if (*(uintptr_t*)(veh + 0x55C) != 0) g_VehicleDetachTrailerFn((void*)veh, world);
+                // Romorku, gonderendeki gorece konumuyla BU cihazdaki aracin arkasina yerlestir; sonra tak.
+                const float c0 = cosf(pk.va), s0 = sinf(pk.va);
+                const float dx = pk.tx - pk.vx, dy = pk.ty - pk.vy;
+                const float lx = c0 * dx + s0 * dy, ly = -s0 * dx + c0 * dy;
+                const float va2 = *(float*)(vbody + 0x40);
+                const float c1 = cosf(va2), s1 = sinf(va2);
+                TestB2Vec2 pos;
+                pos.x = *(float*)(vbody + 0x0C) + c1 * lx - s1 * ly;
+                pos.y = *(float*)(vbody + 0x10) + s1 * lx + c1 * ly;
+                g_b2BodySetTransform((void*)tbody, &pos, va2 + (pk.ta - pk.va));
+                SetRemoteBodyVelocity(tbody, 0.0f, 0.0f, 0.0f);
+                g_VehicleAttachTrailerFn((void*)veh, (void*)tp, world);
+                LOGI("[TRAILER] uzaktan takma uygulandi: romork=%u arac=%u", (unsigned)pk.trIdx, (unsigned)pk.vehNetId);
+            }
+        }
+        g_ApplyingRemoteTrailerOp = false;
+    }
+    if (!attaches.empty()) {                                  // yankilanmasin: kaydi guncelle
+        for (uint32_t i = 0; i < tn; ++i) {
+            const uintptr_t tp = RawTrailerSlot(game, i);
+            bool fresh = false;
+            TrailerTrack* t = tp ? TrackForTrailer(tp, &fresh) : nullptr;
+            if (!t) continue;
+            uintptr_t av = *(uintptr_t*)(tp + 0x184);
+            if (av != 0 && SlotIndexOfVehicle(game, av) < 0) av = 0;
+            t->av = av;
+        }
+    }
+
+    for (const EntityStatePacket& st : states) {
+        if (st.ownerId == localOwner) continue;
+        if (st.kind == 1) {                                   // romork doluluk
+            if (st.id >= tn) continue;
+            const uintptr_t tp = RawTrailerSlot(game, st.id);
+            if (tp == 0 || *(uint32_t*)(tp + 0x10) != st.sub) continue;
+            float level = WordToFloat(st.wa);
+            if (!(level == level) || level > 1.0e7f) continue;
+            const float cap = *(float*)(tp + 0x38C);
+            if (level < 0.0f) level = 0.0f;
+            else if (level > cap) level = cap;
+            memcpy((void*)(tp + 0x388), &level, 4);
+            *(uint32_t*)(tp + 0x390) = st.wb;
+            *(uint32_t*)(tp + 0x3A4) |= 4;                    // Trailer::setFillLevel ile ayni: gorunum yenilensin
+            bool fresh = false;
+            TrailerTrack* t = TrackForTrailer(tp, &fresh);
+            if (t) { memcpy(&t->levelWord, &level, 4); t->typeWord = st.wb; t->lastMs = nowMs; }
+        } else if (st.kind == 2) {                            // bicerdover
+            const uintptr_t v = GetVehicleFromIndex(game, st.id);
+            if (v == 0 || *(uint8_t*)(v + 0x328) == 0) continue;
+            uint8_t owner = VEHICLE_OWNER_NONE;
+            { std::lock_guard<std::mutex> lock(g_VehicleStateMutex); owner = g_VehicleAuthority[st.id].ownerId; }
+            if (owner == localOwner || v == LocalActiveVehiclePtr(game)) continue;     // burada surulen aracin durumunu ezme
+            const float fa = WordToFloat(st.wa), fb = WordToFloat(st.wb);
+            if (!(fa == fa) || !(fb == fb) || fa > 1.0e7f || fb > 1.0e7f) continue;
+            *(uint32_t*)(v + 0x440) = st.wa;
+            *(uint32_t*)(v + 0x448) = st.wb;
+            const bool wantOn = (st.flags & 1) != 0;
+            if ((*(uint8_t*)(v + 0x498) != 0) != wantOn && g_CombineToggleFn) g_CombineToggleFn((void*)v);
+            const uintptr_t tool = *(uintptr_t*)(v + 0x560);
+            if ((st.flags & 4) && tool != 0 && *(uintptr_t*)(tool + 0x23C) != 0 && g_ToolToggleActiveFn) {
+                const bool wantActive = (st.flags & 2) != 0;
+                if ((*(uint8_t*)(tool + 0x230) != 0) != wantActive) g_ToolToggleActiveFn((void*)tool);
+            }
+            CombineTrack& c = g_CbTrack[st.id];               // yerel kayit: yankilanmasin
+            c.valid = true; c.wa = st.wa; c.wb = st.wb; c.flags = st.flags; c.lastMs = nowMs;
+        }
+    }
 }
 
 static void CaptureAndQueueLocalTrailerStates(uintptr_t game, uint8_t localOwner, uint64_t nowMs) {
@@ -1997,7 +2274,9 @@ static void CaptureAndQueueLocalVehicleState(uintptr_t game) {
         // network publication depend on the authority handshake. This is
         // what allows Player A to drive the harvester while Player B drives
         // the tractor on a different vehicle slot.
-        if (vehicleId == activeVehicleId && moving &&
+        // Isciye (AI) verilen arac aktif arac olmasa da hareket ediyorsa sahipligini iste/yayinla.
+        const bool aiDriven = (*(uint32_t*)(vehicle + 0x730) != 0);
+        if ((vehicleId == activeVehicleId || aiDriven) && moving &&
             ownerId == VEHICLE_OWNER_NONE) {
             TryClaimLocalVehicle(vehicleId);
         }
@@ -2030,7 +2309,7 @@ static void CaptureAndQueueLocalVehicleState(uintptr_t game) {
         // Therefore different vehicles can travel simultaneously, while the
         // same vehicle can still exhibit the expected tug-of-war/tremble.
         const bool publishActiveVehicle =
-            (vehicleId == activeVehicleId);
+            (vehicleId == activeVehicleId) || aiDriven;
 
         const bool publishOwnedVehicle =
             (ownerId == localOwner);
@@ -2062,6 +2341,9 @@ static void CaptureAndQueueLocalVehicleState(uintptr_t game) {
     }
 
     CaptureAndQueueLocalTrailerStates(game, localOwner, nowMs);
+    TrackTrailerAttachAndFill(game, nowMs);
+    CaptureAndQueueCombineStates(game, localOwner, nowMs, activeVehicleId);
+    g_EntityResendAll.store(false);
 }
 
 // Where a remote vehicle should be right now: its newest snapshot pushed forward by the
@@ -2176,9 +2458,10 @@ static void ApplyRemoteVehicleStates(uintptr_t game) {
         }
     }
 
-    // ---- Romorklar: sahiplik tablosu yok; sira + tip uyusuyorsa ve yerelde surulmuyorsa yerlestir ----
+    ApplyPendingTrailerEvents(game, localOwner, nowMs);
+
+    // ---- Romorklar: sahiplik tablosu yok; sira + tip uyusuyorsa ve yerelde bir araca bagli degilse yerlestir ----
     const uint32_t tn = TrailerCount(game);
-    const uintptr_t activeVeh = LocalActiveVehiclePtr(game);
     for (uint32_t i = 0; i < tn; ++i) {
         const uint16_t sid = (uint16_t)(TRAILER_ID_BASE + i);
         VehicleRemoteState state;
@@ -2201,7 +2484,7 @@ static void ApplyRemoteVehicleStates(uintptr_t game) {
         const uintptr_t tp = RawTrailerSlot(game, i);
         if (tp == 0 || *(uint32_t*)(tp + 0x10) != g_RemoteTrailerType[i]) continue;
         const uintptr_t av = *(uintptr_t*)(tp + 0x184);
-        if (av != 0 && av == activeVeh) continue;                        // burada surdugun araca bagli
+        if (av != 0) continue;                                           // bagli: eklem (joint) arkadan takip ettirir
         const uintptr_t body = *(uintptr_t*)(tp + 0x180);
         if (body == 0) continue;
 
@@ -2535,6 +2818,13 @@ static void ResetVehicleSyncState() {
     g_LocalClaimSequence.store(0);
     g_LastKnownVehicleCount = 0;
     memset(g_TrailerMine, 0, sizeof(g_TrailerMine));
+    memset(g_TrTrack, 0, sizeof(g_TrTrack));
+    memset(g_CbTrack, 0, sizeof(g_CbTrack));
+    {
+        std::lock_guard<std::mutex> lock(g_VehicleEventMutex);
+        g_PendingTrailerAttach.clear();
+        g_PendingEntityStates.clear();
+    }
     g_VehNetArmed.store(false);
     g_NetMapDirty.store(false);
     {
@@ -2810,6 +3100,8 @@ static bool ProcessPackets(uint8_t* buf, size_t& buffered, int peerId, std::vect
         else if (type == PACKET_VEHICLE_REMOVE) { size = sizeof(VehicleRemovePacket); relayIt = true; }
         else if (type == PACKET_MONEY_DELTA) { size = sizeof(MoneyPacket); relayIt = true; }
         else if (type == PACKET_MONEY_SET) size = sizeof(MoneyPacket);
+        else if (type == PACKET_TRAILER_ATTACH) { size = sizeof(TrailerAttachPacket); relayIt = true; }
+        else if (type == PACKET_ENTITY_STATE) { size = sizeof(EntityStatePacket); relayIt = true; }
         else if (type == PACKET_ACTIVE_VEHICLE) { size = sizeof(ActiveVehiclePacket); relayIt = true; }
         else if (type == PACKET_VEHICLE_NETMAP) {
             if (buffered < 3) break;
@@ -2968,10 +3260,35 @@ static bool ProcessPackets(uint8_t* buf, size_t& buffered, int peerId, std::vect
                 g_HasPendingNetMap = true;
                 g_NetMapSeq = ++g_OpSeq;
             }
+        } else if (type == PACKET_TRAILER_ATTACH) {
+            TrailerAttachPacket tp;
+            memcpy(&tp, buf, sizeof(tp));
+            if (fromPeer) { tp.ownerId = (uint8_t)peerId; memcpy(buf, &tp, sizeof(tp)); }
+            if (tp.ownerId != g_LocalPlayerId.load() && tp.vehNetId < VEHICLE_SLOT_LIMIT) {
+                std::lock_guard<std::mutex> lock(g_VehicleEventMutex);
+                if (g_PendingTrailerAttach.size() >= 64) g_PendingTrailerAttach.erase(g_PendingTrailerAttach.begin());
+                g_PendingTrailerAttach.push_back(tp);
+            }
+        } else if (type == PACKET_ENTITY_STATE) {
+            EntityStatePacket ep;
+            memcpy(&ep, buf, sizeof(ep));
+            if (fromPeer) { ep.ownerId = (uint8_t)peerId; memcpy(buf, &ep, sizeof(ep)); }
+            if (ep.ownerId != g_LocalPlayerId.load() && (ep.kind == 1 || ep.kind == 2)) {
+                std::lock_guard<std::mutex> lock(g_VehicleEventMutex);
+                // Ayni varlik icin eski bekleyen durum varsa yenisiyle degistir.
+                bool replaced = false;
+                for (EntityStatePacket& q : g_PendingEntityStates)
+                    if (q.kind == ep.kind && q.id == ep.id) { q = ep; replaced = true; break; }
+                if (!replaced) {
+                    if (g_PendingEntityStates.size() >= 128) g_PendingEntityStates.erase(g_PendingEntityStates.begin());
+                    g_PendingEntityStates.push_back(ep);
+                }
+            }
         } else if (type == PACKET_SYNC_REQUEST) {
             if (g_IsHost.load() && fromPeer) {
                 g_HostForceTable.store(true);
                 g_ForceResendAll.store(true);
+                g_EntityResendAll.store(true);          // takili romorklar + doluluk + bicer durumlari yeniden
             }
         }
         // PACKET_PING: sadece "canlayim" demek, ozel islem yok (alim zamani disarida kaydedilir).
@@ -5322,7 +5639,7 @@ void* my_renderStartMenuMain(void* thiz, void* p1, void* p2, void* p3) {
 // ========================================================================
 __attribute__((constructor))
 void ModMain() {
-    LOGI(">>> MULTIPLAYER MOD STARTING <<< build=shopfix-7+money-guard+trailer-pos-1");
+    LOGI(">>> MULTIPLAYER MOD STARTING <<< build=shopfix-7+money-guard+trailer-pos-1+attach-state-1");
 
     ResetVehicleSyncState();
     std::thread(StartPONGResponderThread).detach();
@@ -5363,6 +5680,14 @@ void ModMain() {
         if (!g_VehicleDetachToolFn) g_VehicleDetachToolFn = (Vehicle_detach_t)FindElfSymbolByPrefix("libapp.so", "_ZN7Vehicle10detachTool");
         g_VehicleDetachTrailerFn = (Vehicle_detach_t)dlsym(appLib, "_ZN7Vehicle13detachTrailerEP7b2World");
         if (!g_VehicleDetachTrailerFn) g_VehicleDetachTrailerFn = (Vehicle_detach_t)FindElfSymbolByPrefix("libapp.so", "_ZN7Vehicle13detachTrailer");
+        g_VehicleAttachTrailerFn = (Vehicle_attachTrailer_t)dlsym(appLib, "_ZN7Vehicle13attachTrailerEP7TrailerP7b2World");
+        if (!g_VehicleAttachTrailerFn) g_VehicleAttachTrailerFn = (Vehicle_attachTrailer_t)FindElfSymbolByPrefix("libapp.so", "_ZN7Vehicle13attachTrailer");
+        g_CombineToggleFn = (Entity_toggle_t)dlsym(appLib, "_ZN7Vehicle23toggleCombineIsTurnedOnEv");
+        if (!g_CombineToggleFn) g_CombineToggleFn = (Entity_toggle_t)FindElfSymbolByPrefix("libapp.so", "_ZN7Vehicle23toggleCombineIsTurnedOn");
+        g_ToolToggleActiveFn = (Entity_toggle_t)dlsym(appLib, "_ZN4Tool12toogleActiveEv");
+        if (!g_ToolToggleActiveFn) g_ToolToggleActiveFn = (Entity_toggle_t)FindElfSymbolByPrefix("libapp.so", "_ZN4Tool12toogleActive");
+        LOGI("[TRAILER] symbols: attachTrailer=%p combineToggle=%p toolToggleActive=%p",
+             (void*)g_VehicleAttachTrailerFn, (void*)g_CombineToggleFn, (void*)g_ToolToggleActiveFn);
         LOGI("vehicle hooks: addVehicle=%p removeVehicle=%p Vehicle::destroy=%p detachTool=%p detachTrailer=%p",
              addVeh, remVeh, (void*)g_VehicleDestroyFn, (void*)g_VehicleDetachToolFn, (void*)g_VehicleDetachTrailerFn);
         // skipIfRisky=false: bu ikisi zaten calisiyor; sadece prologue riskini loga yaz.
