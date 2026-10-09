@@ -1810,6 +1810,121 @@ static bool TryClaimLocalVehicle(uint16_t vehicleId) {
     return false;
 }
 
+// ========================================================================
+// ROMORK KONUM SENKRONU
+// Romorklar oyunda ayri bir dizide (game+0x1a0..., sayac game+0x19c; Trailer+0x180 = b2Body*,
+// +0x184 = bagli oldugu arac, +0x10 = romork tipi). Araclarla AYNI anlik goruntu hattini kullaniriz:
+// durum dizilerinde 256+sira numarasi, ag uzerinde 0x8000 | (tip << 8) | sira.
+// Gonderen: romork bu cihazda surulen / bu cihazin sahip oldugu araca bagliysa (ve ayrildiktan
+// sonra durana kadar) konumunu yayinlar. Alici: romorku sadece sira numarasi VE tipi uyusuyorsa
+// ve yerelde surdugu araca bagli degilse yerlestirir (alim/satim sonrasi kayma yanlis romorku oynatmaz).
+// Yeni kanca YOK; sadece okuma + b2Body::SetTransform (zaten kullaniliyor).
+// ========================================================================
+static const uint16_t TRAILER_ID_BASE = 256;
+static const uint16_t TRAILER_WIRE_FLAG = 0x8000;
+static const uint32_t TRAILER_MAX = 0x1e;
+static bool g_TrailerMine[256];                // bu cihaz bu romorkun konumunu yayinliyor
+static uint8_t g_RemoteTrailerType[256];       // uzaktan gelen son tip (dogrulama icin)
+
+static uint32_t TrailerCount(uintptr_t game) {
+    const uint32_t n = *(uint32_t*)(game + 0x19C);
+    return n > TRAILER_MAX ? TRAILER_MAX : n;
+}
+
+static uintptr_t RawTrailerSlot(uintptr_t game, uint32_t i) {
+    return *(uintptr_t*)(game + ((uintptr_t)(i + 0x68) * 4u));
+}
+
+static uintptr_t LocalActiveVehiclePtr(uintptr_t game) {
+    const uint32_t ai = *(uint32_t*)(game + 0xA8);
+    return ai < VehicleCount(game) ? RawVehicleSlot(game, ai) : 0;
+}
+
+static void QueueTrailerPosition(uint32_t idx, uint32_t type, float x, float y, float angle, bool moving) {
+    if (!g_IsConnected.load() || idx >= 256 || type > 0x3F) return;
+    const uint8_t ownerId = g_LocalPlayerId.load();
+    if (ownerId == VEHICLE_OWNER_NONE || ownerId >= MAX_PLAYERS) return;
+    VehiclePositionPacket pkt;
+    memset(&pkt, 0, sizeof(pkt));
+    pkt.type = PACKET_VEHICLE_POSITION;
+    pkt.ownerId = ownerId;
+    pkt.vehicleId = (uint16_t)(TRAILER_WIRE_FLAG | (type << 8) | idx);
+    pkt.x = x; pkt.y = y; pkt.angle = angle;
+    pkt.sequence = (uint32_t)GetMonotonicMilliseconds();
+    pkt.moving = moving ? 1 : 0;
+    const uint16_t slot = (uint16_t)(TRAILER_ID_BASE + idx);
+    std::lock_guard<std::mutex> lock(g_VehicleSendMutex);
+    g_LatestOutgoingVehicles[slot] = pkt;
+    g_HasLatestOutgoingVehicle[slot] = true;
+}
+
+static void CaptureAndQueueLocalTrailerStates(uintptr_t game, uint8_t localOwner, uint64_t nowMs) {
+    const uint32_t n = TrailerCount(game);
+    const uintptr_t activeVeh = LocalActiveVehiclePtr(game);
+    for (uint32_t i = 0; i < n; ++i) {
+        const uintptr_t tp = RawTrailerSlot(game, i);
+        if (tp == 0) continue;
+        const uintptr_t body = *(uintptr_t*)(tp + 0x180);
+        if (body == 0) continue;
+        const uint32_t type = *(uint32_t*)(tp + 0x10);
+        if (type > 0x3F) continue;
+
+        const float x = *(float*)(body + 0x0C);
+        const float y = *(float*)(body + 0x10);
+        const float angle = *(float*)(body + 0x40);
+        const uint16_t sid = (uint16_t)(TRAILER_ID_BASE + i);
+
+        bool moving = false;
+        {
+            std::lock_guard<std::mutex> lock(g_VehicleStateMutex);
+            VehicleSampleState& sample = g_LocalSamples[sid];
+            if (sample.valid) {
+                moving = fabsf(x - sample.x) > CLAIM_POSITION_EPSILON ||
+                         fabsf(y - sample.y) > CLAIM_POSITION_EPSILON ||
+                         GetAngleDelta(angle, sample.angle) > CLAIM_ANGLE_EPSILON;
+            }
+            sample.valid = true; sample.x = x; sample.y = y; sample.angle = angle;
+        }
+
+        const uintptr_t av = *(uintptr_t*)(tp + 0x184);       // bagli oldugu arac (0 = bagli degil)
+        if (av != 0) {
+            bool towedByMe = (av == activeVeh);
+            if (!towedByMe) {
+                const int nid = NetIdOfVehicle(av);
+                if (nid >= 0) {
+                    std::lock_guard<std::mutex> lock(g_VehicleStateMutex);
+                    towedByMe = (g_VehicleAuthority[nid].ownerId == localOwner);
+                }
+            }
+            if (towedByMe) g_TrailerMine[i] = true;
+        }
+        if (!g_TrailerMine[i]) continue;
+
+        if (moving || av != 0) g_LocalStationarySince[sid] = 0;
+        else if (g_LocalStationarySince[sid] == 0) g_LocalStationarySince[sid] = nowMs;
+        const bool settled = av == 0 && g_LocalStationarySince[sid] != 0 &&
+                             (nowMs - g_LocalStationarySince[sid]) >= VEHICLE_STOP_RELEASE_MS;
+
+        bool changed = false;
+        {
+            std::lock_guard<std::mutex> lock(g_VehicleStateMutex);
+            VehicleSampleState& sent = g_LastSentLocalVehicles[sid];
+            changed = !sent.valid || sent.moving != moving ||
+                      fabsf(x - sent.x) > POSITION_EPSILON ||
+                      fabsf(y - sent.y) > POSITION_EPSILON ||
+                      GetAngleDelta(angle, sent.angle) > ANGLE_EPSILON ||
+                      (nowMs - sent.timeMs) >= VEHICLE_KEEPALIVE_MS;
+            if (changed) { sent.valid = true; sent.moving = moving; sent.x = x; sent.y = y; sent.angle = angle; sent.timeMs = nowMs; }
+        }
+        if (changed) QueueTrailerPosition(i, type, x, y, angle, moving);
+        if (settled) {                                          // son durum gonderildi: yayini birak
+            g_TrailerMine[i] = false;
+            std::lock_guard<std::mutex> lock(g_VehicleStateMutex);
+            g_LastSentLocalVehicles[sid].valid = false;
+        }
+    }
+}
+
 static void CaptureAndQueueLocalVehicleState(uintptr_t game) {
     if (game == 0 || !g_IsConnected.load()) return;
     if (!g_VehicleGetPosition || !g_VehicleGetOrientation) return;
@@ -1945,6 +2060,8 @@ static void CaptureAndQueueLocalVehicleState(uintptr_t game) {
             if (changed) QueueVehiclePosition(vehicleId, x, y, angle, moving);
         }
     }
+
+    CaptureAndQueueLocalTrailerStates(game, localOwner, nowMs);
 }
 
 // Where a remote vehicle should be right now: its newest snapshot pushed forward by the
@@ -2055,6 +2172,53 @@ static void ApplyRemoteVehicleStates(uintptr_t game) {
                 if (g_RemoteVehicles[vehicleId].sequence == state.sequence) {
                     g_RemoteVehicles[vehicleId].appliedSequence = state.sequence;
                 }
+            }
+        }
+    }
+
+    // ---- Romorklar: sahiplik tablosu yok; sira + tip uyusuyorsa ve yerelde surulmuyorsa yerlestir ----
+    const uint32_t tn = TrailerCount(game);
+    const uintptr_t activeVeh = LocalActiveVehiclePtr(game);
+    for (uint32_t i = 0; i < tn; ++i) {
+        const uint16_t sid = (uint16_t)(TRAILER_ID_BASE + i);
+        VehicleRemoteState state;
+        {
+            std::lock_guard<std::mutex> lock(g_VehicleStateMutex);
+            VehicleRemoteState& stored = g_RemoteVehicles[sid];
+            if (!stored.valid || stored.ownerId == localOwner) continue;
+            stored.errX *= decay;
+            stored.errY *= decay;
+            stored.errA *= decay;
+            if (fabsf(stored.errX) + fabsf(stored.errY) + fabsf(stored.errA) < 0.003f) {
+                stored.errX = stored.errY = stored.errA = 0.0f;
+            }
+            state = stored;
+        }
+        const bool offsetGone = (state.errX == 0.0f && state.errY == 0.0f && state.errA == 0.0f);
+        if (!state.moving && offsetGone && state.appliedSequence == state.sequence) continue;
+        if (g_TrailerMine[i]) continue;                                  // bu cihaz yayinliyor
+
+        const uintptr_t tp = RawTrailerSlot(game, i);
+        if (tp == 0 || *(uint32_t*)(tp + 0x10) != g_RemoteTrailerType[i]) continue;
+        const uintptr_t av = *(uintptr_t*)(tp + 0x184);
+        if (av != 0 && av == activeVeh) continue;                        // burada surdugun araca bagli
+        const uintptr_t body = *(uintptr_t*)(tp + 0x180);
+        if (body == 0) continue;
+
+        float poseX, poseY, poseAngle;
+        PredictRemotePose(state, nowMs, &poseX, &poseY, &poseAngle);
+        TestB2Vec2 position;
+        position.x = poseX + state.errX;
+        position.y = poseY + state.errY;
+        g_b2BodySetTransform((void*)body, &position, poseAngle + state.errA);
+
+        if (state.moving) {
+            SetRemoteBodyVelocity(body, state.vx, state.vy, state.angularVelocity);
+        } else {
+            SetRemoteBodyVelocity(body, 0.0f, 0.0f, 0.0f);
+            if (offsetGone) {
+                std::lock_guard<std::mutex> lock(g_VehicleStateMutex);
+                if (g_RemoteVehicles[sid].sequence == state.sequence) g_RemoteVehicles[sid].appliedSequence = state.sequence;
             }
         }
     }
@@ -2301,13 +2465,24 @@ static void StoreRemoteVehicleState(
     state.moving = moving;
 }
 
+// Ag uzerindeki vehicleId romork ise (0x8000 | tip<<8 | sira) durum dizisi numarasina cevirir.
+static uint16_t DecodeWireVehicleId(uint16_t wire, bool* isTrailer) {
+    *isTrailer = (wire & TRAILER_WIRE_FLAG) != 0;
+    if (!*isTrailer) return wire;
+    const uint16_t idx = wire & 0xFF;
+    g_RemoteTrailerType[idx] = (uint8_t)((wire >> 8) & 0x3F);
+    return (uint16_t)(TRAILER_ID_BASE + idx);
+}
+
 static void HandleVehiclePositionPacket(
     const VehiclePositionPacket& pkt
 ) {
-    HostAdoptIfMoving(pkt.ownerId, pkt.vehicleId, pkt.moving != 0);
+    bool isTrailer = false;
+    const uint16_t vid = DecodeWireVehicleId(pkt.vehicleId, &isTrailer);
+    if (!isTrailer) HostAdoptIfMoving(pkt.ownerId, vid, pkt.moving != 0);
     StoreRemoteVehicleState(
         pkt.ownerId,
-        pkt.vehicleId,
+        vid,
         pkt.x,
         pkt.y,
         pkt.angle,
@@ -2332,10 +2507,12 @@ static void HandleVehicleSnapshotPacket(
             sizeof(entry)
         );
 
-        HostAdoptIfMoving(header.ownerId, entry.vehicleId, entry.moving != 0);
+        bool isTrailer = false;
+        const uint16_t vid = DecodeWireVehicleId(entry.vehicleId, &isTrailer);
+        if (!isTrailer) HostAdoptIfMoving(header.ownerId, vid, entry.moving != 0);
         StoreRemoteVehicleState(
             header.ownerId,
-            entry.vehicleId,
+            vid,
             entry.x,
             entry.y,
             entry.angle,
@@ -2357,6 +2534,7 @@ static void ResetVehicleSyncState() {
     g_LocalPlayerId.store(0xFF);
     g_LocalClaimSequence.store(0);
     g_LastKnownVehicleCount = 0;
+    memset(g_TrailerMine, 0, sizeof(g_TrailerMine));
     g_VehNetArmed.store(false);
     g_NetMapDirty.store(false);
     {
@@ -5144,7 +5322,7 @@ void* my_renderStartMenuMain(void* thiz, void* p1, void* p2, void* p3) {
 // ========================================================================
 __attribute__((constructor))
 void ModMain() {
-    LOGI(">>> MULTIPLAYER MOD STARTING <<< build=shopfix-7+money-guard-shared-vehicle (same-vehicle tiebreak)");
+    LOGI(">>> MULTIPLAYER MOD STARTING <<< build=shopfix-7+money-guard+trailer-pos-1");
 
     ResetVehicleSyncState();
     std::thread(StartPONGResponderThread).detach();
