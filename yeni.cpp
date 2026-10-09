@@ -592,6 +592,7 @@ static const uint8_t PACKET_VEHICLE_SPAWN = 17;   // arac eklendi (client->host:
 static const uint8_t PACKET_VEHICLE_REMOVE = 18;  // arac satildi/silindi (netId)
 static const uint8_t PACKET_VEHICLE_NETMAP = 19;  // host -> client: oyundaki arac sirasi -> netId esleme tablosu
 static const uint8_t PACKET_MONEY_DELTA = 20;     // para degisimi (+/-): client->host, host->herkes
+static const uint8_t PACKET_ACTIVE_VEHICLE = 22;  // "su an bu aracin icindeyim" (oyuncu basina, host iletir)
 static const uint8_t PACKET_MONEY_SET = 21;       // host -> client: mutlak para (oyuncu odaya katilinca)
 static const uint8_t PACKET_UDP_ACK = 16;      // host -> client (UDP): UDP yolu acildi
 
@@ -746,6 +747,11 @@ struct MoneyPacket {
     uint8_t type;
     uint8_t originId;
     double value;
+};
+struct ActiveVehiclePacket {
+    uint8_t type;
+    uint8_t originId;
+    uint16_t netId;
 };
 
 #pragma pack(pop)
@@ -980,6 +986,70 @@ static void QueueVehicleEvent(const void* pkt, size_t size) {
 }
 
 // ========================================================================
+// OYUNCU BASINA "SU AN HANGI ARACIN ICINDE" BILGISI
+// Sahiplik (authority) arac DURUNCA birakiliyor; mahsul satisi ise genelde arac dururken olur.
+// Bu yuzden "bu arac baska birinin mi?" sorusu, o oyuncunun aktif aracina bakilarak cevaplanir.
+// ========================================================================
+struct RemoteActive { int netId; long long ms; };
+static RemoteActive g_RemoteActive[MAX_PLAYERS];
+static std::mutex g_ActiveMutex;
+static int g_LocalActiveNetId = -1;
+static int g_LastSentActiveNetId = -2;
+static long long g_LastActiveSendMs = 0;
+
+static void StoreRemoteActive(uint8_t origin, uint16_t netId) {
+    if (origin >= MAX_PLAYERS) return;
+    std::lock_guard<std::mutex> lock(g_ActiveMutex);
+    g_RemoteActive[origin].netId = (netId == 0xFFFF) ? -1 : (int)netId;
+    g_RemoteActive[origin].ms = NowMs();
+}
+
+// Baska bir oyuncu (yakin zamanda) bu araci aktif araci olarak bildirdi mi?
+static bool IsRemoteActiveVehicle(int netId) {
+    if (netId < 0) return false;
+    const uint8_t me = g_LocalPlayerId.load();
+    const long long now = NowMs();
+    std::lock_guard<std::mutex> lock(g_ActiveMutex);
+    for (uint8_t p = 0; p < MAX_PLAYERS; ++p) {
+        if (p == me) continue;
+        if (g_RemoteActive[p].netId == netId && (now - g_RemoteActive[p].ms) < 6000) return true;
+    }
+    return false;
+}
+
+// Ayni aracin icinde, benden DUSUK numarali baska bir oyuncu da var mi? (ikisi de ayni aractaysa
+// sadece en kucuk numarali oyuncunun cihazi para degisimini sayar.)
+static bool HasLowerIdRemoteActive(int netId, uint8_t me) {
+    if (netId < 0) return false;
+    const long long now = NowMs();
+    std::lock_guard<std::mutex> lock(g_ActiveMutex);
+    for (uint8_t p = 0; p < me && p < MAX_PLAYERS; ++p)
+        if (g_RemoteActive[p].netId == netId && (now - g_RemoteActive[p].ms) < 6000) return true;
+    return false;
+}
+
+// Oyun thread'i, durum 6'da her karede.
+static void ActiveVehicleFrame(uintptr_t game) {
+    if (!g_IsConnected.load() || !g_VehNetArmed.load()) { g_LocalActiveNetId = -1; return; }
+    const uint32_t n = VehicleCount(game);
+    const uint32_t idx = *(volatile uint32_t*)(game + 0xA8);       // aktif arac indeksi
+    int id = -1;
+    if (idx < n) id = NetIdOfVehicle(RawVehicleSlot(game, idx));
+    g_LocalActiveNetId = id;
+    const long long now = NowMs();
+    if (id != g_LastSentActiveNetId || (now - g_LastActiveSendMs) > 2000) {
+        g_LastSentActiveNetId = id;
+        g_LastActiveSendMs = now;
+        ActiveVehiclePacket p;
+        memset(&p, 0, sizeof(p));
+        p.type = PACKET_ACTIVE_VEHICLE;
+        p.originId = g_LocalPlayerId.load();
+        p.netId = (id < 0) ? (uint16_t)0xFFFF : (uint16_t)id;
+        QueueVehicleEvent(&p, sizeof(p));
+    }
+}
+
+// ========================================================================
 // ORTAK PARA (Game+0x6a0 = double)
 // Oyun parayi alim/satim/yakit/maas/hasat satisi gibi pek cok yerde degistirir. Bu yuzden
 // degisimler tek tek kancalanmaz: her karede "simdiki - son bilinen" farki hesaplanir (delta),
@@ -1043,6 +1113,7 @@ static void MoneyFrame(uintptr_t g) {
         cur += inc;
         WriteMoney(g, cur);
         g_MoneyLast = cur;                      // bu degisim yerel sayilmasin
+        if (fabs(inc) >= 100.0) LOGI("[MONEY] gelen degisim uygulandi: %+.2f", inc);
     }
 
     // 3) host: yeni katilana mutlak degeri gonder
@@ -1058,6 +1129,7 @@ static void MoneyFrame(uintptr_t g) {
         MoneyPacket p; memset(&p, 0, sizeof(p));
         p.type = PACKET_MONEY_DELTA; p.originId = g_LocalPlayerId.load(); p.value = g_MoneyAccum;
         QueueVehicleEvent(&p, sizeof(p));
+        if (fabs(g_MoneyAccum) >= 100.0) LOGI("[MONEY] yerel degisim gonderildi: %+.2f", g_MoneyAccum);
         g_MoneyAccum = 0.0;
         g_MoneyLastSendMs = now;
     }
@@ -2560,6 +2632,7 @@ static bool ProcessPackets(uint8_t* buf, size_t& buffered, int peerId, std::vect
         else if (type == PACKET_VEHICLE_REMOVE) { size = sizeof(VehicleRemovePacket); relayIt = true; }
         else if (type == PACKET_MONEY_DELTA) { size = sizeof(MoneyPacket); relayIt = true; }
         else if (type == PACKET_MONEY_SET) size = sizeof(MoneyPacket);
+        else if (type == PACKET_ACTIVE_VEHICLE) { size = sizeof(ActiveVehiclePacket); relayIt = true; }
         else if (type == PACKET_VEHICLE_NETMAP) {
             if (buffered < 3) break;
             uint16_t cnt;
@@ -2680,6 +2753,10 @@ static bool ProcessPackets(uint8_t* buf, size_t& buffered, int peerId, std::vect
                 op.kind = 1;
                 PushVehicleOp(op);
             }
+        } else if (type == PACKET_ACTIVE_VEHICLE) {
+            ActiveVehiclePacket ap;
+            memcpy(&ap, buf, sizeof(ap));
+            if (ap.originId != g_LocalPlayerId.load()) StoreRemoteActive(ap.originId, ap.netId);
         } else if (type == PACKET_MONEY_DELTA) {
             MoneyPacket mp;
             memcpy(&mp, buf, sizeof(mp));
@@ -4767,9 +4844,19 @@ static bool IsGhostVehiclePtr(uintptr_t veh) {
     if (veh == 0) return false;
     const int id = NetIdOfVehicle(veh);
     if (id < 0) return false;
+    const uint8_t me = g_LocalPlayerId.load();
     uint8_t owner = VEHICLE_OWNER_NONE;
-    if (!GetVehicleOwner((uint16_t)id, &owner)) return false;
-    return owner != VEHICLE_OWNER_NONE && owner != g_LocalPlayerId.load();
+    GetVehicleOwner((uint16_t)id, &owner);
+    if (id == g_LocalActiveNetId) {
+        // Yerel oyuncu bu aracin icinde. Baska bir oyuncu da AYNI aractaysa sadece biri saymali:
+        //  - sahip (suren) baskasiysa o sayar, sahip bensem ben sayarim,
+        //  - sahip yoksa (arac duruyor) en kucuk oyuncu numarasi sayar.
+        if (!IsRemoteActiveVehicle(id)) return false;
+        if (owner != VEHICLE_OWNER_NONE) return owner != me;
+        return HasLowerIdRemoteActive(id, me);
+    }
+    if (owner != VEHICLE_OWNER_NONE && owner != me) return true;   // baskasi suruyor
+    return IsRemoteActiveVehicle(id);                              // baskasi icinde (arac duruyor olabilir)
 }
 
 static void* GuardedEntityUpdate(EntityUpdate_t orig, uintptr_t ownerVeh, const char* name, void* thiz,
@@ -4864,6 +4951,7 @@ void my_GameUpdateStateBase(void* thiz, float param_1, uint32_t param_2, uint32_
     if (*(volatile uint32_t*)(g_EngineInstance + 0x64) == 6) {
         ApplyRemoteVehicleStates(g_EngineInstance);
         CaptureAndQueueLocalVehicleState(g_EngineInstance);
+        ActiveVehicleFrame(g_EngineInstance);
     } else {
         // Oyun ici menu (magaza): konum esitleme yok, ama arac tablosu acik kalir ve
         // magazadan alinan/satilan araclar hemen diger cihazlara bildirilir.
@@ -5056,7 +5144,7 @@ void* my_renderStartMenuMain(void* thiz, void* p1, void* p2, void* p3) {
 // ========================================================================
 __attribute__((constructor))
 void ModMain() {
-    LOGI(">>> MULTIPLAYER MOD STARTING <<< build=shopfix-5+money-guard (ghost income suppressed)");
+    LOGI(">>> MULTIPLAYER MOD STARTING <<< build=shopfix-7+money-guard-shared-vehicle (same-vehicle tiebreak)");
 
     ResetVehicleSyncState();
     std::thread(StartPONGResponderThread).detach();
