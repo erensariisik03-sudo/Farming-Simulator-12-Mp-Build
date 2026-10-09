@@ -4745,6 +4745,62 @@ void DrawImGui() {
 // ========================================================================
 // RENDER HOOKS
 // ========================================================================
+// ========================================================================
+// ORTAK PARA: "HAYALET" VARLIKLARIN PARA DEGISIMINI GERI AL
+// Oyun, parayi varliklarin kendi update fonksiyonlarinda degistirir (urun satisi: Trailer::update
+// icinden TipSite::tip; yakit/is maliyeti: Vehicle::update, Tool::update). Baska bir oyuncunun
+// surdugu arac her cihazda "hayalet" olarak calisir, yani ayni satis HER cihazda gerceklesir ve
+// para cihaz sayisi kadar katlanirdi.
+// Cozum: sahibi BASKA oyuncu olan bir aracin (veya ona bagli romork/aletin) update'i para
+// degistirirse, o degisim hemen geri alinir. Sadece araci gercekten suren cihazin degisimi
+// kalir ve MoneyFrame ile diger cihazlara delta olarak gider. Boylece her olay 1 kez sayilir.
+// Kanca takilamazsa (prologue riskli) bu ozellik sessizce kapanir, loga yazilir.
+// ========================================================================
+static const bool kGuardGhostMoney = true;
+typedef void* (*EntityUpdate_t)(void*, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t);
+static EntityUpdate_t orig_Vehicle_update = nullptr;
+static EntityUpdate_t orig_Trailer_update = nullptr;
+static EntityUpdate_t orig_Tool_update = nullptr;
+static std::atomic<int> g_MoneyGuardLogs(0);
+
+static bool IsGhostVehiclePtr(uintptr_t veh) {
+    if (veh == 0) return false;
+    const int id = NetIdOfVehicle(veh);
+    if (id < 0) return false;
+    uint8_t owner = VEHICLE_OWNER_NONE;
+    if (!GetVehicleOwner((uint16_t)id, &owner)) return false;
+    return owner != VEHICLE_OWNER_NONE && owner != g_LocalPlayerId.load();
+}
+
+static void* GuardedEntityUpdate(EntityUpdate_t orig, uintptr_t ownerVeh, const char* name, void* thiz,
+                                 uint32_t a, uint32_t b, uint32_t c, uint32_t d, uint32_t e) {
+    if (!orig) return nullptr;
+    const uintptr_t g = g_EngineInstance;
+    if (g == 0 || !kSharedMoney || !g_IsConnected.load() || !g_VehNetArmed.load() || !IsGhostVehiclePtr(ownerVeh))
+        return orig(thiz, a, b, c, d, e);
+    const double before = ReadMoney(g);
+    void* r = orig(thiz, a, b, c, d, e);
+    const double after = ReadMoney(g);
+    if (after != before) {
+        WriteMoney(g, before);
+        if (g_MoneyGuardLogs.fetch_add(1) < 30)
+            LOGI("[MONEY] hayalet %s para degisimi geri alindi: %+.2f", name, after - before);
+    }
+    return r;
+}
+
+static void* my_Vehicle_update(void* t, uint32_t a, uint32_t b, uint32_t c, uint32_t d, uint32_t e) {
+    return GuardedEntityUpdate(orig_Vehicle_update, (uintptr_t)t, "Vehicle", t, a, b, c, d, e);
+}
+static void* my_Trailer_update(void* t, uint32_t a, uint32_t b, uint32_t c, uint32_t d, uint32_t e) {
+    const uintptr_t veh = t ? *(uintptr_t*)((uintptr_t)t + 0x184) : 0;     // Trailer+0x184 = bagli oldugu arac
+    return GuardedEntityUpdate(orig_Trailer_update, veh, "Trailer", t, a, b, c, d, e);
+}
+static void* my_Tool_update(void* t, uint32_t a, uint32_t b, uint32_t c, uint32_t d, uint32_t e) {
+    const uintptr_t veh = t ? *(uintptr_t*)((uintptr_t)t + 0x23C) : 0;     // Tool+0x23C = bagli oldugu arac
+    return GuardedEntityUpdate(orig_Tool_update, veh, "Tool", t, a, b, c, d, e);
+}
+
 void my_GameUpdate(void* thiz, float param_1) {
     if (g_HUDInstance != 0) RepairShopClick((void*)g_HUDInstance, "gameUpdate");   // tiklama bu karede islenmeden once
     g_LastGameUpdateMs.store(NowMs());   // host canlilik sinyali icin (oyun dongusu donarsa ping kesilir)
@@ -5000,7 +5056,7 @@ void* my_renderStartMenuMain(void* thiz, void* p1, void* p2, void* p3) {
 // ========================================================================
 __attribute__((constructor))
 void ModMain() {
-    LOGI(">>> MULTIPLAYER MOD STARTING <<< build=shopfix-4+money (shared money, RepairShopClick, state7-armed)");
+    LOGI(">>> MULTIPLAYER MOD STARTING <<< build=shopfix-5+money-guard (ghost income suppressed)");
 
     ResetVehicleSyncState();
     std::thread(StartPONGResponderThread).detach();
@@ -5047,6 +5103,21 @@ void ModMain() {
         orig_Game_addVehicle = (Game_addVehicle_t)addVeh;     // kanca YOK: sadece cagrilacak ham fonksiyon
         HookChecked("Game::removeVehicle", remVeh, (void*)my_Game_removeVehicle, (void**)&orig_Game_removeVehicle, false);
         g_VehicleHooksOk = addVeh && remVeh && g_VehicleDestroyFn;
+
+        // Ortak para: hayalet varliklarin gelir/giderini geri alan kancalar (riskli prologue'da TAKILMAZ).
+        if (kSharedMoney && kGuardGhostMoney) {
+            void* vu = dlsym(appLib, "_ZN7Vehicle6updateEfffbP4Game");
+            if (!vu) vu = FindElfSymbolByPrefix("libapp.so", "_ZN7Vehicle6update");
+            void* tru = dlsym(appLib, "_ZN7Trailer6updateEfP4Game");
+            if (!tru) tru = FindElfSymbolByPrefix("libapp.so", "_ZN7Trailer6update");
+            void* tou = dlsym(appLib, "_ZN4Tool6updateEfP4Game");
+            if (!tou) tou = FindElfSymbolByPrefix("libapp.so", "_ZN4Tool6update");
+            LOGI("[MONEY] guard symbols: Vehicle::update=%p Trailer::update=%p Tool::update=%p", vu, tru, tou);
+            const bool h1 = HookChecked("Vehicle::update", vu, (void*)my_Vehicle_update, (void**)&orig_Vehicle_update, true);
+            const bool h2 = HookChecked("Trailer::update", tru, (void*)my_Trailer_update, (void**)&orig_Trailer_update, true);
+            const bool h3 = HookChecked("Tool::update", tou, (void*)my_Tool_update, (void**)&orig_Tool_update, true);
+            LOGI("[MONEY] guard hooks installed: Vehicle=%d Trailer=%d Tool=%d", (int)h1, (int)h2, (int)h3);
+        }
         if (saveTask) {
             g_SaveStartTaskFn = saveTask;
             MSHookFunction(saveTask, (void*)my_SaveStartTask, (void**)&orig_SaveStartTask);
