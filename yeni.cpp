@@ -596,6 +596,8 @@ static const uint8_t PACKET_ACTIVE_VEHICLE = 22;  // "su an bu aracin icindeyim"
 static const uint8_t PACKET_MONEY_SET = 21;       // host -> client: mutlak para (oyuncu odaya katilinca)
 static const uint8_t PACKET_UDP_ACK = 16;      // host -> client (UDP): UDP yolu acildi
 static const uint8_t PACKET_TRAILER_ATTACH = 23;  // romork takildi/cikarildi (olay, guvenilir)
+static const uint8_t PACKET_FIELD_OP = 25;       // tarla islemi (hasat/pulluk/mibzer...): diger cihazlarda ayni tarla degissin
+static const uint8_t PACKET_POOL_OP = 26;        // romork/alet satin alma (ekle) / satma (sil)
 static const uint8_t PACKET_ENTITY_STATE = 24;    // romork doluluk / bicer tank, calisma, kesici durumu
 
 // Baglanti sagligi: bu sureden uzun sessizlik = karsi taraf gitti (donmus / zorla kapatilmis).
@@ -1872,6 +1874,29 @@ static std::vector<EntityStatePacket> g_PendingEntityStates;      // g_VehicleEv
 static std::atomic<bool> g_EntityResendAll(false);                // host: yeni oyuncu icin tum durumlari tekrar yolla
 static bool g_ApplyingRemoteTrailerOp = false;                    // sadece oyun thread'i
 
+// ---- Tarla islemi (Map::updateFields cagrisi) ve romork/alet ekleme-silme paketleri ----
+struct __attribute__((packed)) FieldOpPacket {
+    uint8_t type;
+    uint8_t ownerId;
+    uint32_t wtype;         // FieldWork[0]: islem tipi (1 ekim, 3 hasat, 2/5 isleme...)
+    uint32_t wfruit;        // FieldWork[1]: urun / alt tip
+    uint32_t p[8];          // 4 kose noktasi (x,y) x4 - float bitleri
+};
+struct __attribute__((packed)) PoolOpPacket {
+    uint8_t type;
+    uint8_t ownerId;
+    uint8_t kind;           // 1 = romork, 2 = alet
+    uint8_t op;             // 1 = eklendi (satin alindi), 0 = silindi (satildi)
+    uint16_t itemType;      // Trailer+0x10 / Tool+0x10
+    uint8_t idx;            // dizideki sira
+    float x, y, a;          // ekleme: konum (box2d x,y) ve aci
+};
+static std::vector<uint8_t> g_FieldOpOut;                         // g_VehicleEventMutex ile korunur
+static std::vector<FieldOpPacket> g_PendingFieldOps;              // g_VehicleEventMutex ile korunur
+static std::vector<PoolOpPacket> g_PendingPoolOps;                // g_VehicleEventMutex ile korunur
+static bool g_ReplayingFieldOp = false;                           // sadece oyun thread'i: uzaktan tarla islemi uygulaniyor
+static const bool kSyncFieldWork = true;                          // tarla senkronu (hasat, pulluk, mibzer...)
+
 typedef void (*Vehicle_attachTrailer_t)(void* vehicle, void* trailer, void* world);
 typedef void (*Entity_toggle_t)(void* self);
 static Vehicle_attachTrailer_t g_VehicleAttachTrailerFn = nullptr;
@@ -1945,6 +1970,30 @@ static void QueueEntityState(uint8_t kind, uint16_t id, uint8_t sub, uint32_t wa
     p.ownerId = g_LocalPlayerId.load();
     p.kind = kind; p.id = id; p.sub = sub; p.wa = wa; p.wb = wb; p.flags = flags;
     QueueVehicleEvent(&p, sizeof(p));
+}
+
+static void QueueFieldOp(uint32_t wtype, uint32_t wfruit, const uint32_t* pts) {
+    if (!g_IsConnected.load()) return;
+    FieldOpPacket k;
+    memset(&k, 0, sizeof(k));
+    k.type = PACKET_FIELD_OP;
+    k.ownerId = g_LocalPlayerId.load();
+    k.wtype = wtype; k.wfruit = wfruit;
+    memcpy(k.p, pts, sizeof(k.p));
+    std::lock_guard<std::mutex> lock(g_VehicleEventMutex);
+    if (g_FieldOpOut.size() > 6000) return;               // tampon doldu: bu islemi atla (arac olaylarini silme)
+    const uint8_t* b = (const uint8_t*)&k;
+    g_FieldOpOut.insert(g_FieldOpOut.end(), b, b + sizeof(k));
+}
+
+static void QueuePoolOp(uint8_t kind, uint8_t op, uint16_t itemType, uint8_t idx, float x, float y, float a) {
+    if (!g_IsConnected.load()) return;
+    PoolOpPacket k;
+    memset(&k, 0, sizeof(k));
+    k.type = PACKET_POOL_OP;
+    k.ownerId = g_LocalPlayerId.load();
+    k.kind = kind; k.op = op; k.itemType = itemType; k.idx = idx; k.x = x; k.y = y; k.a = a;
+    QueueVehicleEvent(&k, sizeof(k));
 }
 
 static float WordToFloat(uint32_t w) { float f; memcpy(&f, &w, 4); return f; }
@@ -2248,6 +2297,172 @@ static void HornFrame(uintptr_t game, uint64_t nowMs) {
         *(uint8_t*)(game + 0xA416) = 0;
         g_HornForced = false;
     }
+}
+
+
+// ========================================================================
+// ROMORK / ALET SATIN ALMA - SATMA (karsilikli)
+// Havuz dizileri (trailer: game+0x1a0.., alet: game+0x294..) sayac + "son ile yer degistir" ile silinir.
+// Her karede dizinin goruntusu bir oncekiyle karsilastirilir: sonda yeni giris = satin alindi (ekle),
+// kaybolan giris = satildi (sil). Karsi cihazda oyunun kendi Game::addTrailer/addTool,
+// Game::removeTrailer/removeTool ve destroy fonksiyonlari CAGRILIR (kanca yok, para dokunulmaz).
+// ========================================================================
+typedef void (*Game_addItem_t)(void* game, int type, const float* pos, uint32_t angleBits, uint32_t extra);
+typedef void (*Game_removeIdx_t)(void* game, uint32_t idx);
+static Game_addItem_t g_GameAddTrailerFn = nullptr;
+static Game_addItem_t g_GameAddToolFn = nullptr;
+static Game_removeIdx_t g_GameRemoveTrailerFn = nullptr;
+static Game_removeIdx_t g_GameRemoveToolFn = nullptr;
+static Entity_toggle_t g_TrailerDestroyFn = nullptr;               // Trailer::destroy()
+static Entity_toggle_t g_ToolDestroyFn = nullptr;                  // Tool::destroy()
+static std::vector<uintptr_t> g_PoolSnap[2];                       // [0] romorklar, [1] aletler
+static bool g_PoolSnapValid = false;
+
+static void PoolTake(uintptr_t game, std::vector<uintptr_t>* snap) {
+    snap[0].clear(); snap[1].clear();
+    const uint32_t tn = TrailerCount(game), on = ToolCount(game);
+    for (uint32_t i = 0; i < tn; ++i) snap[0].push_back(RawTrailerSlot(game, i));
+    for (uint32_t i = 0; i < on; ++i) snap[1].push_back(RawToolSlot(game, i));
+}
+
+// Siralar degisti: sira numarasina bagli tum konum/yayin kayitlari gecersiz.
+static void PoolOnChanged() {
+    memset(g_TrailerMine, 0, sizeof(g_TrailerMine));
+    memset(g_ToolMine, 0, sizeof(g_ToolMine));
+    std::lock_guard<std::mutex> lock(g_VehicleStateMutex);
+    for (uint16_t i = 0; i < 64; ++i) ClearVehicleStateSlot((uint16_t)(TRAILER_ID_BASE + i));
+    for (uint16_t i = 0; i < 64; ++i) ClearVehicleStateSlot((uint16_t)(TOOL_ID_BASE + i));
+}
+
+static bool PtrIn(const std::vector<uintptr_t>& v, uintptr_t p) {
+    for (size_t i = 0; i < v.size(); ++i) if (v[i] == p) return true;
+    return false;
+}
+
+// Her kare (oyun thread'i, durum 6 ve 7): yerel satin alma / satma tespiti.
+static void PoolPollFrame(uintptr_t game) {
+    if (game == 0) return;
+    if (!g_VehNetArmed.load() || !g_IsConnected.load()) { g_PoolSnapValid = false; return; }
+    std::vector<uintptr_t> cur[2];
+    PoolTake(game, cur);
+    if (!g_PoolSnapValid) { g_PoolSnap[0] = cur[0]; g_PoolSnap[1] = cur[1]; g_PoolSnapValid = true; return; }
+    bool changed = false;
+    for (int k = 0; k < 2; ++k) {
+        const uint8_t kind = (uint8_t)(k + 1);
+        const std::vector<uintptr_t>& prev = g_PoolSnap[k];
+        const std::vector<uintptr_t>& now = cur[k];
+        if (prev == now) continue;
+        std::vector<uintptr_t> sim = prev;
+        for (size_t i = 0; i < prev.size(); ++i) {            // kaybolanlar = satildi
+            const uintptr_t pp = prev[i];
+            if (PtrIn(now, pp)) continue;
+            size_t idx = 0;
+            for (; idx < sim.size(); ++idx) if (sim[idx] == pp) break;
+            if (idx >= sim.size()) continue;
+            const uint32_t type = *(uint32_t*)(pp + 0x10);
+            QueuePoolOp(kind, 0, (uint16_t)type, (uint8_t)idx, 0, 0, 0);
+            LOGI("[POOL] satildi: %s tip=%u sira=%u", k == 0 ? "romork" : "alet", (unsigned)type, (unsigned)idx);
+            sim[idx] = sim.back();                             // oyunun "son ile yer degistir" mantigi
+            sim.pop_back();
+            changed = true;
+        }
+        for (size_t i = sim.size(); i < now.size(); ++i) {     // sonda yeni girisler = satin alindi
+            const uintptr_t np = now[i];
+            const uintptr_t body = *(uintptr_t*)(np + (k == 0 ? 0x180 : 0x228));
+            const uint32_t type = *(uint32_t*)(np + 0x10);
+            if (body == 0 || type > 0xFFFF) continue;
+            QueuePoolOp(kind, 1, (uint16_t)type, (uint8_t)i, *(float*)(body + 0x0C), *(float*)(body + 0x10), *(float*)(body + 0x40));
+            LOGI("[POOL] alindi: %s tip=%u sira=%u", k == 0 ? "romork" : "alet", (unsigned)type, (unsigned)i);
+            changed = true;
+        }
+    }
+    g_PoolSnap[0] = cur[0]; g_PoolSnap[1] = cur[1];
+    if (changed) PoolOnChanged();
+}
+
+static void ApplyPendingPoolOps(uintptr_t game, uint8_t localOwner) {
+    std::vector<PoolOpPacket> ops;
+    {
+        std::lock_guard<std::mutex> lock(g_VehicleEventMutex);
+        if (g_PendingPoolOps.empty()) return;
+        if (!g_VehNetArmed.load()) return;
+        ops.swap(g_PendingPoolOps);
+    }
+    void* world = *(void**)(game + 0xA0);
+    bool changed = false;
+    for (const PoolOpPacket& op : ops) {
+        if (op.ownerId == localOwner) continue;
+        const bool isTool = (op.kind == 2);
+        const char* nm = isTool ? "alet" : "romork";
+        if (op.op == 1) {                                      // EKLE
+            Game_addItem_t fn = isTool ? g_GameAddToolFn : g_GameAddTrailerFn;
+            const uint32_t total = VehicleCount(game) + TrailerCount(game) + ToolCount(game);
+            if (!fn || total >= 0x1e) { LOGI("[POOL] ekleme atlandi: %s (fonksiyon yok / sinir)", nm); continue; }
+            const float pos[3] = { op.x, 0.0f, op.y };
+            uint32_t ab; memcpy(&ab, &op.a, 4);
+            fn((void*)game, (int)op.itemType, pos, ab, 0);
+            LOGI("[POOL] uzaktan ekleme uygulandi: %s tip=%u", nm, (unsigned)op.itemType);
+            changed = true;
+        } else {                                               // SIL
+            Game_removeIdx_t rm = isTool ? g_GameRemoveToolFn : g_GameRemoveTrailerFn;
+            Entity_toggle_t des = isTool ? g_ToolDestroyFn : g_TrailerDestroyFn;
+            if (!rm || !des) { LOGI("[POOL] silme atlandi: %s (fonksiyon yok)", nm); continue; }
+            const uint32_t n = isTool ? ToolCount(game) : TrailerCount(game);
+            int found = -1;
+            if (op.idx < n) {
+                const uintptr_t tp = isTool ? RawToolSlot(game, op.idx) : RawTrailerSlot(game, op.idx);
+                if (tp != 0 && *(uint32_t*)(tp + 0x10) == op.itemType) found = op.idx;
+            }
+            if (found < 0) {                                   // sira kaymis: ayni tipteki ilk girisi bul (oyunun sat mantigi)
+                for (uint32_t i = 0; i < n; ++i) {
+                    const uintptr_t tp = isTool ? RawToolSlot(game, i) : RawTrailerSlot(game, i);
+                    if (tp != 0 && *(uint32_t*)(tp + 0x10) == op.itemType) { found = (int)i; break; }
+                }
+            }
+            if (found < 0) { LOGI("[POOL] silme atlandi: %s tip=%u bulunamadi", nm, (unsigned)op.itemType); continue; }
+            const uintptr_t tp = isTool ? RawToolSlot(game, found) : RawTrailerSlot(game, found);
+            const uintptr_t av = *(uintptr_t*)(tp + (isTool ? 0x23C : 0x184));
+            if (av != 0 && world != nullptr && SlotIndexOfVehicle(game, av) >= 0) {
+                if (isTool) { if (g_VehicleDetachToolFn) g_VehicleDetachToolFn((void*)av, world); }
+                else { if (g_VehicleDetachTrailerFn) g_VehicleDetachTrailerFn((void*)av, world); }
+            }
+            rm((void*)game, (uint32_t)found);
+            des((void*)tp);
+            LOGI("[POOL] uzaktan silme uygulandi: %s tip=%u sira=%d", nm, (unsigned)op.itemType, found);
+            changed = true;
+        }
+    }
+    if (changed) {
+        PoolTake(game, g_PoolSnap);                            // yerel degisiklik sanilip geri yayinlanmasin
+        g_PoolSnapValid = true;
+        PoolOnChanged();
+    }
+}
+
+// ---- Tarla islemleri: Map::updateFields kancasi yerel islemi gonderir, bu fonksiyon uzaktakini uygular ----
+typedef void (*Map_updateFields_t)(void* map, uint32_t f1, uint32_t f2, uint32_t f3, uint32_t s0, uint32_t s1,
+                                   uint32_t s2, uint32_t s3, uint32_t s4, void* fieldWork);
+static Map_updateFields_t orig_Map_updateFields = nullptr;
+static void* g_MapUpdateFieldsRaw = nullptr;
+
+static void ApplyPendingFieldOps(uintptr_t game) {
+    std::vector<FieldOpPacket> ops;
+    {
+        std::lock_guard<std::mutex> lock(g_VehicleEventMutex);
+        if (g_PendingFieldOps.empty()) return;
+        ops.swap(g_PendingFieldOps);
+    }
+    void* map = (void*)(*(uintptr_t*)(game + 0x704));
+    Map_updateFields_t fn = orig_Map_updateFields ? orig_Map_updateFields : (Map_updateFields_t)g_MapUpdateFieldsRaw;
+    if (!map || !fn) return;
+    static int s_logs = 0;
+    g_ReplayingFieldOp = true;
+    for (const FieldOpPacket& op : ops) {
+        uint32_t fw[8] = { op.wtype, op.wfruit, 0, 0, 0, 0, 0, 0 };     // FieldWork: tip, urun, sonuc alanlari (sifir)
+        fn(map, op.p[0], op.p[1], op.p[2], op.p[3], op.p[4], op.p[5], op.p[6], op.p[7], fw);
+    }
+    g_ReplayingFieldOp = false;
+    if (s_logs < 12) { ++s_logs; LOGI("[FIELD] uzaktan tarla islemi uygulandi: %u adet", (unsigned)ops.size()); }
 }
 
 // Diger cihazdan gelen romork takma/cikarma ve durum paketlerini oyun thread'inde uygular.
@@ -2817,7 +3032,9 @@ static void ApplyRemoteVehicleStates(uintptr_t game) {
         }
     }
 
+    ApplyPendingPoolOps(game, localOwner);
     ApplyPendingTrailerEvents(game, localOwner, nowMs);
+    ApplyPendingFieldOps(game);
 
     ApplyRemoteAttachablePoses(game, localOwner, nowMs, decay, false);
     ApplyRemoteAttachablePoses(game, localOwner, nowMs, decay, true);
@@ -3154,7 +3371,11 @@ static void ResetVehicleSyncState() {
         std::lock_guard<std::mutex> lock(g_VehicleEventMutex);
         g_PendingTrailerAttach.clear();
         g_PendingEntityStates.clear();
+        g_PendingFieldOps.clear();
+        g_PendingPoolOps.clear();
+        g_FieldOpOut.clear();
     }
+    g_PoolSnapValid = false;
     g_VehNetArmed.store(false);
     g_NetMapDirty.store(false);
     {
@@ -3432,6 +3653,8 @@ static bool ProcessPackets(uint8_t* buf, size_t& buffered, int peerId, std::vect
         else if (type == PACKET_MONEY_SET) size = sizeof(MoneyPacket);
         else if (type == PACKET_TRAILER_ATTACH) { size = sizeof(TrailerAttachPacket); relayIt = true; }
         else if (type == PACKET_ENTITY_STATE) { size = sizeof(EntityStatePacket); relayIt = true; }
+        else if (type == PACKET_FIELD_OP) { size = sizeof(FieldOpPacket); relayIt = true; }
+        else if (type == PACKET_POOL_OP) { size = sizeof(PoolOpPacket); relayIt = true; }
         else if (type == PACKET_ACTIVE_VEHICLE) { size = sizeof(ActiveVehiclePacket); relayIt = true; }
         else if (type == PACKET_VEHICLE_NETMAP) {
             if (buffered < 3) break;
@@ -3616,6 +3839,24 @@ static bool ProcessPackets(uint8_t* buf, size_t& buffered, int peerId, std::vect
                     g_PendingEntityStates.push_back(ep);
                 }
             }
+        } else if (type == PACKET_FIELD_OP) {
+            FieldOpPacket fp;
+            memcpy(&fp, buf, sizeof(fp));
+            if (fromPeer) { fp.ownerId = (uint8_t)peerId; memcpy(buf, &fp, sizeof(fp)); }
+            if (kSyncFieldWork && fp.ownerId != g_LocalPlayerId.load() && fp.wtype < 16) {
+                std::lock_guard<std::mutex> lock(g_VehicleEventMutex);
+                if (g_PendingFieldOps.size() >= 256) g_PendingFieldOps.erase(g_PendingFieldOps.begin());
+                g_PendingFieldOps.push_back(fp);
+            }
+        } else if (type == PACKET_POOL_OP) {
+            PoolOpPacket pp;
+            memcpy(&pp, buf, sizeof(pp));
+            if (fromPeer) { pp.ownerId = (uint8_t)peerId; memcpy(buf, &pp, sizeof(pp)); }
+            if (pp.ownerId != g_LocalPlayerId.load() && (pp.kind == 1 || pp.kind == 2)) {
+                std::lock_guard<std::mutex> lock(g_VehicleEventMutex);
+                if (g_PendingPoolOps.size() >= 32) g_PendingPoolOps.erase(g_PendingPoolOps.begin());
+                g_PendingPoolOps.push_back(pp);
+            }
         } else if (type == PACKET_SYNC_REQUEST) {
             if (g_IsHost.load() && fromPeer) {
                 g_HostForceTable.store(true);
@@ -3644,6 +3885,10 @@ static void BuildOutgoing(std::vector<uint8_t>& out, std::vector<uint8_t>* fast 
         if (!g_VehicleEventOut.empty()) {
             out.insert(out.end(), g_VehicleEventOut.begin(), g_VehicleEventOut.end());
             g_VehicleEventOut.clear();
+        }
+        if (!g_FieldOpOut.empty()) {
+            out.insert(out.end(), g_FieldOpOut.begin(), g_FieldOpOut.end());
+            g_FieldOpOut.clear();
         }
     }
     {
@@ -5733,6 +5978,50 @@ static void* my_Tool_update(void* t, uint32_t a, uint32_t b, uint32_t c, uint32_
     return GuardedEntityUpdate(orig_Tool_update, veh, "Tool", t, a, b, c, d, e);
 }
 
+// ---- Tarla islemi kancasi: Map::updateFields(8 kose float, FieldWork&) ----
+// Hasat / pulluk / mibzer gibi tum tarla degisiklikleri bu fonksiyondan gecer. Bu cihazin surdugu (ya da
+// isciye verdigi) aracin islemi diger cihazlara gonderilir; onlar ayni cagriyi kendi tarlalarinda yapar.
+// FieldWork bir arac (+0x3d4) ya da aletin (+0x434) icinde oldugundan kaynak adresten bulunur.
+struct FieldSrcCache { uintptr_t fw; uint32_t p[8]; uint32_t wtype, wfruit; long long ms; };
+static FieldSrcCache g_FieldSrc[16];
+static int g_FieldSrcNext = 0;
+
+static int FieldSourceKind(uintptr_t game, uintptr_t fw, uintptr_t* vehOut) {
+    const uint32_t vn = VehicleCount(game);
+    for (uint32_t i = 0; i < vn; ++i) {
+        const uintptr_t v = RawVehicleSlot(game, i);
+        if (v != 0 && fw == v + 0x3D4) { *vehOut = v; return 1; }
+    }
+    const uint32_t tn = ToolCount(game);
+    for (uint32_t i = 0; i < tn; ++i) {
+        const uintptr_t t = RawToolSlot(game, i);
+        if (t != 0 && fw == t + 0x434) { *vehOut = *(uintptr_t*)(t + 0x23C); return 2; }
+    }
+    return 0;
+}
+
+static void my_Map_updateFields(void* map, uint32_t f1, uint32_t f2, uint32_t f3, uint32_t s0, uint32_t s1,
+                                uint32_t s2, uint32_t s3, uint32_t s4, void* fw) {
+    const bool capture = kSyncFieldWork && fw != nullptr && !g_ReplayingFieldOp && g_IsConnected.load() &&
+                         g_VehNetArmed.load() && g_EngineInstance != 0;
+    uint32_t wt = 0, wf = 0;
+    if (capture) { wt = ((uint32_t*)fw)[0]; wf = ((uint32_t*)fw)[1]; }
+    if (orig_Map_updateFields) orig_Map_updateFields(map, f1, f2, f3, s0, s1, s2, s3, s4, fw);
+    if (!capture || wt >= 16) return;
+    uintptr_t veh = 0;
+    if (FieldSourceKind(g_EngineInstance, (uintptr_t)fw, &veh) == 0 || veh == 0) return;
+    const int nid = NetIdOfVehicle(veh);
+    if (nid < 0 || g_AiMirrored[nid] || IsGhostVehiclePtr(veh)) return;     // uzaktan surulen / taklit isci: gonderme
+    const uint32_t pts[8] = { f1, f2, f3, s0, s1, s2, s3, s4 };
+    const long long now = NowMs();
+    FieldSrcCache* c = nullptr;
+    for (int i = 0; i < 16; ++i) if (g_FieldSrc[i].fw == (uintptr_t)fw) { c = &g_FieldSrc[i]; break; }
+    if (!c) { c = &g_FieldSrc[g_FieldSrcNext]; g_FieldSrcNext = (g_FieldSrcNext + 1) & 15; c->fw = (uintptr_t)fw; c->ms = 0; }
+    if (c->ms != 0 && now - c->ms < 1500 && c->wtype == wt && c->wfruit == wf && memcmp(c->p, pts, sizeof(pts)) == 0) return;   // ayni dikdortgen: tekrar yollama
+    memcpy(c->p, pts, sizeof(pts)); c->wtype = wt; c->wfruit = wf; c->ms = now;
+    QueueFieldOp(wt, wf, pts);
+}
+
 void my_GameUpdate(void* thiz, float param_1) {
     if (g_HUDInstance != 0) RepairShopClick((void*)g_HUDInstance, "gameUpdate");   // tiklama bu karede islenmeden once
     g_LastGameUpdateMs.store(NowMs());   // host canlilik sinyali icin (oyun dongusu donarsa ping kesilir)
@@ -5802,6 +6091,10 @@ void my_GameUpdateStateBase(void* thiz, float param_1, uint32_t param_2, uint32_
         // Oyun ici menu (magaza): konum esitleme yok, ama arac tablosu acik kalir ve
         // magazadan alinan/satilan araclar hemen diger cihazlara bildirilir.
         RefreshVehicleTopology(g_EngineInstance);
+    }
+    {   // romork/alet satin alma-satma tespiti (durum 6 ve 7)
+        const uint32_t st = *(volatile uint32_t*)(g_EngineInstance + 0x64);
+        if (st == 6 || st == 7) PoolPollFrame(g_EngineInstance);
     }
 
     // Oyun ici ImGui cizimi: ekran renderQueues'ta (presentGLESFramebuffer) ekrana verilir,
@@ -5990,7 +6283,7 @@ void* my_renderStartMenuMain(void* thiz, void* p1, void* p2, void* p3) {
 // ========================================================================
 __attribute__((constructor))
 void ModMain() {
-    LOGI(">>> MULTIPLAYER MOD STARTING <<< build=shopfix-7+money-guard+trailer-pos-1+attach-state-2+ai-horn-steer+echo-fix+tools-1");
+    LOGI(">>> MULTIPLAYER MOD STARTING <<< build=shopfix-7+money-guard+trailer-pos-1+attach-state-2+ai-horn-steer+echo-fix+tools-1+field-ops+pool-sync");
 
     ResetVehicleSyncState();
     std::thread(StartPONGResponderThread).detach();
@@ -6070,6 +6363,25 @@ void ModMain() {
             const bool h2 = HookChecked("Trailer::update", tru, (void*)my_Trailer_update, (void**)&orig_Trailer_update, true);
             const bool h3 = HookChecked("Tool::update", tou, (void*)my_Tool_update, (void**)&orig_Tool_update, true);
             LOGI("[MONEY] guard hooks installed: Vehicle=%d Trailer=%d Tool=%d", (int)h1, (int)h2, (int)h3);
+        }
+        {   // romork/alet alim-satim fonksiyonlari (sadece cagrilir) + tarla islemi kancasi
+            g_GameAddTrailerFn = (Game_addItem_t)dlsym(appLib, "_ZN4Game10addTrailerEN13EntityManager8TRAILERSERK7Vector3fj");
+            if (!g_GameAddTrailerFn) g_GameAddTrailerFn = (Game_addItem_t)FindElfSymbolByPrefix("libapp.so", "_ZN4Game10addTrailerE");
+            g_GameAddToolFn = (Game_addItem_t)dlsym(appLib, "_ZN4Game7addToolEN13EntityManager5TOOLSERK7Vector3fj");
+            if (!g_GameAddToolFn) g_GameAddToolFn = (Game_addItem_t)FindElfSymbolByPrefix("libapp.so", "_ZN4Game7addToolE");
+            g_GameRemoveTrailerFn = (Game_removeIdx_t)dlsym(appLib, "_ZN4Game13removeTrailerEj");
+            g_GameRemoveToolFn = (Game_removeIdx_t)dlsym(appLib, "_ZN4Game10removeToolEj");
+            g_TrailerDestroyFn = (Entity_toggle_t)dlsym(appLib, "_ZN7Trailer7destroyEv");
+            g_ToolDestroyFn = (Entity_toggle_t)dlsym(appLib, "_ZN4Tool7destroyEv");
+            LOGI("[POOL] symbols: addTrailer=%p addTool=%p removeTrailer=%p removeTool=%p trailerDestroy=%p toolDestroy=%p",
+                 (void*)g_GameAddTrailerFn, (void*)g_GameAddToolFn, (void*)g_GameRemoveTrailerFn,
+                 (void*)g_GameRemoveToolFn, (void*)g_TrailerDestroyFn, (void*)g_ToolDestroyFn);
+            void* uf = dlsym(appLib, "_ZN3Map12updateFieldsEffffffffRN5Field9FieldWorkE");
+            if (!uf) uf = FindElfSymbolByPrefix("libapp.so", "_ZN3Map12updateFields");
+            g_MapUpdateFieldsRaw = uf;
+            const bool hf = kSyncFieldWork && HookChecked("Map::updateFields", uf, (void*)my_Map_updateFields,
+                                                          (void**)&orig_Map_updateFields, true);
+            LOGI("[FIELD] Map::updateFields=%p hook=%d", uf, (int)hf);
         }
         if (saveTask) {
             g_SaveStartTaskFn = saveTask;
