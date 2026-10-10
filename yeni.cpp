@@ -597,6 +597,9 @@ static const uint8_t PACKET_MONEY_SET = 21;       // host -> client: mutlak para
 static const uint8_t PACKET_UDP_ACK = 16;      // host -> client (UDP): UDP yolu acildi
 static const uint8_t PACKET_TRAILER_ATTACH = 23;  // romork takildi/cikarildi (olay, guvenilir)
 static const uint8_t PACKET_FIELD_OP = 25;       // tarla islemi (hasat/pulluk/mibzer...): diger cihazlarda ayni tarla degissin
+static const uint8_t PACKET_TIME_SYNC = 27;      // host -> client: oyun saati (menude duran saat kaymasin)
+static std::atomic<double> g_TimeSyncValue(0.0);
+static std::atomic<bool> g_TimeSyncPending(false);
 static const uint8_t PACKET_POOL_OP = 26;        // romork/alet satin alma (ekle) / satma (sil)
 static const uint8_t PACKET_ENTITY_STATE = 24;    // romork doluluk / bicer tank, calisma, kesici durumu
 
@@ -1451,13 +1454,6 @@ static bool ThumbPrologueHasPcRelative(const void* fn, char* why, size_t whySize
 }
 
 // skipIfRisky=true ise riskli fonksiyona kanca TAKILMAZ (oyun cokmesin diye) ve false doner.
-// Oyunun arka plan muzik yukleyicisi (BackgroundMusicPlayer::processTrackLoad) bazi cihazlarda parcayi kucuk bir
-// tampona tasirarak SIGSEGV ile coker (memcpy, StreamingZipInflater). Bu kanca yuklemeyi atlar = "parca yuklenemedi"
-// yolu (oyun bunu zaten sessizce geciyor). Muzik acilmaz ama oyun cokmez. Gerek yoksa false yap.
-static const bool kDisableBgMusic = true;
-static void my_BgMusic_processTrackLoad(void* /*thiz*/) {}
-static void* orig_BgMusic_processTrackLoad = nullptr;
-
 static bool HookChecked(const char* name, void* fn, void* replacement, void** original, bool skipIfRisky) {
     if (!fn) return false;
     char why[64] = {0};
@@ -1917,8 +1913,8 @@ static Vehicle_aiStart_t g_VehicleAiStartFn = nullptr;
 static Entity_toggle_t g_VehicleAiStopFn = nullptr;                    // Vehicle::aiStop()
 static bool g_AiMirrored[VEHICLE_SLOT_LIMIT];                          // isci bu cihazda UZAKTAN baslatildi (konum yayinlama)
 static std::atomic<long long> g_RemoteHornUntilMs(0);                  // uzaktan korna: bu ana kadar acik
+static std::atomic<int> g_RemoteHornOrigin(-1);                         // kornaya basan uzak oyuncu
 static bool g_HornForced = false;
-static std::atomic<int> g_RemoteHornOwner(-1);                         // kornaya basan uzak oyuncu (mesafe icin)
 
 struct TrailerTrack { uintptr_t tp; uintptr_t av; uint32_t levelWord; uint32_t typeWord; uint64_t lastMs; };
 static TrailerTrack g_TrTrack[64];
@@ -2297,9 +2293,9 @@ static void CaptureAndQueueCombineStates(uintptr_t game, uint8_t localOwner, uin
                 } else if (!remoteAi) {
                     g_AiMirrored[id] = false;                         // karsi taraf da durdurmus
                 }
-                // Aynali isci kendi kendine durduysa YENIDEN BASLATILMAZ: arac zaten gercek iscinin konumunu izliyor,
-                // tarla islemi karsi cihazdan aynalanir. (Tekrar baslatma hem gecikme yapiyor hem de kullanicinin
-                // bastigi durdurmayi geri aliyordu.) Durum yayinlanmaz, kullanici dugmeye basarsa yayinlanir.
+                // Aynali isci kendi kendine durduysa YENIDEN BASLATILMAZ (eskiden 1.5 sn'de bir aiStart/prepareStartAi
+                // cagrilip gecikme yapiyor ve kullanicinin durdurmasini geri aliyordu). Arac zaten gercek iscinin konumunu
+                // izliyor, tarla islemi karsi cihazdan aynalaniyor. Kullanici dugmeye basarsa durum yayinlanir.
             }
             if (g_AiMirrored[id] && !intent) continue;                // aynali isci simulasyonunun kararlari yayinlanmaz
         }
@@ -2348,89 +2344,78 @@ static void CaptureAndQueueCombineStates(uintptr_t game, uint8_t localOwner, uin
 
 // ---- Korna: Game+0xa416 = korna tusu basili (her karenin sonunda yerel girdiden dolar), Game+0xa417 = calan ses.
 // Yerel korna degisince "kind 3" paketi gider; uzaktan korna varsa bayrak her kare 1'e zorlanir ve oyun kendi sesini calar.
-// Oyun kornayi birakinca sesi sadece DURAKLATIYOR (kanal serbest kalmiyor, FMOD'da 32 kanal var) -> her basista bir kanal
-// sizar ve ~30 basistan sonra motor sesleri susuyor. Bu yuzden duraklatma sonrasi AudioSource::stop cagrilir (kanal serbest).
-typedef void (*AudioSrcStop_t)(void*);
-typedef void (*AudioSrcVol_t)(void*, float);
-static AudioSrcStop_t g_AudioStopFn = nullptr;
-static AudioSrcVol_t g_AudioVolFn = nullptr;
-static void ResolveAudioSyms() {
-    static bool tried = false;
-    if (tried) return;
-    tried = true;
-    void* lib = dlopen("libapp.so", RTLD_NOW | RTLD_NOLOAD);
-    if (lib) {
-        g_AudioStopFn = (AudioSrcStop_t)dlsym(lib, "_ZN11AudioSource4stopEv");
-        g_AudioVolFn = (AudioSrcVol_t)dlsym(lib, "_ZN11AudioSource9setVolumeEf");
-        dlclose(lib);
-    }
-    LOGI("[HORN] symbols: stop=%p setVolume=%p", (void*)g_AudioStopFn, (void*)g_AudioVolFn);
-}
+//
+// SES KANALI SIZINTISI (decompile'dan): oyun kornayi birakinca sadece AudioSource::pause() cagirir
+// (FMOD_Channel_SetPaused). Duraklatilmis kanal serbest kalmaz; her basis bir FMOD kanalini tutar,
+// kanallar bitince motor/arac sesleri calinamaz ("korna basinca aracin sesi gelmiyor"). Duraklatmanin
+// hemen ardindan AudioSource::stop() (FMOD_ChannelGroup_Stop) cagirip kanali birakiyoruz.
+//
+// MESAFE: korna tek bir global AudioSource'tur (Game+0xA468, konumsuz); uzaktaki oyuncunun kornasi icin ses
+// seviyesini (AudioSource::setVolume) mesafeye gore ayarlariz: 12 m'ye kadar tam, 150 m'de sifir.
+typedef void (*AudioStop_t)(void* self);
+typedef void (*AudioSetVol_t)(void* self, float vol);
+static AudioStop_t g_AudioStopFn = nullptr;           // AudioSource::stop()
+static AudioSetVol_t g_AudioSetVolFn = nullptr;       // AudioSource::setVolume(float)
+static const uintptr_t kHornSourceOff = 0xA468;       // Game+0xA468 = korna AudioSource
+static const float kHornFullDist = 12.0f, kHornMaxDist = 150.0f;
 
-static void HornSoundCleanup(uintptr_t game) {
-    ResolveAudioSyms();
-    static uint8_t s_prevPlaying = 0;
-    static int s_stopCount = 0;
-    const uint8_t cur = *(uint8_t*)(game + 0xA417);
-    const uintptr_t hDev = *(uintptr_t*)(game + 0xA468);
-    const uint32_t hId = *(uint32_t*)(game + 0xA46C);
-    // AudioSource::stop cihaz dizisini kaynak numarasiyla indeksler: numara gecersizse (ilklenmemis kaynak) cagirma.
-    if (s_prevPlaying != 0 && cur == 0 && g_AudioStopFn && hDev > 0x10000 && hId < 64 && hId < *(uint32_t*)(hDev + 0xC)) {
-        g_AudioStopFn((void*)(game + 0xA468));
-        if (++s_stopCount <= 5 || (s_stopCount % 20) == 0) LOGI("[HORN] kanal serbest birakildi (#%d)", s_stopCount);
-    }
-    s_prevPlaying = cur;
-}
-
-// Uzak kornanin duyulma seviyesi: <=12 m tam ses, >=150 m sessiz, arada karesel azalma.
+// 0 = duyulmaz, 1 = tam ses. Bilgi yoksa 1.
 static float RemoteHornGain(uintptr_t game) {
-    const int owner = g_RemoteHornOwner.load();
-    if (owner < 0 || owner >= MAX_PLAYERS) return 1.0f;
-    int nid = -1;
-    { std::lock_guard<std::mutex> lock(g_ActiveMutex); nid = g_RemoteActive[owner].netId; }
-    if (nid < 0) return 1.0f;
-    const uintptr_t sv = GetVehicleFromIndex(game, (uint16_t)nid);
+    const int origin = g_RemoteHornOrigin.load();
+    if (origin < 0 || origin >= (int)MAX_PLAYERS) return 1.0f;
+    int rid = -1;
+    { std::lock_guard<std::mutex> lock(g_ActiveMutex); rid = g_RemoteActive[origin].netId; }
+    if (rid < 0) return 1.0f;
+    const uintptr_t rv = GetVehicleFromIndex(game, (uint16_t)rid);
     const uintptr_t lv = LocalActiveVehiclePtr(game);
-    if (!sv || !lv || sv == lv) return 1.0f;
-    const uintptr_t sb = *(uintptr_t*)(sv + 0x528), lb = *(uintptr_t*)(lv + 0x528);
-    if (!sb || !lb) return 1.0f;
-    const float dx = *(float*)(sb + 0x0C) - *(float*)(lb + 0x0C);
-    const float dy = *(float*)(sb + 0x10) - *(float*)(lb + 0x10);
+    if (rv == 0 || lv == 0) return 1.0f;
+    const uintptr_t rb = *(uintptr_t*)(rv + 0x528), lb = *(uintptr_t*)(lv + 0x528);
+    if (rb == 0 || lb == 0) return 1.0f;
+    const float dx = *(float*)(rb + 0x0C) - *(float*)(lb + 0x0C);
+    const float dy = *(float*)(rb + 0x10) - *(float*)(lb + 0x10);
     const float d = sqrtf(dx * dx + dy * dy);
-    const float nearD = 12.0f, farD = 150.0f;
-    if (d <= nearD) return 1.0f;
-    if (d >= farD) return 0.0f;
-    const float t = 1.0f - (d - nearD) / (farD - nearD);
-    return t * t;
+    if (d <= kHornFullDist) return 1.0f;
+    if (d >= kHornMaxDist) return 0.0f;
+    const float t = (kHornMaxDist - d) / (kHornMaxDist - kHornFullDist);
+    return t * t;                                      // karesel azalma
 }
 
 static void HornFrame(uintptr_t game, uint64_t nowMs) {
     if (!g_IsConnected.load()) {
         if (g_HornForced) { *(uint8_t*)(game + 0xA416) = 0; g_HornForced = false; }
-        HornSoundCleanup(game);
         return;
     }
     static bool s_sentOn = false;
     static uint64_t s_lastSend = 0;
+    static bool s_prevPlaying = false;
+    static float s_lastGain = -1.0f;
+    void* hornSrc = (void*)(game + kHornSourceOff);
+
+    // Kornanin sesi bu karede bitti mi? (oyun az once pause etti) -> kanali birak.
+    const bool playing = *(uint8_t*)(game + 0xA417) != 0;
+    if (s_prevPlaying && !playing && g_AudioStopFn) g_AudioStopFn(hornSrc);
+    s_prevPlaying = playing;
+
     const bool localPressed = (*(uint8_t*)(game + 0xA416) != 0) && !g_HornForced;   // zorladigimiz degeri sayma
     if (!g_HornForced && (localPressed != s_sentOn || (localPressed && nowMs - s_lastSend > 1500))) {
         QueueEntityState(3, 0, 0, 0, 0, localPressed ? 1 : 0);
         s_sentOn = localPressed; s_lastSend = nowMs;
     }
-    const bool remoteOn = (long long)nowMs < g_RemoteHornUntilMs.load();
-    float gain = 1.0f;
-    if (remoteOn && !localPressed) gain = RemoteHornGain(game);
-    if (remoteOn && !localPressed && gain >= 0.03f) {
+    const bool remoteHorn = (long long)nowMs < g_RemoteHornUntilMs.load();
+    const float gain = remoteHorn ? RemoteHornGain(game) : 1.0f;
+    const bool remoteOn = remoteHorn && gain > 0.01f;                               // cok uzaksa hic calma
+    if (remoteOn && !localPressed) {
         *(uint8_t*)(game + 0xA416) = 1;
         g_HornForced = true;
-        // oyun play() ile sesi sifirlar; calan sesin seviyesini her karede mesafeye gore ayarla
-        if (*(uint8_t*)(game + 0xA417) != 0 && g_AudioVolFn && *(uintptr_t*)(game + 0xA468) != 0)
-            g_AudioVolFn((void*)(game + 0xA468), gain);
+        if (g_AudioSetVolFn && playing && fabsf(gain - s_lastGain) > 0.02f) {       // mesafeye gore ses
+            g_AudioSetVolFn(hornSrc, gain);
+            s_lastGain = gain;
+        }
     } else if (g_HornForced) {
         *(uint8_t*)(game + 0xA416) = 0;
         g_HornForced = false;
+        s_lastGain = -1.0f;                                                         // bir sonraki calista yeniden ayarla
     }
-    HornSoundCleanup(game);
 }
 
 
@@ -3792,6 +3777,7 @@ static bool ProcessPackets(uint8_t* buf, size_t& buffered, int peerId, std::vect
         else if (type == PACKET_ENTITY_STATE) { size = sizeof(EntityStatePacket); relayIt = true; }
         else if (type == PACKET_FIELD_OP) { size = sizeof(FieldOpPacket); relayIt = true; }
         else if (type == PACKET_POOL_OP) { size = sizeof(PoolOpPacket); relayIt = true; }
+        else if (type == PACKET_TIME_SYNC) size = sizeof(MoneyPacket);
         else if (type == PACKET_ACTIVE_VEHICLE) { size = sizeof(ActiveVehiclePacket); relayIt = true; }
         else if (type == PACKET_VEHICLE_NETMAP) {
             if (buffered < 3) break;
@@ -3964,8 +3950,8 @@ static bool ProcessPackets(uint8_t* buf, size_t& buffered, int peerId, std::vect
             memcpy(&ep, buf, sizeof(ep));
             if (fromPeer) { ep.ownerId = (uint8_t)peerId; memcpy(buf, &ep, sizeof(ep)); }
             if (ep.kind == 3 && ep.ownerId != g_LocalPlayerId.load()) {                 // korna
-                g_RemoteHornOwner.store(ep.ownerId);
                 g_RemoteHornUntilMs.store((ep.flags & 1) ? NowMs() + 2500 : 0);
+                g_RemoteHornOrigin.store((int)ep.ownerId);
             } else if (ep.ownerId != g_LocalPlayerId.load() && (ep.kind == 1 || ep.kind == 2 || ep.kind == 4)) {
                 std::lock_guard<std::mutex> lock(g_VehicleEventMutex);
                 // Ayni varlik icin eski bekleyen durum varsa yenisiyle degistir.
@@ -3988,6 +3974,13 @@ static bool ProcessPackets(uint8_t* buf, size_t& buffered, int peerId, std::vect
                 std::lock_guard<std::mutex> lock(g_VehicleEventMutex);
                 if (g_PendingFieldOps.size() >= 256) g_PendingFieldOps.erase(g_PendingFieldOps.begin());
                 g_PendingFieldOps.push_back(fp);
+            }
+        } else if (type == PACKET_TIME_SYNC) {
+            MoneyPacket tp;
+            memcpy(&tp, buf, sizeof(tp));
+            if (!g_IsHost.load() && !fromPeer && tp.value >= 0.0 && tp.value < 1.0e12) {
+                g_TimeSyncValue.store(tp.value);
+                g_TimeSyncPending.store(true);
             }
         } else if (type == PACKET_POOL_OP) {
             PoolOpPacket pp;
@@ -6163,6 +6156,40 @@ static void my_Map_updateFields(void* map, uint32_t f1, uint32_t f2, uint32_t f3
     QueueFieldOp(wt, wf, pts);
 }
 
+// ---- OYUN SAATI SENKRONU ----
+// Magaza/ayarlar acilinca o cihazda dunya (Environment::update) durur, saat da durur; digerlerinde akar.
+// Environment = Game+0xA098: +0x00 double oyun zamani, +0x10 float hiz carpani. Host zamani 3 sn'de bir yollar,
+// client yerel zaman ondan ~1.5 gercek saniyeden fazla sapmissa host'unkine ceker. Oyun gunduz/gece
+// aci/konumunu bu zamandan her karede yeniden hesapliyor, baska bir alana dokunmuyoruz.
+static void TimeSyncFrame(uintptr_t game) {
+    if (!g_IsConnected.load() || game == 0) return;
+    const uint32_t st = *(volatile uint32_t*)(game + 0x64);
+    if (st != 6 && st != 7) return;
+    double* envTime = (double*)(game + 0xA098);
+    const float speed = *(float*)(game + 0xA098 + 0x10);
+    const double local = *envTime;
+    if (!(local == local) || local < 0.0 || local > 1.0e12) return;
+    const long long now = NowMs();
+    if (g_IsHost.load()) {
+        static long long s_last = 0;
+        if (now - s_last >= 3000) {
+            s_last = now;
+            MoneyPacket p; memset(&p, 0, sizeof(p));
+            p.type = PACKET_TIME_SYNC; p.originId = g_LocalPlayerId.load(); p.value = local;
+            QueueVehicleEvent(&p, sizeof(p));
+        }
+        return;
+    }
+    if (!g_TimeSyncPending.exchange(false)) return;
+    const double host = g_TimeSyncValue.load();
+    const double sp = (speed > 0.0f && speed < 1.0e4f) ? (double)speed : 1.0;
+    const double limit = (1.5 * sp > 1.0) ? 1.5 * sp : 1.0;
+    if (fabs(host - local) > limit) {
+        *envTime = host;
+        LOGI("[TIME] saat host'a cekildi: fark=%.1f (yerel=%.1f host=%.1f)", host - local, local, host);
+    }
+}
+
 void my_GameUpdate(void* thiz, float param_1) {
     if (g_HUDInstance != 0) RepairShopClick((void*)g_HUDInstance, "gameUpdate");   // tiklama bu karede islenmeden once
     g_LastGameUpdateMs.store(NowMs());   // host canlilik sinyali icin (oyun dongusu donarsa ping kesilir)
@@ -6210,14 +6237,12 @@ void my_GameUpdate(void* thiz, float param_1) {
         s_prevInGame = inGame;
     }
     if (orig_GameUpdate) orig_GameUpdate(thiz, param_1);
-    // Magaza menusu (durum 7) icinde my_GameUpdateStateBase calismiyor: satin alma/satma tespiti ve korna ses temizligi buradan.
-    if (g_EngineInstance != 0 && *(volatile uint32_t*)(g_EngineInstance + 0x64) == 7) {
-        RefreshVehicleTopology(g_EngineInstance);
-        HornSoundCleanup(g_EngineInstance);
-    }
+    // Magaza menusu (durum 7): my_GameUpdateStateBase calismiyor -> alim/satim tespiti ve saat senkronu buradan.
     if (g_EngineInstance != 0) {
         const uint32_t st2 = *(volatile uint32_t*)(g_EngineInstance + 0x64);
+        if (st2 == 7) RefreshVehicleTopology(g_EngineInstance);
         if (st2 == 6 || st2 == 7) PoolPollFrame(g_EngineInstance);
+        TimeSyncFrame(g_EngineInstance);
     }
 }
 
@@ -6441,7 +6466,7 @@ void* my_renderStartMenuMain(void* thiz, void* p1, void* p2, void* p3) {
 // ========================================================================
 __attribute__((constructor))
 void ModMain() {
-    LOGI(">>> MULTIPLAYER MOD STARTING <<< build=shopfix-7+money-guard+trailer-pos-1+attach-state-2+ai-horn-steer+echo-fix+tools-1+field-ops+pool-sync+horn-fade+menu-poll+ai-intent-2+nomusic");
+    LOGI(">>> MULTIPLAYER MOD STARTING <<< build=shopfix-9+ai-intent-2+horn-fix-1+menu-poll+time-sync");
 
     ResetVehicleSyncState();
     std::thread(StartPONGResponderThread).detach();
@@ -6489,6 +6514,9 @@ void ModMain() {
         LOGI("[TOOL] symbols: attachTool=%p detachTool=%p", (void*)g_VehicleAttachToolFn, (void*)g_VehicleDetachToolFn);
         g_CombineToggleFn = (Entity_toggle_t)dlsym(appLib, "_ZN7Vehicle23toggleCombineIsTurnedOnEv");
         if (!g_CombineToggleFn) g_CombineToggleFn = (Entity_toggle_t)FindElfSymbolByPrefix("libapp.so", "_ZN7Vehicle23toggleCombineIsTurnedOn");
+        g_AudioStopFn = (AudioStop_t)dlsym(appLib, "_ZN11AudioSource4stopEv");
+        g_AudioSetVolFn = (AudioSetVol_t)dlsym(appLib, "_ZN11AudioSource9setVolumeEf");
+        LOGI("[HORN] AudioSource::stop=%p setVolume=%p", (void*)g_AudioStopFn, (void*)g_AudioSetVolFn);
         g_ToolToggleActiveFn = (Entity_toggle_t)dlsym(appLib, "_ZN4Tool12toogleActiveEv");
         if (!g_ToolToggleActiveFn) g_ToolToggleActiveFn = (Entity_toggle_t)FindElfSymbolByPrefix("libapp.so", "_ZN4Tool12toogleActive");
         g_VehiclePrepareAiFn = (Vehicle_prepareAi_t)dlsym(appLib, "_ZN7Vehicle14prepareStartAiEP4Game");
@@ -6540,13 +6568,6 @@ void ModMain() {
             const bool hf = kSyncFieldWork && HookChecked("Map::updateFields", uf, (void*)my_Map_updateFields,
                                                           (void**)&orig_Map_updateFields, true);
             LOGI("[FIELD] Map::updateFields=%p hook=%d", uf, (int)hf);
-            if (kDisableBgMusic) {
-                void* bm = dlsym(appLib, "_ZN21BackgroundMusicPlayer16processTrackLoadEv");
-                if (!bm) bm = FindElfSymbolByPrefix("libapp.so", "_ZN21BackgroundMusicPlayer16processTrackLoad");
-                const bool hm = HookChecked("BackgroundMusicPlayer::processTrackLoad", bm, (void*)my_BgMusic_processTrackLoad,
-                                            (void**)&orig_BgMusic_processTrackLoad, true);
-                LOGI("[MUSIC] processTrackLoad=%p hook=%d (muzik kapali)", bm, (int)hm);
-            }
         }
         if (saveTask) {
             g_SaveStartTaskFn = saveTask;
