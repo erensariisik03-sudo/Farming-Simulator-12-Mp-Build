@@ -1451,6 +1451,13 @@ static bool ThumbPrologueHasPcRelative(const void* fn, char* why, size_t whySize
 }
 
 // skipIfRisky=true ise riskli fonksiyona kanca TAKILMAZ (oyun cokmesin diye) ve false doner.
+// Oyunun arka plan muzik yukleyicisi (BackgroundMusicPlayer::processTrackLoad) bazi cihazlarda parcayi kucuk bir
+// tampona tasirarak SIGSEGV ile coker (memcpy, StreamingZipInflater). Bu kanca yuklemeyi atlar = "parca yuklenemedi"
+// yolu (oyun bunu zaten sessizce geciyor). Muzik acilmaz ama oyun cokmez. Gerek yoksa false yap.
+static const bool kDisableBgMusic = true;
+static void my_BgMusic_processTrackLoad(void* /*thiz*/) {}
+static void* orig_BgMusic_processTrackLoad = nullptr;
+
 static bool HookChecked(const char* name, void* fn, void* replacement, void** original, bool skipIfRisky) {
     if (!fn) return false;
     char why[64] = {0};
@@ -2365,7 +2372,10 @@ static void HornSoundCleanup(uintptr_t game) {
     static uint8_t s_prevPlaying = 0;
     static int s_stopCount = 0;
     const uint8_t cur = *(uint8_t*)(game + 0xA417);
-    if (s_prevPlaying != 0 && cur == 0 && g_AudioStopFn && *(uintptr_t*)(game + 0xA468) != 0) {
+    const uintptr_t hDev = *(uintptr_t*)(game + 0xA468);
+    const uint32_t hId = *(uint32_t*)(game + 0xA46C);
+    // AudioSource::stop cihaz dizisini kaynak numarasiyla indeksler: numara gecersizse (ilklenmemis kaynak) cagirma.
+    if (s_prevPlaying != 0 && cur == 0 && g_AudioStopFn && hDev > 0x10000 && hId < 64 && hId < *(uint32_t*)(hDev + 0xC)) {
         g_AudioStopFn((void*)(game + 0xA468));
         if (++s_stopCount <= 5 || (s_stopCount % 20) == 0) LOGI("[HORN] kanal serbest birakildi (#%d)", s_stopCount);
     }
@@ -6431,7 +6441,7 @@ void* my_renderStartMenuMain(void* thiz, void* p1, void* p2, void* p3) {
 // ========================================================================
 __attribute__((constructor))
 void ModMain() {
-    LOGI(">>> MULTIPLAYER MOD STARTING <<< build=shopfix-7+money-guard+trailer-pos-1+attach-state-2+ai-horn-steer+echo-fix+tools-1+field-ops+pool-sync+horn-fade+menu-poll+ai-intent-2");
+    LOGI(">>> MULTIPLAYER MOD STARTING <<< build=shopfix-7+money-guard+trailer-pos-1+attach-state-2+ai-horn-steer+echo-fix+tools-1+field-ops+pool-sync+horn-fade+menu-poll+ai-intent-2+nomusic");
 
     ResetVehicleSyncState();
     std::thread(StartPONGResponderThread).detach();
@@ -6530,6 +6540,13 @@ void ModMain() {
             const bool hf = kSyncFieldWork && HookChecked("Map::updateFields", uf, (void*)my_Map_updateFields,
                                                           (void**)&orig_Map_updateFields, true);
             LOGI("[FIELD] Map::updateFields=%p hook=%d", uf, (int)hf);
+            if (kDisableBgMusic) {
+                void* bm = dlsym(appLib, "_ZN21BackgroundMusicPlayer16processTrackLoadEv");
+                if (!bm) bm = FindElfSymbolByPrefix("libapp.so", "_ZN21BackgroundMusicPlayer16processTrackLoad");
+                const bool hm = HookChecked("BackgroundMusicPlayer::processTrackLoad", bm, (void*)my_BgMusic_processTrackLoad,
+                                            (void**)&orig_BgMusic_processTrackLoad, true);
+                LOGI("[MUSIC] processTrackLoad=%p hook=%d (muzik kapali)", bm, (int)hm);
+            }
         }
         if (saveTask) {
             g_SaveStartTaskFn = saveTask;
