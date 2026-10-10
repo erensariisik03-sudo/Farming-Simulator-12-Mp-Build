@@ -1911,6 +1911,7 @@ static Entity_toggle_t g_VehicleAiStopFn = nullptr;                    // Vehicl
 static bool g_AiMirrored[VEHICLE_SLOT_LIMIT];                          // isci bu cihazda UZAKTAN baslatildi (konum yayinlama)
 static std::atomic<long long> g_RemoteHornUntilMs(0);                  // uzaktan korna: bu ana kadar acik
 static bool g_HornForced = false;
+static std::atomic<int> g_RemoteHornOwner(-1);                         // kornaya basan uzak oyuncu (mesafe icin)
 
 struct TrailerTrack { uintptr_t tp; uintptr_t av; uint32_t levelWord; uint32_t typeWord; uint64_t lastMs; };
 static TrailerTrack g_TrTrack[64];
@@ -2277,9 +2278,63 @@ static void CaptureAndQueueCombineStates(uintptr_t game, uint8_t localOwner, uin
 
 // ---- Korna: Game+0xa416 = korna tusu basili (her karenin sonunda yerel girdiden dolar), Game+0xa417 = calan ses.
 // Yerel korna degisince "kind 3" paketi gider; uzaktan korna varsa bayrak her kare 1'e zorlanir ve oyun kendi sesini calar.
+// Oyun kornayi birakinca sesi sadece DURAKLATIYOR (kanal serbest kalmiyor, FMOD'da 32 kanal var) -> her basista bir kanal
+// sizar ve ~30 basistan sonra motor sesleri susuyor. Bu yuzden duraklatma sonrasi AudioSource::stop cagrilir (kanal serbest).
+typedef void (*AudioSrcStop_t)(void*);
+typedef void (*AudioSrcVol_t)(void*, float);
+static AudioSrcStop_t g_AudioStopFn = nullptr;
+static AudioSrcVol_t g_AudioVolFn = nullptr;
+static void ResolveAudioSyms() {
+    static bool tried = false;
+    if (tried) return;
+    tried = true;
+    void* lib = dlopen("libapp.so", RTLD_NOW | RTLD_NOLOAD);
+    if (lib) {
+        g_AudioStopFn = (AudioSrcStop_t)dlsym(lib, "_ZN11AudioSource4stopEv");
+        g_AudioVolFn = (AudioSrcVol_t)dlsym(lib, "_ZN11AudioSource9setVolumeEf");
+        dlclose(lib);
+    }
+    LOGI("[HORN] symbols: stop=%p setVolume=%p", (void*)g_AudioStopFn, (void*)g_AudioVolFn);
+}
+
+static void HornSoundCleanup(uintptr_t game) {
+    ResolveAudioSyms();
+    static uint8_t s_prevPlaying = 0;
+    static int s_stopCount = 0;
+    const uint8_t cur = *(uint8_t*)(game + 0xA417);
+    if (s_prevPlaying != 0 && cur == 0 && g_AudioStopFn && *(uintptr_t*)(game + 0xA468) != 0) {
+        g_AudioStopFn((void*)(game + 0xA468));
+        if (++s_stopCount <= 5 || (s_stopCount % 20) == 0) LOGI("[HORN] kanal serbest birakildi (#%d)", s_stopCount);
+    }
+    s_prevPlaying = cur;
+}
+
+// Uzak kornanin duyulma seviyesi: <=12 m tam ses, >=150 m sessiz, arada karesel azalma.
+static float RemoteHornGain(uintptr_t game) {
+    const int owner = g_RemoteHornOwner.load();
+    if (owner < 0 || owner >= MAX_PLAYERS) return 1.0f;
+    int nid = -1;
+    { std::lock_guard<std::mutex> lock(g_ActiveMutex); nid = g_RemoteActive[owner].netId; }
+    if (nid < 0) return 1.0f;
+    const uintptr_t sv = GetVehicleFromIndex(game, (uint16_t)nid);
+    const uintptr_t lv = LocalActiveVehiclePtr(game);
+    if (!sv || !lv || sv == lv) return 1.0f;
+    const uintptr_t sb = *(uintptr_t*)(sv + 0x528), lb = *(uintptr_t*)(lv + 0x528);
+    if (!sb || !lb) return 1.0f;
+    const float dx = *(float*)(sb + 0x0C) - *(float*)(lb + 0x0C);
+    const float dy = *(float*)(sb + 0x10) - *(float*)(lb + 0x10);
+    const float d = sqrtf(dx * dx + dy * dy);
+    const float nearD = 12.0f, farD = 150.0f;
+    if (d <= nearD) return 1.0f;
+    if (d >= farD) return 0.0f;
+    const float t = 1.0f - (d - nearD) / (farD - nearD);
+    return t * t;
+}
+
 static void HornFrame(uintptr_t game, uint64_t nowMs) {
     if (!g_IsConnected.load()) {
         if (g_HornForced) { *(uint8_t*)(game + 0xA416) = 0; g_HornForced = false; }
+        HornSoundCleanup(game);
         return;
     }
     static bool s_sentOn = false;
@@ -2290,13 +2345,19 @@ static void HornFrame(uintptr_t game, uint64_t nowMs) {
         s_sentOn = localPressed; s_lastSend = nowMs;
     }
     const bool remoteOn = (long long)nowMs < g_RemoteHornUntilMs.load();
-    if (remoteOn && !localPressed) {
+    float gain = 1.0f;
+    if (remoteOn && !localPressed) gain = RemoteHornGain(game);
+    if (remoteOn && !localPressed && gain >= 0.03f) {
         *(uint8_t*)(game + 0xA416) = 1;
         g_HornForced = true;
+        // oyun play() ile sesi sifirlar; calan sesin seviyesini her karede mesafeye gore ayarla
+        if (*(uint8_t*)(game + 0xA417) != 0 && g_AudioVolFn && *(uintptr_t*)(game + 0xA468) != 0)
+            g_AudioVolFn((void*)(game + 0xA468), gain);
     } else if (g_HornForced) {
         *(uint8_t*)(game + 0xA416) = 0;
         g_HornForced = false;
     }
+    HornSoundCleanup(game);
 }
 
 
@@ -3827,6 +3888,7 @@ static bool ProcessPackets(uint8_t* buf, size_t& buffered, int peerId, std::vect
             memcpy(&ep, buf, sizeof(ep));
             if (fromPeer) { ep.ownerId = (uint8_t)peerId; memcpy(buf, &ep, sizeof(ep)); }
             if (ep.kind == 3 && ep.ownerId != g_LocalPlayerId.load()) {                 // korna
+                g_RemoteHornOwner.store(ep.ownerId);
                 g_RemoteHornUntilMs.store((ep.flags & 1) ? NowMs() + 2500 : 0);
             } else if (ep.ownerId != g_LocalPlayerId.load() && (ep.kind == 1 || ep.kind == 2 || ep.kind == 4)) {
                 std::lock_guard<std::mutex> lock(g_VehicleEventMutex);
@@ -6069,6 +6131,15 @@ void my_GameUpdate(void* thiz, float param_1) {
         s_prevInGame = inGame;
     }
     if (orig_GameUpdate) orig_GameUpdate(thiz, param_1);
+    // Magaza menusu (durum 7) icinde my_GameUpdateStateBase calismiyor: satin alma/satma tespiti ve korna ses temizligi buradan.
+    if (g_EngineInstance != 0 && *(volatile uint32_t*)(g_EngineInstance + 0x64) == 7) {
+        RefreshVehicleTopology(g_EngineInstance);
+        HornSoundCleanup(g_EngineInstance);
+    }
+    if (g_EngineInstance != 0) {
+        const uint32_t st2 = *(volatile uint32_t*)(g_EngineInstance + 0x64);
+        if (st2 == 6 || st2 == 7) PoolPollFrame(g_EngineInstance);
+    }
 }
 
 void my_GameUpdateStateBase(void* thiz, float param_1, uint32_t param_2, uint32_t param_3, uint32_t param_4) {
@@ -6091,10 +6162,6 @@ void my_GameUpdateStateBase(void* thiz, float param_1, uint32_t param_2, uint32_
         // Oyun ici menu (magaza): konum esitleme yok, ama arac tablosu acik kalir ve
         // magazadan alinan/satilan araclar hemen diger cihazlara bildirilir.
         RefreshVehicleTopology(g_EngineInstance);
-    }
-    {   // romork/alet satin alma-satma tespiti (durum 6 ve 7)
-        const uint32_t st = *(volatile uint32_t*)(g_EngineInstance + 0x64);
-        if (st == 6 || st == 7) PoolPollFrame(g_EngineInstance);
     }
 
     // Oyun ici ImGui cizimi: ekran renderQueues'ta (presentGLESFramebuffer) ekrana verilir,
@@ -6283,7 +6350,7 @@ void* my_renderStartMenuMain(void* thiz, void* p1, void* p2, void* p3) {
 // ========================================================================
 __attribute__((constructor))
 void ModMain() {
-    LOGI(">>> MULTIPLAYER MOD STARTING <<< build=shopfix-7+money-guard+trailer-pos-1+attach-state-2+ai-horn-steer+echo-fix+tools-1+field-ops+pool-sync");
+    LOGI(">>> MULTIPLAYER MOD STARTING <<< build=shopfix-7+money-guard+trailer-pos-1+attach-state-2+ai-horn-steer+echo-fix+tools-1+field-ops+pool-sync+horn-fade+menu-poll");
 
     ResetVehicleSyncState();
     std::thread(StartPONGResponderThread).detach();
