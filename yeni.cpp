@@ -1917,7 +1917,7 @@ struct TrailerTrack { uintptr_t tp; uintptr_t av; uint32_t levelWord; uint32_t t
 static TrailerTrack g_TrTrack[64];
 // valid/flags = bu cihazin bildigi YEREL gercek (en son gonderilen ya da uygulandiktan sonra olculen);
 // rvalid/rflags = karsidan en son bildirilen bayraklar (kenar tespiti icin). Ikisi karismaz -> yanki olmaz.
-struct CombineTrack { bool valid; uint32_t wa, wb; uint8_t flags; uint64_t lastMs; bool rvalid; uint8_t rflags; };
+struct CombineTrack { bool valid; uint32_t wa, wb; uint8_t flags; uint64_t lastMs; bool rvalid; uint8_t rflags; uint8_t chgBits; uint64_t chgMs; };
 static const uint8_t kStateFlagMask = 0x0B;   // 1 = bicer/kesici, 2 = alet aktif, 8 = isci
 static TrailerTrack g_ToolTrack[64];
 static CombineTrack g_CbTrack[VEHICLE_SLOT_LIMIT];
@@ -2268,6 +2268,13 @@ static void CaptureAndQueueCombineStates(uintptr_t game, uint8_t localOwner, uin
         const bool keepAlive = c.valid && (nowMs - c.lastMs) >= 3000;
         if ((changed && (!c.valid || nowMs - c.lastMs >= 250 || c.flags != flags)) || keepAlive) {
             QueueEntityState(2, id, 0, wa, wb, flags);
+            if (c.valid && c.flags != flags) {
+                // Yerel degisen bitler: karsi cihaz bunlari uygulayacak. Bizim "karsidan son bilinen" gorunumumuz de buna uymali;
+                // yoksa karsi cihaz sonra ters yone cevirdiginde (ornegin isciyi durdurdugunda) kenar fark edilmez.
+                const uint8_t chg = (uint8_t)((c.flags ^ flags) & kStateFlagMask);
+                if (c.rvalid) c.rflags = (uint8_t)((c.rflags & ~chg) | (flags & chg));
+                c.chgBits = chg; c.chgMs = nowMs;
+            }
             if (c.valid && c.flags != flags)
                 LOGI("[VEHSTATE] gonderildi netId=%u bicer/kesici=%d alet=%d isci=%d", (unsigned)id,
                      (int)(flags & 1), (int)((flags >> 1) & 1), (int)((flags >> 3) & 1));
@@ -2647,7 +2654,9 @@ static void ApplyPendingTrailerEvents(uintptr_t game, uint8_t localOwner, uint64
             // Boylece ayni arac iki cihazda secili olsa bile calisir, eski paket yerel degisikligi geri almaz.
             const uint8_t rflagsNew = (uint8_t)(st.flags & kStateFlagMask);
             const uint8_t base = c.rvalid ? c.rflags : LocalVehicleFlags(v);
-            const uint8_t diff = (uint8_t)(base ^ rflagsNew);
+            // Az once (1 sn) yerelde degistirdigimiz bitlerde, karsidan gelen ESKI (yola cikmis) paketler yok sayilir.
+            const uint8_t guard = (nowMs - c.chgMs < 1000) ? c.chgBits : 0;
+            const uint8_t diff = (uint8_t)((base ^ rflagsNew) & ~guard);
             if (combine && owner != localOwner) {
                 const float fa = WordToFloat(st.wa), fb = WordToFloat(st.wb);
                 if (fa == fa && fb == fb && fa < 1.0e7f && fb < 1.0e7f) {
@@ -2700,7 +2709,7 @@ static void ApplyPendingTrailerEvents(uintptr_t game, uint8_t localOwner, uint64
                 }
             }
             // Yanki olmasin: yerel gercegi (uygulamadan SONRA olculen) kaydet; karsidan gelen bayraklar ayri tutulur.
-            c.rvalid = true; c.rflags = rflagsNew;
+            c.rvalid = true; c.rflags = (uint8_t)((rflagsNew & ~guard) | (LocalVehicleFlags(v) & guard));
             c.valid = true; c.flags = LocalVehicleFlags(v);
             const bool combineNow = *(uint8_t*)(v + 0x328) != 0;
             c.wa = combineNow ? *(uint32_t*)(v + 0x440) : 0;
@@ -6350,7 +6359,7 @@ void* my_renderStartMenuMain(void* thiz, void* p1, void* p2, void* p3) {
 // ========================================================================
 __attribute__((constructor))
 void ModMain() {
-    LOGI(">>> MULTIPLAYER MOD STARTING <<< build=shopfix-7+money-guard+trailer-pos-1+attach-state-2+ai-horn-steer+echo-fix+tools-1+field-ops+pool-sync+horn-fade+menu-poll");
+    LOGI(">>> MULTIPLAYER MOD STARTING <<< build=shopfix-7+money-guard+trailer-pos-1+attach-state-2+ai-horn-steer+echo-fix+tools-1+field-ops+pool-sync+horn-fade+menu-poll+ai-edge-fix");
 
     ResetVehicleSyncState();
     std::thread(StartPONGResponderThread).detach();
