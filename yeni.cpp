@@ -593,13 +593,11 @@ static const uint8_t PACKET_VEHICLE_REMOVE = 18;  // arac satildi/silindi (netId
 static const uint8_t PACKET_VEHICLE_NETMAP = 19;  // host -> client: oyundaki arac sirasi -> netId esleme tablosu
 static const uint8_t PACKET_MONEY_DELTA = 20;     // para degisimi (+/-): client->host, host->herkes
 static const uint8_t PACKET_ACTIVE_VEHICLE = 22;  // "su an bu aracin icindeyim" (oyuncu basina, host iletir)
-static const uint8_t PACKET_MONEY_SET = 21;       // host -> client: mutlak para (oyuncu odaya katilinca)
+static const uint8_t PACKET_MONEY_SET = 21;
+static const uint8_t PACKET_TIME_SYNC = 27;      // host -> client: oyun saati (Environment: Game+0xA098)       // host -> client: mutlak para (oyuncu odaya katilinca)
 static const uint8_t PACKET_UDP_ACK = 16;      // host -> client (UDP): UDP yolu acildi
 static const uint8_t PACKET_TRAILER_ATTACH = 23;  // romork takildi/cikarildi (olay, guvenilir)
 static const uint8_t PACKET_FIELD_OP = 25;       // tarla islemi (hasat/pulluk/mibzer...): diger cihazlarda ayni tarla degissin
-static const uint8_t PACKET_TIME_SYNC = 27;      // host -> client: oyun saati (menude duran saat kaymasin)
-static std::atomic<double> g_TimeSyncValue(0.0);
-static std::atomic<bool> g_TimeSyncPending(false);
 static const uint8_t PACKET_POOL_OP = 26;        // romork/alet satin alma (ekle) / satma (sil)
 static const uint8_t PACKET_ENTITY_STATE = 24;    // romork doluluk / bicer tank, calisma, kesici durumu
 
@@ -754,6 +752,12 @@ struct MoneyPacket {
     uint8_t type;
     uint8_t originId;
     double value;
+};
+struct TimeSyncPacket {
+    uint8_t type;
+    uint8_t originId;
+    double time;        // Environment+0  (oyun zamani)
+    double realTime;    // Environment+8  (HUD saati)
 };
 struct ActiveVehiclePacket {
     uint8_t type;
@@ -1922,6 +1926,11 @@ static TrailerTrack g_TrTrack[64];
 // rvalid/rflags = karsidan en son bildirilen bayraklar (kenar tespiti icin). Ikisi karismaz -> yanki olmaz.
 struct CombineTrack { bool valid; uint32_t wa, wb; uint8_t flags; uint64_t lastMs; bool rvalid; uint8_t rflags; };
 static const uint8_t kStateFlagMask = 0x0B;   // 1 = bicer/kesici, 2 = alet aktif, 8 = isci
+// Aynali isci (baska cihazda calisan iscinin bu cihazda da baslatilmasi) KAPALI: aynali simulasyon 1-2 sn'de
+// kendiliginden dusuyor, yeniden baslatma dongusu oyunu kasiyor ve gercek iscinin bayragini bozuyordu.
+// Isci sadece dugmeye basilan cihazda calisir; konumu/alet durumu/tarla degisiklikleri zaten ayri senkronize.
+// Diger cihazda kullanici dugmeye basarsa "durdur" komutu iscinin cihazina gider (asagidaki niyet mantigi).
+static const bool kMirrorAiOnRemote = false;
 static const uint8_t kEdgeBit = 0x10;         // paketlerde: "kullanici bunu YENI yapti" (periyodik durum paketinden ayirir)
 static uint64_t g_AiIntentMs = 0;             // bu cihazda kullanici isci (AI) dugmesine bastigi an
 static int g_AiIntentVeh = -1;                // ... o anda aktif olan aracin netId'si
@@ -2255,8 +2264,9 @@ static void ToggleCombineInline(uintptr_t v) {
 
 // Durum bayraklarinin "periyodik" yayincisi kim? Ayni aracin icinde birden fazla oyuncu varken
 // sadece biri periyodik/tank bilgisini gonderir; KULLANICI DEGISIKLIKLERI (kenar) herkesten gider.
-static bool IsStatePublisherVeh(uint16_t id, uint8_t localOwner, uint16_t activeVehicleId, bool ai, uint8_t owner) {
-    if (ai && !g_AiMirrored[id]) return true;                       // isciyi bu cihaz calistiriyor: gercek kaynak
+static bool IsStatePublisherVeh(uint16_t id, uint8_t localOwner, uint16_t activeVehicleId, bool ai, uint8_t owner, bool remoteAi) {
+    if (ai && !g_AiMirrored[id]) return true;
+    if (remoteAi) return false;                                    // isciyi baska cihaz calistiriyor: onun durumu gecerli                       // isciyi bu cihaz calistiriyor: gercek kaynak
     if (owner != VEHICLE_OWNER_NONE) return owner == localOwner;
     if (id == activeVehicleId) return !HasLowerIdRemoteActive((int)id, localOwner);
     return false;
@@ -2292,10 +2302,14 @@ static void CaptureAndQueueCombineStates(uintptr_t game, uint8_t localOwner, uin
                     g_AiMirrored[id] = false;
                 } else if (!remoteAi) {
                     g_AiMirrored[id] = false;                         // karsi taraf da durdurmus
+                } else if (!intent && g_AiRestartTries[id] < 3 && (nowMs - g_AiRestartMs[id]) >= 1500 &&
+                           g_VehiclePrepareAiFn && g_VehicleAiStartFn) {
+                    g_AiRestartMs[id] = nowMs; g_AiRestartTries[id]++;     // simulasyon kendi kendine durdu: canli tut
+                    const uint32_t ok = g_VehiclePrepareAiFn((void*)v, (void*)game) & 0xFF;
+                    if (ok) { g_VehicleAiStartFn((void*)v, (void*)game); ai = *(uint32_t*)(v + 0x730) != 0; g_AiPrevOn[id] = ai; }
+                    LOGI("[VEHSTATE] aynali isci yeniden baslatildi netId=%u sonuc=%u deneme=%u",
+                         (unsigned)id, (unsigned)ok, (unsigned)g_AiRestartTries[id]);
                 }
-                // Aynali isci kendi kendine durduysa YENIDEN BASLATILMAZ (eskiden 1.5 sn'de bir aiStart/prepareStartAi
-                // cagrilip gecikme yapiyor ve kullanicinin durdurmasini geri aliyordu). Arac zaten gercek iscinin konumunu
-                // izliyor, tarla islemi karsi cihazdan aynalaniyor. Kullanici dugmeye basarsa durum yayinlanir.
             }
             if (g_AiMirrored[id] && !intent) continue;                // aynali isci simulasyonunun kararlari yayinlanmaz
         }
@@ -2318,7 +2332,7 @@ static void CaptureAndQueueCombineStates(uintptr_t game, uint8_t localOwner, uin
         const uint8_t flags = LocalVehicleFlags(v);
         const uint32_t wa = combine ? *(uint32_t*)(v + 0x440) : 0;
         const uint32_t wb = combine ? *(uint32_t*)(v + 0x448) : 0;
-        const bool publisher = IsStatePublisherVeh(id, localOwner, activeVehicleId, ai, owner);
+        const bool publisher = IsStatePublisherVeh(id, localOwner, activeVehicleId, ai, owner, remoteAi);
         const bool localEdge = c.valid && flags != c.flags;
 
         if (localEdge) {                                              // kullanici (ya da isci) bir sey degistirdi
@@ -2459,6 +2473,74 @@ static bool PtrIn(const std::vector<uintptr_t>& v, uintptr_t p) {
 }
 
 // Her kare (oyun thread'i, durum 6 ve 7): yerel satin alma / satma tespiti.
+// ========================================================================
+// ZAMAN SENKRONU: Environment nesnesi Game+0xA098'de (+0 time, +8 realTime, ikisi double).
+// Environment::update sadece Game::updateStateBase icinden cagrilir; yani oyun durumu 6 disinda
+// (magaza, ayarlar) o cihazin saati DURUR, digerlerinin akar. Host'un saati referanstir:
+// host her saniye saatini gonderir, client fark 1 sn'yi gecerse kendi saatini ona ceker.
+// Boylece mağaza/ayarlardan donen cihaz geri kalanlarla ayni saate gelir.
+// ========================================================================
+static std::mutex g_TimeMutex;
+static bool g_TimePending = false;
+static double g_TimeHost = 0.0, g_TimeHostReal = 0.0;
+static uint64_t g_TimeLastSendMs = 0;
+static const uintptr_t kEnvOff = 0xA098;
+static const double kTimeSyncThreshold = 1.0;      // saniye
+
+static double ReadEnvD(uintptr_t game, uintptr_t off) { double d; memcpy(&d, (const void*)(game + kEnvOff + off), 8); return d; }
+static void WriteEnvD(uintptr_t game, uintptr_t off, double d) { memcpy((void*)(game + kEnvOff + off), &d, 8); }
+
+static void TimeSyncFrame(uintptr_t game, uint32_t st) {
+    if (game == 0) return;
+    static uint64_t s_lastAdv = 0;
+    if (!g_IsConnected.load() || (st != 6 && st != 7)) { s_lastAdv = 0; return; }
+    const uint64_t now = (uint64_t)NowMs();
+
+    // Magaza/ayarlar (durum 7) acikken oyun saati durur; bagliyken saat akmaya devam etsin ki hicbir cihaz
+    // digerlerinden geri kalmasin. Environment::update'in aynisi (decompile): realTime += dt;
+    // time += dt * olcek (gece 20:00-06:00 arasi dt x4); olcek = Environment+0x10 (float).
+    if (st == 7) {
+        if (s_lastAdv != 0) {
+            double dt = (double)(now - s_lastAdv) / 1000.0;
+            if (dt > 0.1) dt = 0.1;
+            if (dt > 0.0) {
+                const double day = ReadEnvD(game, 0x18);
+                float step = (float)dt;
+                if (day > 72000.0 || day < 21600.0) step *= 4.0f;
+                float scale = 0.0f;
+                memcpy(&scale, (const void*)(game + kEnvOff + 0x10), sizeof(scale));
+                if (scale > 0.0f && scale < 100000.0f) WriteEnvD(game, 0, ReadEnvD(game, 0) + (double)(step * scale));
+                WriteEnvD(game, 8, ReadEnvD(game, 8) + dt);
+            }
+        }
+        s_lastAdv = now;
+    } else {
+        s_lastAdv = 0;
+    }
+    if (g_IsHost.load()) {
+        if (now - g_TimeLastSendMs >= 1000) {
+            g_TimeLastSendMs = now;
+            TimeSyncPacket tp; memset(&tp, 0, sizeof(tp));
+            tp.type = PACKET_TIME_SYNC; tp.originId = g_LocalPlayerId.load();
+            tp.time = ReadEnvD(game, 0); tp.realTime = ReadEnvD(game, 8);
+            QueueVehicleEvent(&tp, sizeof(tp));
+        }
+        return;
+    }
+    bool have = false; double ht = 0.0, hr = 0.0;
+    {
+        std::lock_guard<std::mutex> lock(g_TimeMutex);
+        if (g_TimePending) { have = true; ht = g_TimeHost; hr = g_TimeHostReal; g_TimePending = false; }
+    }
+    if (!have) return;
+    const double lr = ReadEnvD(game, 8);
+    if (fabs(lr - hr) > kTimeSyncThreshold) {
+        WriteEnvD(game, 0, ht);
+        WriteEnvD(game, 8, hr);
+        LOGI("[TIME] saat host'a cekildi: fark=%.1f sn", hr - lr);
+    }
+}
+
 static void PoolPollFrame(uintptr_t game) {
     if (game == 0) return;
     if (!g_VehNetArmed.load() || !g_IsConnected.load()) { g_PoolSnapValid = false; return; }
@@ -2717,7 +2799,7 @@ static void ApplyPendingTrailerEvents(uintptr_t game, uint8_t localOwner, uint64
                 const bool wantAi = (st.flags & 8) != 0;
                 const bool haveAi = *(uint32_t*)(v + 0x730) != 0;
                 if (wantAi && !haveAi) {
-                    if (g_VehiclePrepareAiFn && g_VehicleAiStartFn) {
+                    if (kMirrorAiOnRemote && g_VehiclePrepareAiFn && g_VehicleAiStartFn) {
                         const uint32_t ok = g_VehiclePrepareAiFn((void*)v, (void*)game) & 0xFF;
                         if (ok) {
                             g_VehicleAiStartFn((void*)v, (void*)game);
@@ -2734,6 +2816,17 @@ static void ApplyPendingTrailerEvents(uintptr_t game, uint8_t localOwner, uint64
                             }
                         }
                         LOGI("[VEHSTATE] uzaktan isci baslatma netId=%u sonuc=%u", (unsigned)st.id, (unsigned)ok);
+                    } else if (!kMirrorAiOnRemote) {
+                        // Aynalama yok: sadece araci bu cihaz suruyorsa yetkiyi birak ki iscinin cihazi konumu yayinlasin.
+                        if (owner == localOwner) {
+                            if (g_IsHost.load()) ReleaseVehicleAuthority(st.id, localOwner, true);
+                            else {
+                                QueueVehicleRelease(st.id);
+                                std::lock_guard<std::mutex> lock(g_VehicleStateMutex);
+                                g_ClaimPending[st.id] = true;
+                            }
+                        }
+                        LOGI("[VEHSTATE] uzaktan isci acildi (aynalanmiyor) netId=%u", (unsigned)st.id);
                     }
                 } else if (!wantAi && haveAi && g_VehicleAiStopFn &&
                            ((st.flags & kEdgeBit) || g_AiMirrored[st.id])) {   // kullanici durdurdu (kenar) ya da aynali isci iscinin sahibinden durdu
@@ -3773,11 +3866,11 @@ static bool ProcessPackets(uint8_t* buf, size_t& buffered, int peerId, std::vect
         else if (type == PACKET_VEHICLE_REMOVE) { size = sizeof(VehicleRemovePacket); relayIt = true; }
         else if (type == PACKET_MONEY_DELTA) { size = sizeof(MoneyPacket); relayIt = true; }
         else if (type == PACKET_MONEY_SET) size = sizeof(MoneyPacket);
+        else if (type == PACKET_TIME_SYNC) size = sizeof(TimeSyncPacket);
         else if (type == PACKET_TRAILER_ATTACH) { size = sizeof(TrailerAttachPacket); relayIt = true; }
         else if (type == PACKET_ENTITY_STATE) { size = sizeof(EntityStatePacket); relayIt = true; }
         else if (type == PACKET_FIELD_OP) { size = sizeof(FieldOpPacket); relayIt = true; }
         else if (type == PACKET_POOL_OP) { size = sizeof(PoolOpPacket); relayIt = true; }
-        else if (type == PACKET_TIME_SYNC) size = sizeof(MoneyPacket);
         else if (type == PACKET_ACTIVE_VEHICLE) { size = sizeof(ActiveVehiclePacket); relayIt = true; }
         else if (type == PACKET_VEHICLE_NETMAP) {
             if (buffered < 3) break;
@@ -3903,6 +3996,13 @@ static bool ProcessPackets(uint8_t* buf, size_t& buffered, int peerId, std::vect
             ActiveVehiclePacket ap;
             memcpy(&ap, buf, sizeof(ap));
             if (ap.originId != g_LocalPlayerId.load()) StoreRemoteActive(ap.originId, ap.netId);
+        } else if (type == PACKET_TIME_SYNC) {
+            TimeSyncPacket tp;
+            memcpy(&tp, buf, sizeof(tp));
+            if (!g_IsHost.load() && !fromPeer && tp.time == tp.time && tp.realTime == tp.realTime) {
+                std::lock_guard<std::mutex> lock(g_TimeMutex);
+                g_TimePending = true; g_TimeHost = tp.time; g_TimeHostReal = tp.realTime;
+            }
         } else if (type == PACKET_MONEY_DELTA) {
             MoneyPacket mp;
             memcpy(&mp, buf, sizeof(mp));
@@ -3974,13 +4074,6 @@ static bool ProcessPackets(uint8_t* buf, size_t& buffered, int peerId, std::vect
                 std::lock_guard<std::mutex> lock(g_VehicleEventMutex);
                 if (g_PendingFieldOps.size() >= 256) g_PendingFieldOps.erase(g_PendingFieldOps.begin());
                 g_PendingFieldOps.push_back(fp);
-            }
-        } else if (type == PACKET_TIME_SYNC) {
-            MoneyPacket tp;
-            memcpy(&tp, buf, sizeof(tp));
-            if (!g_IsHost.load() && !fromPeer && tp.value >= 0.0 && tp.value < 1.0e12) {
-                g_TimeSyncValue.store(tp.value);
-                g_TimeSyncPending.store(true);
             }
         } else if (type == PACKET_POOL_OP) {
             PoolOpPacket pp;
@@ -6156,46 +6249,21 @@ static void my_Map_updateFields(void* map, uint32_t f1, uint32_t f2, uint32_t f3
     QueueFieldOp(wt, wf, pts);
 }
 
-// ---- OYUN SAATI SENKRONU ----
-// Magaza/ayarlar acilinca o cihazda dunya (Environment::update) durur, saat da durur; digerlerinde akar.
-// Environment = Game+0xA098: +0x00 double oyun zamani, +0x10 float hiz carpani. Host zamani 3 sn'de bir yollar,
-// client yerel zaman ondan ~1.5 gercek saniyeden fazla sapmissa host'unkine ceker. Oyun gunduz/gece
-// aci/konumunu bu zamandan her karede yeniden hesapliyor, baska bir alana dokunmuyoruz.
-static void TimeSyncFrame(uintptr_t game) {
-    if (!g_IsConnected.load() || game == 0) return;
-    const uint32_t st = *(volatile uint32_t*)(game + 0x64);
-    if (st != 6 && st != 7) return;
-    double* envTime = (double*)(game + 0xA098);
-    const float speed = *(float*)(game + 0xA098 + 0x10);
-    const double local = *envTime;
-    if (!(local == local) || local < 0.0 || local > 1.0e12) return;
-    const long long now = NowMs();
-    if (g_IsHost.load()) {
-        static long long s_last = 0;
-        if (now - s_last >= 3000) {
-            s_last = now;
-            MoneyPacket p; memset(&p, 0, sizeof(p));
-            p.type = PACKET_TIME_SYNC; p.originId = g_LocalPlayerId.load(); p.value = local;
-            QueueVehicleEvent(&p, sizeof(p));
-        }
-        return;
-    }
-    if (!g_TimeSyncPending.exchange(false)) return;
-    const double host = g_TimeSyncValue.load();
-    const double sp = (speed > 0.0f && speed < 1.0e4f) ? (double)speed : 1.0;
-    const double limit = (1.5 * sp > 1.0) ? 1.5 * sp : 1.0;
-    if (fabs(host - local) > limit) {
-        *envTime = host;
-        LOGI("[TIME] saat host'a cekildi: fark=%.1f (yerel=%.1f host=%.1f)", host - local, local, host);
-    }
-}
-
 void my_GameUpdate(void* thiz, float param_1) {
     if (g_HUDInstance != 0) RepairShopClick((void*)g_HUDInstance, "gameUpdate");   // tiklama bu karede islenmeden once
     g_LastGameUpdateMs.store(NowMs());   // host canlilik sinyali icin (oyun dongusu donarsa ping kesilir)
     g_EngineInstance = (uintptr_t)thiz; 
     g_CurrentMenu = MENU_INGAME; 
     MoneyFrame((uintptr_t)thiz);         // ortak para (her kare, tum oyun durumlarinda)
+    {
+        // Game::updateStateBase SADECE durum 6'da calisir; magaza/ayarlar (durum 7) acikken hic cagrilmaz.
+        // Alim/satim tespiti ve arac tablosu bu yuzden burada (her karede) calistirilir; boylece magaza
+        // KAPANMADAN diger cihazlara bildirilir.
+        const uint32_t st0 = *(volatile uint32_t*)((uintptr_t)thiz + 0x64);
+        if (st0 == 6 || st0 == 7) PoolPollFrame((uintptr_t)thiz);
+        if (st0 == 7) RefreshVehicleTopology((uintptr_t)thiz);
+        TimeSyncFrame((uintptr_t)thiz, st0);
+    }
 
     // Oturum guvenligi: host oyundan cikarsa oda kapanir, client baglantisi kopunca oyundan atilir.
     {
@@ -6237,13 +6305,6 @@ void my_GameUpdate(void* thiz, float param_1) {
         s_prevInGame = inGame;
     }
     if (orig_GameUpdate) orig_GameUpdate(thiz, param_1);
-    // Magaza menusu (durum 7): my_GameUpdateStateBase calismiyor -> alim/satim tespiti ve saat senkronu buradan.
-    if (g_EngineInstance != 0) {
-        const uint32_t st2 = *(volatile uint32_t*)(g_EngineInstance + 0x64);
-        if (st2 == 7) RefreshVehicleTopology(g_EngineInstance);
-        if (st2 == 6 || st2 == 7) PoolPollFrame(g_EngineInstance);
-        TimeSyncFrame(g_EngineInstance);
-    }
 }
 
 void my_GameUpdateStateBase(void* thiz, float param_1, uint32_t param_2, uint32_t param_3, uint32_t param_4) {
@@ -6257,7 +6318,6 @@ void my_GameUpdateStateBase(void* thiz, float param_1, uint32_t param_2, uint32_
             const uint32_t ai = *(volatile uint32_t*)(g_EngineInstance + 0xA8);
             g_AiIntentVeh = (ai < VehicleCount(g_EngineInstance)) ? NetIdOfVehicle(RawVehicleSlot(g_EngineInstance, ai)) : -1;
             g_AiIntentMs = NowMs();
-            LOGI("[AI] isci dugmesine basildi netId=%d", g_AiIntentVeh);
         }
     }
 
@@ -6274,10 +6334,6 @@ void my_GameUpdateStateBase(void* thiz, float param_1, uint32_t param_2, uint32_
         CaptureAndQueueLocalVehicleState(g_EngineInstance);
         ActiveVehicleFrame(g_EngineInstance);
         HornFrame(g_EngineInstance, GetMonotonicMilliseconds());
-    } else {
-        // Oyun ici menu (magaza): konum esitleme yok, ama arac tablosu acik kalir ve
-        // magazadan alinan/satilan araclar hemen diger cihazlara bildirilir.
-        RefreshVehicleTopology(g_EngineInstance);
     }
 
     // Oyun ici ImGui cizimi: ekran renderQueues'ta (presentGLESFramebuffer) ekrana verilir,
@@ -6466,7 +6522,7 @@ void* my_renderStartMenuMain(void* thiz, void* p1, void* p2, void* p3) {
 // ========================================================================
 __attribute__((constructor))
 void ModMain() {
-    LOGI(">>> MULTIPLAYER MOD STARTING <<< build=shopfix-9+ai-intent-2+horn-fix-1+menu-poll+time-sync");
+    LOGI(">>> MULTIPLAYER MOD STARTING <<< build=shopfix-9+no-ai-mirror+shop-menu-poll+time-sync");
 
     ResetVehicleSyncState();
     std::thread(StartPONGResponderThread).detach();
