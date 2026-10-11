@@ -22,6 +22,7 @@
 #include <unistd.h>
 #include <fcntl.h>
 #include <sys/stat.h>
+#include <sys/mman.h>
 #include <strings.h>
 #include <elf.h>
 #include <sys/ioctl.h>
@@ -2314,14 +2315,24 @@ static void CaptureAndQueueCombineStates(uintptr_t game, uint8_t localOwner, uin
             if (g_AiMirrored[id] && !intent) continue;                // aynali isci simulasyonunun kararlari yayinlanmaz
         }
 
-        // Kullanici dugmeye basti ve isci ACILDI, ama karsi cihaz zaten isci calistiriyor: kullanicinin niyeti
-        // "durdur"dur (dugme tek bir ortak durumu cevirir). Yerel baslangici geri al.
-        if (intent && ai && !prevOn && remoteAi && g_VehicleAiStopFn) {
-            g_VehicleAiStopFn((void*)v);
-            ai = *(uint32_t*)(v + 0x730) != 0;
-            g_AiPrevOn[id] = ai;
-            g_AiMirrored[id] = false;
-            LOGI("[VEHSTATE] kullanici isciyi durdurdu (karsi cihazdaki iscinin) netId=%u", (unsigned)id);
+        // Karsi cihaz isciyi calistirirken kullanici bu cihazda dugmeye bastiysa niyet "durdur"dur (dugme tek bir
+        // ortak durumu cevirir). Oyun yerelde isciyi baslatmis olabilir (geri al) ya da baslatamamis olabilir;
+        // ikisinde de durdurma istegini isciyi calistiran cihaza gonder.
+        if (intent && remoteAi && !g_AiMirrored[id] && g_AiIntentMs != 0) {
+            if (ai && !prevOn && g_VehicleAiStopFn) {
+                g_VehicleAiStopFn((void*)v);
+                ai = *(uint32_t*)(v + 0x730) != 0;
+                g_AiPrevOn[id] = ai;
+            }
+            if (!ai) {
+                const bool cmb = *(uint8_t*)(v + 0x328) != 0;
+                QueueEntityState(2, id, 0, cmb ? *(uint32_t*)(v + 0x440) : 0, cmb ? *(uint32_t*)(v + 0x448) : 0,
+                                 (uint8_t)((LocalVehicleFlags(v) & ~8) | kEdgeBit));
+                c.rvalid = true; c.rflags = (uint8_t)(c.rflags & ~8);
+                g_AiIntentMs = 0;                                   // niyet tuketildi
+                LOGI("[VEHSTATE] isci durdurma istegi gonderildi netId=%u", (unsigned)id);
+                continue;
+            }
         }
 
         uint8_t owner = VEHICLE_OWNER_NONE;
@@ -6249,6 +6260,80 @@ static void my_Map_updateFields(void* map, uint32_t f1, uint32_t f2, uint32_t f3
     QueueFieldOp(wt, wf, pts);
 }
 
+// ---- Aynalanmayan isci icin HUD dugmesi ----
+// Karsi cihaz isciyi calistirirken bu cihazin HUD'u "isciden cik" dugmesini gostersin. HUD, dugmeyi
+// GUIInterfaceDesc+0x59B (= Game+0x8EAB = aktif aracin +0x730 != 0) bayragindan secer; bayrak
+// GenericGUIManager::updateBaseMenu icinde okunur. Okunmadan hemen once 1'e cekilir.
+typedef void* (*UpdateBaseMenu_t)(void*, void*, void*, uint32_t, uint32_t, uint32_t);
+static UpdateBaseMenu_t orig_updateBaseMenu = nullptr;
+static void* my_updateBaseMenu(void* thiz, void* desc, void* in, uint32_t a, uint32_t b, uint32_t c) {
+    const uintptr_t g = g_EngineInstance;
+    if (desc && g && g_IsConnected.load() && g_VehNetArmed.load()) {
+        const uint32_t ai = *(volatile uint32_t*)(g + 0xA8);
+        if (ai < VehicleCount(g)) {
+            const uintptr_t v = RawVehicleSlot(g, ai);
+            const int id = NetIdOfVehicle(v);
+            if (id >= 0 && *(volatile uint32_t*)(v + 0x730) == 0) {
+                const CombineTrack& ct = g_CbTrack[id];
+                if (ct.rvalid && (ct.rflags & 8) && ((long long)NowMs() - (long long)ct.lastMs) < 10000)
+                    *(volatile uint8_t*)((uintptr_t)desc + 0x59B) = 1;
+            }
+        }
+    }
+    return orig_updateBaseMenu ? orig_updateBaseMenu(thiz, desc, in, a, b, c) : nullptr;
+}
+
+// ---- Kayma TANI logu (tarla / balya / sayilar) ----
+// Her cihaz 15 sn'de bir ayni bicimde bir [SYNC] satiri yazar; iki cihazin logunu yan yana koyunca hangi
+// verinin (arac/alet sayisi, para, saat, tarla haritasi karmasi, balyalar) kaydigi gorulur. Harita karmasi
+// Map::serialize'in cikti baytlarinin FNV-1a'sidir (okuma amacli, oyunun kaydi degil).
+static const bool kSyncDiag = true;
+typedef uint8_t* (*MapSerialize_t)(void* map, uint8_t* buf);
+static MapSerialize_t g_MapSerializeFn = nullptr;
+static uint64_t g_DiagLastMs = 0;
+static uint8_t* g_DiagBuf = nullptr;
+static const size_t kDiagBufSize = 16u * 1024u * 1024u;
+
+static uint32_t Fnv1a(const uint8_t* p, size_t n) {
+    uint32_t h = 2166136261u;
+    for (size_t i = 0; i < n; ++i) { h ^= p[i]; h *= 16777619u; }
+    return h;
+}
+
+static void SyncDiagFrame(uintptr_t game, uint32_t st) {
+    if (!kSyncDiag || game == 0 || st != 6 || !g_IsConnected.load()) return;
+    const uint64_t now = (uint64_t)NowMs();
+    if (now - g_DiagLastMs < 15000) return;
+    g_DiagLastMs = now;
+
+    uint32_t mapHash = 0; size_t mapSize = 0;
+    void* map = (void*)(*(uintptr_t*)(game + 0x704));
+    if (g_MapSerializeFn && map) {
+        if (!g_DiagBuf) {
+            void* m = mmap(nullptr, kDiagBufSize, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+            g_DiagBuf = (m == MAP_FAILED) ? nullptr : (uint8_t*)m;
+        }
+        if (g_DiagBuf) {
+            uint8_t* end = g_MapSerializeFn(map, g_DiagBuf);
+            const size_t n = (size_t)(end - g_DiagBuf);
+            if (end >= g_DiagBuf && n > 0 && n < kDiagBufSize) { mapHash = Fnv1a(g_DiagBuf, n); mapSize = n; }
+        }
+    }
+    char bales[160]; bales[0] = '\0';
+    const uint32_t bn = *(uint32_t*)(game + 900);
+    for (uint32_t i = 0; i < bn && i < 5; ++i) {
+        const uintptr_t b = *(uintptr_t*)(game + 0x388 + (uintptr_t)i * 4u);
+        const uintptr_t body = b ? *(uintptr_t*)(b + 0x50) : 0;
+        if (!body) continue;
+        char t[32];
+        snprintf(t, sizeof(t), "(%.0f,%.0f)", *(float*)(body + 0x0C), *(float*)(body + 0x10));
+        strncat(bales, t, sizeof(bales) - strlen(bales) - 1);
+    }
+    LOGI("[SYNC] veh=%u trl=%u tool=%u bale=%u money=%.0f env=%.1f/%.1f maphash=%08x mapsize=%u %s",
+         (unsigned)VehicleCount(game), (unsigned)TrailerCount(game), (unsigned)ToolCount(game), (unsigned)bn,
+         ReadMoney(game), ReadEnvD(game, 0), ReadEnvD(game, 8), (unsigned)mapHash, (unsigned)mapSize, bales);
+}
+
 void my_GameUpdate(void* thiz, float param_1) {
     if (g_HUDInstance != 0) RepairShopClick((void*)g_HUDInstance, "gameUpdate");   // tiklama bu karede islenmeden once
     g_LastGameUpdateMs.store(NowMs());   // host canlilik sinyali icin (oyun dongusu donarsa ping kesilir)
@@ -6263,6 +6348,7 @@ void my_GameUpdate(void* thiz, float param_1) {
         if (st0 == 6 || st0 == 7) PoolPollFrame((uintptr_t)thiz);
         if (st0 == 7) RefreshVehicleTopology((uintptr_t)thiz);
         TimeSyncFrame((uintptr_t)thiz, st0);
+        SyncDiagFrame((uintptr_t)thiz, st0);
     }
 
     // Oturum guvenligi: host oyundan cikarsa oda kapanir, client baglantisi kopunca oyundan atilir.
@@ -6522,7 +6608,7 @@ void* my_renderStartMenuMain(void* thiz, void* p1, void* p2, void* p3) {
 // ========================================================================
 __attribute__((constructor))
 void ModMain() {
-    LOGI(">>> MULTIPLAYER MOD STARTING <<< build=shopfix-9+no-ai-mirror+shop-menu-poll+time-sync");
+    LOGI(">>> MULTIPLAYER MOD STARTING <<< build=shopfix-10+ai-button+sync-diag");
 
     ResetVehicleSyncState();
     std::thread(StartPONGResponderThread).detach();
@@ -6605,6 +6691,15 @@ void ModMain() {
             const bool h2 = HookChecked("Trailer::update", tru, (void*)my_Trailer_update, (void**)&orig_Trailer_update, true);
             const bool h3 = HookChecked("Tool::update", tou, (void*)my_Tool_update, (void**)&orig_Tool_update, true);
             LOGI("[MONEY] guard hooks installed: Vehicle=%d Trailer=%d Tool=%d", (int)h1, (int)h2, (int)h3);
+        }
+        {   // isci dugmesi gorunumu (karsi cihaz isciyi calistirirken "isciden cik" gorunsun)
+            void* ubm = dlsym(appLib, "_ZN17GenericGUIManager14updateBaseMenuEP16GUIInterfaceDescP26AndroidHandheldInputDevicef");
+            if (!ubm) ubm = FindElfSymbolByPrefix("libapp.so", "_ZN17GenericGUIManager14updateBaseMenu");
+            const bool hu = HookChecked("GenericGUIManager::updateBaseMenu", ubm, (void*)my_updateBaseMenu, (void**)&orig_updateBaseMenu, true);
+            LOGI("[AIBTN] updateBaseMenu=%p hooked=%d", ubm, (int)hu);
+            g_MapSerializeFn = (MapSerialize_t)dlsym(appLib, "_ZN3Map9serializeEPh");
+            if (!g_MapSerializeFn) g_MapSerializeFn = (MapSerialize_t)FindElfSymbolByPrefix("libapp.so", "_ZN3Map9serialize");
+            LOGI("[SYNC] Map::serialize=%p", (void*)g_MapSerializeFn);
         }
         {   // romork/alet alim-satim fonksiyonlari (sadece cagrilir) + tarla islemi kancasi
             g_GameAddTrailerFn = (Game_addItem_t)dlsym(appLib, "_ZN4Game10addTrailerEN13EntityManager8TRAILERSERK7Vector3fj");
