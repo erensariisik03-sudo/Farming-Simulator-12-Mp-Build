@@ -1927,11 +1927,12 @@ static TrailerTrack g_TrTrack[64];
 // rvalid/rflags = karsidan en son bildirilen bayraklar (kenar tespiti icin). Ikisi karismaz -> yanki olmaz.
 struct CombineTrack { bool valid; uint32_t wa, wb; uint8_t flags; uint64_t lastMs; bool rvalid; uint8_t rflags; };
 static const uint8_t kStateFlagMask = 0x0B;   // 1 = bicer/kesici, 2 = alet aktif, 8 = isci
-// Aynali isci (baska cihazda calisan iscinin bu cihazda da baslatilmasi) KAPALI: aynali simulasyon 1-2 sn'de
-// kendiliginden dusuyor, yeniden baslatma dongusu oyunu kasiyor ve gercek iscinin bayragini bozuyordu.
-// Isci sadece dugmeye basilan cihazda calisir; konumu/alet durumu/tarla degisiklikleri zaten ayri senkronize.
-// Diger cihazda kullanici dugmeye basarsa "durdur" komutu iscinin cihazina gider (asagidaki niyet mantigi).
-static const bool kMirrorAiOnRemote = false;
+// Aynali isci: baska cihazda calisan isci bu cihazda da baslatilir. Boylece (1) bu cihazin HUD dugmeleri
+// (isciye ver / isciden cik, biçer ve alet dugmeleri) dogru gorunur, (2) iscinin cihazi coker/kapanirsa
+// tarla isi diger cihazda kesintisiz devam eder. Aynali simulasyon kendi kendine dusebilir; bu durumda
+// en fazla 8 kez yeniden baslatilir (ve nedeni loga yazilir). Kullanici dugmesi olmadan aynali iscinin
+// kararlari yayinlanmaz (yanki olmasin diye).
+static const bool kMirrorAiOnRemote = true;
 static const uint8_t kEdgeBit = 0x10;         // paketlerde: "kullanici bunu YENI yapti" (periyodik durum paketinden ayirir)
 static uint64_t g_AiIntentMs = 0;             // bu cihazda kullanici isci (AI) dugmesine bastigi an
 static int g_AiIntentVeh = -1;                // ... o anda aktif olan aracin netId'si
@@ -2265,6 +2266,14 @@ static void ToggleCombineInline(uintptr_t v) {
 
 // Durum bayraklarinin "periyodik" yayincisi kim? Ayni aracin icinde birden fazla oyuncu varken
 // sadece biri periyodik/tank bilgisini gonderir; KULLANICI DEGISIKLIKLERI (kenar) herkesten gider.
+// Aracin bagli mibzerinin secili tohumu (Tool+0x438, tur Tool+0x434 == 1; 0..2). 0 = yok, aksi halde tohum + 1.
+static uint8_t VehSeedSub(uintptr_t v) {
+    const uintptr_t tool = *(uintptr_t*)(v + 0x560);
+    if (tool == 0 || *(uint32_t*)(tool + 0x434) != 1) return 0;
+    const uint32_t sd = *(uint32_t*)(tool + 0x438);
+    return sd < 3 ? (uint8_t)(sd + 1) : (uint8_t)0;
+}
+
 static bool IsStatePublisherVeh(uint16_t id, uint8_t localOwner, uint16_t activeVehicleId, bool ai, uint8_t owner, bool remoteAi) {
     if (ai && !g_AiMirrored[id]) return true;
     if (remoteAi) return false;                                    // isciyi baska cihaz calistiriyor: onun durumu gecerli                       // isciyi bu cihaz calistiriyor: gercek kaynak
@@ -2303,13 +2312,15 @@ static void CaptureAndQueueCombineStates(uintptr_t game, uint8_t localOwner, uin
                     g_AiMirrored[id] = false;
                 } else if (!remoteAi) {
                     g_AiMirrored[id] = false;                         // karsi taraf da durdurmus
-                } else if (!intent && g_AiRestartTries[id] < 3 && (nowMs - g_AiRestartMs[id]) >= 1500 &&
+                } else if (!intent && g_AiRestartTries[id] < 8 && (nowMs - g_AiRestartMs[id]) >= 1500 &&
                            g_VehiclePrepareAiFn && g_VehicleAiStartFn) {
                     g_AiRestartMs[id] = nowMs; g_AiRestartTries[id]++;     // simulasyon kendi kendine durdu: canli tut
                     const uint32_t ok = g_VehiclePrepareAiFn((void*)v, (void*)game) & 0xFF;
                     if (ok) { g_VehicleAiStartFn((void*)v, (void*)game); ai = *(uint32_t*)(v + 0x730) != 0; g_AiPrevOn[id] = ai; }
-                    LOGI("[VEHSTATE] aynali isci yeniden baslatildi netId=%u sonuc=%u deneme=%u",
-                         (unsigned)id, (unsigned)ok, (unsigned)g_AiRestartTries[id]);
+                    const uintptr_t tl = *(uintptr_t*)(v + 0x560);
+                    LOGI("[VEHSTATE] aynali isci yeniden baslatildi netId=%u sonuc=%u deneme=%u alet=%p aletbayrak=%08x ai=%u",
+                         (unsigned)id, (unsigned)ok, (unsigned)g_AiRestartTries[id], (void*)tl,
+                         tl ? (unsigned)*(uint32_t*)tl : 0u, (unsigned)*(uint32_t*)(v + 0x730));
                 }
             }
             if (g_AiMirrored[id] && !intent) continue;                // aynali isci simulasyonunun kararlari yayinlanmaz
@@ -2326,7 +2337,7 @@ static void CaptureAndQueueCombineStates(uintptr_t game, uint8_t localOwner, uin
             }
             if (!ai) {
                 const bool cmb = *(uint8_t*)(v + 0x328) != 0;
-                QueueEntityState(2, id, 0, cmb ? *(uint32_t*)(v + 0x440) : 0, cmb ? *(uint32_t*)(v + 0x448) : 0,
+                QueueEntityState(2, id, VehSeedSub(v), cmb ? *(uint32_t*)(v + 0x440) : 0, cmb ? *(uint32_t*)(v + 0x448) : 0,
                                  (uint8_t)((LocalVehicleFlags(v) & ~8) | kEdgeBit));
                 c.rvalid = true; c.rflags = (uint8_t)(c.rflags & ~8);
                 g_AiIntentMs = 0;                                   // niyet tuketildi
@@ -2347,7 +2358,7 @@ static void CaptureAndQueueCombineStates(uintptr_t game, uint8_t localOwner, uin
         const bool localEdge = c.valid && flags != c.flags;
 
         if (localEdge) {                                              // kullanici (ya da isci) bir sey degistirdi
-            QueueEntityState(2, id, 0, wa, wb, (uint8_t)(flags | kEdgeBit));
+            QueueEntityState(2, id, VehSeedSub(v), wa, wb, (uint8_t)(flags | kEdgeBit));
             LOGI("[VEHSTATE] gonderildi netId=%u bicer/kesici=%d alet=%d isci=%d", (unsigned)id,
                  (int)(flags & 1), (int)((flags >> 1) & 1), (int)((flags >> 3) & 1));
             c.rvalid = true; c.rflags = flags;                        // ortak durum artik bu
@@ -2361,7 +2372,7 @@ static void CaptureAndQueueCombineStates(uintptr_t game, uint8_t localOwner, uin
         const bool tankChanged = c.valid && (c.wa != wa || c.wb != wb);
         const bool due = !c.valid || resend || (nowMs - c.lastMs) >= 3000 || (tankChanged && (nowMs - c.lastMs) >= 250);
         if (due) {
-            QueueEntityState(2, id, 0, wa, wb, flags);
+            QueueEntityState(2, id, VehSeedSub(v), wa, wb, flags);
             c.valid = true; c.wa = wa; c.wb = wb; c.flags = flags; c.lastMs = nowMs;
         }
     }
@@ -2804,6 +2815,19 @@ static void ApplyPendingTrailerEvents(uintptr_t game, uint8_t localOwner, uint64
                 if (fa == fa && fb == fb && fa < 1.0e7f && fb < 1.0e7f) {
                     *(uint32_t*)(v + 0x440) = st.wa;
                     *(uint32_t*)(v + 0x448) = st.wb;
+                }
+            }
+            if (st.sub != 0 && st.sub <= 3) {                 // tohum secimi (mibzer): kenar paketinde ya da isci baslarken
+                const bool aiStartNow = ((st.flags & 8) != 0) && (*(uint32_t*)(v + 0x730) == 0);
+                if ((st.flags & kEdgeBit) || aiStartNow) {
+                    const uintptr_t tool = *(uintptr_t*)(v + 0x560);
+                    if (tool != 0 && *(uint32_t*)(tool + 0x434) == 1 && *(uint32_t*)(tool + 0x438) != (uint32_t)(st.sub - 1)) {
+                        *(uint32_t*)(tool + 0x438) = (uint32_t)(st.sub - 1);
+                        bool fresh = false;
+                        TrailerTrack* tt = TrackForTool(tool, &fresh);
+                        if (tt) tt->typeWord = (uint32_t)(st.sub - 1);
+                        LOGI("[SEED] tohum uzaktan secildi netId=%u tohum=%u", (unsigned)st.id, (unsigned)(st.sub - 1));
+                    }
                 }
             }
             if (diff & 8) {                                   // isci (AI): uzaktan baslat / durdur
@@ -6608,7 +6632,7 @@ void* my_renderStartMenuMain(void* thiz, void* p1, void* p2, void* p3) {
 // ========================================================================
 __attribute__((constructor))
 void ModMain() {
-    LOGI(">>> MULTIPLAYER MOD STARTING <<< build=shopfix-10+ai-button+sync-diag");
+    LOGI(">>> MULTIPLAYER MOD STARTING <<< build=shopfix-11+ai-mirror-on+seed-sync");
 
     ResetVehicleSyncState();
     std::thread(StartPONGResponderThread).detach();
