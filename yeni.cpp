@@ -604,6 +604,7 @@ static const uint8_t PACKET_ENTITY_STATE = 24;    // romork doluluk / bicer tank
 static const uint8_t PACKET_BALE_OP = 28;         // balya eklendi / silindi (toplandi, satildi) / tasindi (guvenilir, host iletir)
 static const uint8_t PACKET_BALE_LIST = 29;       // host -> client: tum balyalar (yakinsama icin, degisken uzunluk)
 static const uint8_t PACKET_MAP_CLOCK = 30;       // host -> client: tarla buyume saati (Map zamanlayicisi)
+static const uint8_t PACKET_FIELD_OWN = 31;       // tarla satin alindi (sahiplik bayti 0 -> 1), host iletir
 
 // Baglanti sagligi: bu sureden uzun sessizlik = karsi taraf gitti (donmus / zorla kapatilmis).
 static const long long HOST_SILENCE_TIMEOUT_MS = 10000;  // client: host'tan hicbir sey gelmedi
@@ -1921,6 +1922,13 @@ struct __attribute__((packed)) MapClockPacket {
     uint32_t cycles;        // host'ta tamamlanan buyume turu sayaci
     int32_t idx;            // Map+0xc90 (suan islenen grup, -1 = bekliyor)
     uint32_t timerBits;     // Map+0xc88 (sonraki tura kalan sure, float bitleri)
+    uint32_t ownMask;       // host'un sahip oldugu tarlalar (bit i = tarla i), client'a EKLENIR
+};
+struct __attribute__((packed)) FieldOwnPacket {
+    uint8_t type;
+    uint8_t ownerId;        // host'ta peerId ile ezilir
+    uint8_t idx;            // tarla kaydi sirasi (Map + idx*100 + 0x2c = sahiplik bayti)
+    uint8_t owned;
 };
 static const uint32_t kBaleMax = 50;                              // oyunun balya havuzu (Game+0x388, sayac Game+900)
 static std::vector<BaleOpPacket> g_PendingBaleOps;                // g_VehicleEventMutex ile korunur
@@ -1928,6 +1936,7 @@ static std::vector<float> g_PendingBaleList;                      // host'un son
 static bool g_HasPendingBaleList = false;
 static MapClockPacket g_PendingMapClock;                          // host'un son saati; g_VehicleEventMutex
 static bool g_HasPendingMapClock = false;
+static std::vector<FieldOwnPacket> g_PendingFieldOwn;             // g_VehicleEventMutex ile korunur
 static std::vector<uint8_t> g_FieldOpOut;                         // g_VehicleEventMutex ile korunur
 static std::vector<FieldOpPacket> g_PendingFieldOps;              // g_VehicleEventMutex ile korunur
 static std::vector<PoolOpPacket> g_PendingPoolOps;                // g_VehicleEventMutex ile korunur
@@ -2742,6 +2751,7 @@ struct BaleTrack {
     float x, y, a;              // son gozlenen konum
     float sx, sy, sa;           // en son yayinlanan / uygulanan konum
     long long bornMs, sentMs, remoteMs;
+    long long nearMs;           // bu cihazin GERCEK (yerel suruldugu) bir aracin yakininda oldugu son an
 };
 struct BaleRecent { float x, y; long long ms; bool sale; bool local; bool used; double gain; };
 static std::vector<BaleTrack> g_BaleTrk;
@@ -2908,8 +2918,39 @@ static void BaleApplyOp(uintptr_t game, const BaleOpPacket& op, uint8_t localOwn
     }
 }
 
+// Balya hareketinin "sahibi": balyayi gercekten iten, bu cihazda YEREL suruldugu (aktif / sahip / yerel isci) arac.
+// Baska cihazin suruculugu bu cihazda "hayalet" arac olarak balyanin icinden gecer ya da fizigi bozup balyayi koseye firlatir;
+// bu yuzden bir balyanin hareketi SADECE yerel gercek bir aracin yakininda olusmussa yayinlanir (yoksa host/sahip cihazin
+// akisi gecerlidir ve gelen konum yerel fizigin ustune yazilir).
+static const float kBaleNearVehicleR2 = 12.0f * 12.0f;
+static const long long kBaleOwnHoldMs = 2500;                 // araci biraktiktan sonra balyanin kayip durmasi icin
+static const long long kBaleSendIntervalMs = 50;              // 20 Hz
+static void BaleLocalVehiclePoints(uintptr_t game, std::vector<float>* pts) {
+    pts->clear();
+    const uint8_t localOwner = g_LocalPlayerId.load();
+    const uint32_t activeIdx = *(volatile uint32_t*)(game + 0xA8);
+    const uint32_t vn = VehicleCount(game);
+    for (uint32_t i = 0; i < vn; ++i) {
+        const uintptr_t v = RawVehicleSlot(game, i);
+        if (!v) continue;
+        const int nid = NetIdOfVehicle(v);
+        bool local = (i == activeIdx);
+        if (!local && nid >= 0) {
+            { std::lock_guard<std::mutex> lock(g_VehicleStateMutex); local = (g_VehicleAuthority[nid].ownerId == localOwner); }
+            if (!local) local = (*(uint32_t*)(v + 0x730) != 0) && !g_AiMirrored[nid];
+        }
+        if (!local) continue;
+        const uintptr_t vb = *(uintptr_t*)(v + 0x528);
+        if (!vb) continue;
+        pts->push_back(*(float*)(vb + 0x0C));
+        pts->push_back(*(float*)(vb + 0x10));
+    }
+}
+
 // Yerel degisiklikleri yakala ve yayinla.
 static void BaleCapture(uintptr_t game, long long now) {
+    std::vector<float> vpts;
+    BaleLocalVehiclePoints(game, &vpts);
     struct Cur { uintptr_t p; float x, y, a; };
     Cur cur[kBaleMax];
     uint32_t cn = 0;
@@ -2969,11 +3010,16 @@ static void BaleCapture(uintptr_t game, long long now) {
         }
         t = *old;
         t.x = c.x; t.y = c.y; t.a = c.a;
+        for (size_t k = 0; k + 1 < vpts.size(); k += 2) {                  // yerel gercek bir aracin yakininda mi
+            const float vx = vpts[k] - c.x, vy = vpts[k + 1] - c.y;
+            if (vx * vx + vy * vy < kBaleNearVehicleR2) { t.nearMs = now; break; }
+        }
         const float dx = c.x - t.sx, dy = c.y - t.sy;
-        const bool moved = (dx * dx + dy * dy > 0.0064f) || GetAngleDelta(c.a, t.sa) > 0.08f;
-        if (now - t.remoteMs < 1500) {                                     // baska cihaz yonetiyor: yanki gonderme
+        const bool moved = (dx * dx + dy * dy > 0.0001f) || GetAngleDelta(c.a, t.sa) > 0.02f;
+        const bool mine = (now - t.nearMs) < kBaleOwnHoldMs;
+        if (now - t.remoteMs < 1500 || !mine) {                            // baska cihaz yonetiyor / sahibi biz degiliz: yayinlama, sadece izle
             t.sx = c.x; t.sy = c.y; t.sa = c.a;
-        } else if (moved && now - t.sentMs >= 120) {
+        } else if (moved && now - t.sentMs >= kBaleSendIntervalMs) {       // 20 Hz; durunca son konum da gider
             QueueBaleOp(3, t.sx, t.sy, c.x, c.y, c.a, 0);
             t.sx = c.x; t.sy = c.y; t.sa = c.a; t.sentMs = now;
         }
@@ -3063,6 +3109,83 @@ static void BaleFrame(uintptr_t game) {
 }
 
 // ========================================================================
+// TARLA SATIN ALMA (sahiplik)
+// Satin alma Game::updateGameLogicState icinde (onay diyalogu, Game+0x68 == 9): secili tarla kaydi Game+0xa2f8,
+// sahiplik bayti Map + idx*100 + 0x2c (0 -> 1) ve para (Game+0x6a0) dusulur. Para zaten ORTAK PARA ile senkron;
+// burada sadece sahiplik baytini yayiniyoruz. Her karede 17 kayitlik bayt dizisi bir onceki goruntuyle
+// karsilastirilir (kanca YOK); 0 -> 1 olan = satin alindi. Host ayrica 2 sn'de bir sahiplik maskesini yollar (guvenlik agi).
+// ========================================================================
+static const bool kSyncFieldOwn = true;
+static const uint32_t kFieldRecMax = 17;                    // Map::serialize 17 kayit yazar (0x6a4 / 100)
+static uint8_t g_OwnSnap[kFieldRecMax];
+static bool g_OwnSnapValid = false;
+static uintptr_t g_OwnMapPtr = 0;
+
+static uint32_t FieldRecCount(uintptr_t map) {
+    const int32_t n = *(volatile int32_t*)(map + 0x28);
+    return (n < 0) ? 0u : ((uint32_t)n > kFieldRecMax ? kFieldRecMax : (uint32_t)n);
+}
+static uint32_t FieldOwnMask(uintptr_t map) {
+    uint32_t m = 0;
+    const uint32_t n = FieldRecCount(map);
+    for (uint32_t i = 0; i < n; ++i) if (*(volatile uint8_t*)(map + (uintptr_t)i * 100 + 0x2c) != 0) m |= (1u << i);
+    return m;
+}
+static void FieldOwnApplyMask(uintptr_t map, uint32_t mask) {
+    const uint32_t n = FieldRecCount(map);
+    for (uint32_t i = 0; i < n; ++i) {
+        if (!(mask & (1u << i))) continue;
+        volatile uint8_t* b = (volatile uint8_t*)(map + (uintptr_t)i * 100 + 0x2c);
+        if (*b == 0) {
+            *b = 1;
+            if (g_OwnSnapValid) g_OwnSnap[i] = 1;
+            LOGI("[FIELDOWN] tarla %u sahipligi host maskesinden alindi", (unsigned)i);
+        }
+    }
+}
+static void FieldOwnFrame(uintptr_t game, uint32_t st) {
+    if (!kSyncFieldOwn || game == 0) return;
+    if (!g_IsConnected.load() || (st != 6 && st != 7)) { g_OwnSnapValid = false; return; }
+    const uintptr_t map = *(uintptr_t*)(game + 0x704);
+    if (!map) { g_OwnSnapValid = false; return; }
+    const uint32_t n = FieldRecCount(map);
+    if (map != g_OwnMapPtr) { g_OwnMapPtr = map; g_OwnSnapValid = false; }   // harita yeniden yuklendi (kayit alindi)
+    if (!g_OwnSnapValid) {
+        for (uint32_t i = 0; i < kFieldRecMax; ++i)
+            g_OwnSnap[i] = (i < n) ? *(volatile uint8_t*)(map + (uintptr_t)i * 100 + 0x2c) : 0;
+        g_OwnSnapValid = true;
+        std::lock_guard<std::mutex> lock(g_VehicleEventMutex);
+        g_PendingFieldOwn.clear();
+        return;
+    }
+    // uzaktan gelen satin almalari uygula (para zaten delta ile geliyor)
+    std::vector<FieldOwnPacket> ops;
+    { std::lock_guard<std::mutex> lock(g_VehicleEventMutex); ops.swap(g_PendingFieldOwn); }
+    for (size_t k = 0; k < ops.size(); ++k) {
+        const FieldOwnPacket& op = ops[k];
+        if (op.idx >= n || !op.owned) continue;
+        volatile uint8_t* b = (volatile uint8_t*)(map + (uintptr_t)op.idx * 100 + 0x2c);
+        if (*b == 0) {
+            *b = 1;
+            LOGI("[FIELDOWN] uzaktan tarla satin alma uygulandi: tarla=%u oyuncu=%u", (unsigned)op.idx, (unsigned)op.ownerId);
+        }
+        g_OwnSnap[op.idx] = 1;                                              // yerel degisiklik sanilip geri yayinlanmasin
+    }
+    // yerel degisiklikler
+    for (uint32_t i = 0; i < n; ++i) {
+        const uint8_t cur = *(volatile uint8_t*)(map + (uintptr_t)i * 100 + 0x2c);
+        if (cur == g_OwnSnap[i]) continue;
+        g_OwnSnap[i] = cur;
+        if (cur != 0) {
+            FieldOwnPacket p; memset(&p, 0, sizeof(p));
+            p.type = PACKET_FIELD_OWN; p.ownerId = g_LocalPlayerId.load(); p.idx = (uint8_t)i; p.owned = 1;
+            QueueVehicleEvent(&p, sizeof(p));
+            LOGI("[FIELDOWN] yerel tarla satin alma yayinlandi: tarla=%u", (unsigned)i);
+        }
+    }
+}
+
+// ========================================================================
 // TARLA BUYUME SAATI (mahsul durumu)
 // Tarla islemleri (ekim/hasat/isleme) FIELD_OP ile zaten senkron. Mahsulun BUYUMESI ise her cihazda kendi
 // Map zamanlayicisiyla ilerler (Map::update: Map+0xc88 sonraki tura kalan sure, +0xc90 islenen grup, -1 = bekliyor).
@@ -3125,6 +3248,7 @@ static void MapClockFrame(uintptr_t game, uint32_t st) {
             p.type = PACKET_MAP_CLOCK; p.originId = g_LocalPlayerId.load();
             p.cycles = g_McCycles; p.idx = *(volatile int32_t*)(map + 0xc90);
             memcpy(&p.timerBits, &tm, sizeof(tm));
+            p.ownMask = FieldOwnMask(map);
             QueueVehicleEvent(&p, sizeof(p));
         }
         return;
@@ -3135,6 +3259,7 @@ static void MapClockFrame(uintptr_t game, uint32_t st) {
         if (g_HasPendingMapClock) { hp = g_PendingMapClock; g_HasPendingMapClock = false; have = true; }
     }
     if (!have) return;
+    if (kSyncFieldOwn) FieldOwnApplyMask(map, hp.ownMask);
     float ht; memcpy(&ht, &hp.timerBits, sizeof(ht));
     if (!(ht == ht) || ht < 0.0f || ht > 1.0e6f) return;
     const float lt = g_McPrevTimer;
@@ -4113,7 +4238,9 @@ static void ResetVehicleSyncState() {
         g_PendingBaleList.clear();
         g_HasPendingBaleList = false;
         g_HasPendingMapClock = false;
+        g_PendingFieldOwn.clear();
     }
+    g_OwnSnapValid = false; g_OwnMapPtr = 0;
     g_BaleTrk.clear();
     g_BaleTrkValid = false;
     g_BaleLocalChangeMs = 0; g_BaleRemoteMs = 0; g_BaleListSendMs = 0;
@@ -4402,6 +4529,7 @@ static bool ProcessPackets(uint8_t* buf, size_t& buffered, int peerId, std::vect
         else if (type == PACKET_POOL_OP) { size = sizeof(PoolOpPacket); relayIt = true; }
         else if (type == PACKET_BALE_OP) { size = sizeof(BaleOpPacket); relayIt = true; }
         else if (type == PACKET_MAP_CLOCK) size = sizeof(MapClockPacket);
+        else if (type == PACKET_FIELD_OWN) { size = sizeof(FieldOwnPacket); relayIt = true; }
         else if (type == PACKET_BALE_LIST) {
             if (buffered < sizeof(BaleListHeader)) break;
             if (buf[1] > kBaleMax) return false;
@@ -4628,6 +4756,15 @@ static bool ProcessPackets(uint8_t* buf, size_t& buffered, int peerId, std::vect
                 std::lock_guard<std::mutex> lock(g_VehicleEventMutex);
                 if (g_PendingBaleOps.size() >= 128) g_PendingBaleOps.erase(g_PendingBaleOps.begin());
                 g_PendingBaleOps.push_back(bp);
+            }
+        } else if (type == PACKET_FIELD_OWN) {
+            FieldOwnPacket fo;
+            memcpy(&fo, buf, sizeof(fo));
+            if (fromPeer) { fo.ownerId = (uint8_t)peerId; memcpy(buf, &fo, sizeof(fo)); }
+            if (kSyncFieldOwn && fo.ownerId != g_LocalPlayerId.load() && fo.idx < kFieldRecMax) {
+                std::lock_guard<std::mutex> lock(g_VehicleEventMutex);
+                if (g_PendingFieldOwn.size() >= 32) g_PendingFieldOwn.erase(g_PendingFieldOwn.begin());
+                g_PendingFieldOwn.push_back(fo);
             }
         } else if (type == PACKET_BALE_LIST) {
             if (kSyncBales && !g_IsHost.load() && !fromPeer) {
@@ -6926,6 +7063,7 @@ void my_GameUpdate(void* thiz, float param_1) {
         if (st0 == 7) RefreshVehicleTopology((uintptr_t)thiz);
         TimeSyncFrame((uintptr_t)thiz, st0);
         MapClockFrame((uintptr_t)thiz, st0);
+        FieldOwnFrame((uintptr_t)thiz, st0);
         SyncDiagFrame((uintptr_t)thiz, st0);
     }
 
@@ -7192,7 +7330,7 @@ void* my_renderStartMenuMain(void* thiz, void* p1, void* p2, void* p3) {
 // ========================================================================
 __attribute__((constructor))
 void ModMain() {
-    LOGI(">>> MULTIPLAYER MOD STARTING <<< build=shopfix-12+bale-sync+map-clock");
+    LOGI(">>> MULTIPLAYER MOD STARTING <<< build=shopfix-13+bale-20hz+field-own+map-clock");
 
     ResetVehicleSyncState();
     std::thread(StartPONGResponderThread).detach();
