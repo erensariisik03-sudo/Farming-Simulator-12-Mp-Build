@@ -263,6 +263,7 @@ uintptr_t g_MenuInstance = 0;
 uintptr_t g_StartMenuInstance = 0;
 uintptr_t g_HUDInstance = 0;
 static void RepairShopClick(void* gui, const char* where);   // tanim my_updateGUI oncesinde
+static void GuestBlockDialogs(uintptr_t g);                   // client alisveris engeli (tanim RepairShopClick oncesinde)
 
 std::atomic<bool> g_IsHost(false);
 std::atomic<bool> g_IsClient(false);
@@ -615,6 +616,11 @@ static const long long AUTH_TABLE_INTERVAL_MS = 1000;
 static const long long UDP_STALE_MS = 3000;              // UDP yolu bu kadar sessizse TCP'ye don
 
 static std::atomic<long long> g_LastGameUpdateMs(0);     // oyun ana dongusunun son calistigi an
+// Host duraklamasi: Game::updateStateBase (dunya mantigi) bu surede hic calismadiysa host oyunu
+// durmus demektir (magaza/ayarlar, arka plan, bildirim paneli). Araci donup kalir; sahiplik birakilir.
+static std::atomic<long long> g_LastStateBaseMs(0);      // updateStateBase'in son calistigi an
+static const long long HOST_PAUSE_DETECT_MS = 1200;      // bu kadar suredir calismiyorsa host "duraklamis"
+static const long long HOST_PAUSE_GRACE_MS = 180000;     // duraklama suresince ping/tablo bu kadar surdurulur (client atilmasin)
 static std::atomic<bool> g_SyncRequestOut(false);        // client: host'tan tam senkron iste
 static std::atomic<bool> g_HostForceTable(false);        // host: sahiplik tablosunu hemen yayinla
 static std::atomic<bool> g_ForceResendAll(false);        // yerel araclari yeniden gonder
@@ -5177,6 +5183,8 @@ static void HostNetworkLoop(int serverFd, int gen) {
     std::vector<uint8_t> out, fast, relay, relayFast;
     int lastSentInGame = -1;
     long long lastPingMs = 0, lastTableMs = 0;
+    bool hostPaused = false;                 // host oyunu su an duraklamis mi (asagida algilanir)
+    int pausedReleasedNetId = -1;            // duraklarken sahipligi birakilan arac
 
     const int udpFd = OpenUdpSocket(true);   // -1 ise her sey TCP'den gider (eskisi gibi)
     if (udpFd < 0) ShowNativeToast("UDP is not supported on this device. The game may not run properly.");
@@ -5358,7 +5366,37 @@ static void HostNetworkLoop(int serverFd, int gen) {
 
             // Host oyun dongusu calisiyorsa "canli": ping + sahiplik tablosu. Oyun zorla kapatilip
             // surec bir sure yasasa bile bu sinyaller kesilir, client'lar 10 sn icinde atilir.
-            const bool hostAlive = (nowT - g_LastGameUpdateMs.load()) < HOST_ALIVE_WINDOW_MS;
+            // Host duraklamasi: dunya mantigi (updateStateBase) durduysa host'un araci hicbir sey yapmaz.
+            // Aracin sahipligini host'un AG THREAD'i birakir (oyun thread'i durdugu icin kendisi birakamaz);
+            // boylece client'lar araci surebilir. Host oyuna donunca (updateStateBase tekrar calisinca) normale doner.
+            {
+                const long long sb = g_LastStateBaseMs.load();
+                const bool pausedNow = g_LocalInGame.load() && sb > 0 && (nowT - sb) > HOST_PAUSE_DETECT_MS;
+                if (pausedNow && !hostPaused) {
+                    hostPaused = true;
+                    pausedReleasedNetId = -1;
+                    const int nid = *(volatile int*)&g_LocalActiveNetId;
+                    const uint8_t hostId = g_LocalPlayerId.load();
+                    if (nid >= 0 && nid < (int)VEHICLE_SLOT_LIMIT && hostId < MAX_PLAYERS &&
+                        ReleaseVehicleAuthority((uint16_t)nid, hostId, true)) {
+                        pausedReleasedNetId = nid;
+                        g_HostForceTable.store(true);          // tabloyu hemen yay
+                    }
+                    LOGI("[HOSTPAUSE] host oyunu durdu, aktif arac=%d sahiplik birakildi=%d",
+                         nid, (int)(pausedReleasedNetId >= 0));
+                } else if (!pausedNow && hostPaused) {
+                    hostPaused = false;
+                    LOGI("[HOSTPAUSE] host oyuna dondu (birakilan arac=%d)", pausedReleasedNetId);
+                    pausedReleasedNetId = -1;
+                    g_HostForceTable.store(true);
+                }
+            }
+
+            // Oyun dongusu duruyorsa bile (host arka planda / bildirim paneli) kisa sure "canli" say:
+            // ping ve sahiplik tablosu kesilmez, client'lar baglantidan atilmaz. Surec zorla kapatilirsa
+            // ya da duraklama cok uzarsa (HOST_PAUSE_GRACE_MS) sinyaller yine kesilir.
+            const long long sinceUpd = nowT - g_LastGameUpdateMs.load();
+            const bool hostAlive = sinceUpd < HOST_ALIVE_WINDOW_MS || (hostPaused && sinceUpd < HOST_PAUSE_GRACE_MS);
             out.clear();
             fast.clear();
             if (hostAlive && (nowT - lastPingMs) >= PING_INTERVAL_MS) {
@@ -7051,8 +7089,9 @@ static void SyncDiagFrame(uintptr_t game, uint32_t st) {
 void my_GameUpdate(void* thiz, float param_1) {
     if (g_HUDInstance != 0) RepairShopClick((void*)g_HUDInstance, "gameUpdate");   // tiklama bu karede islenmeden once
     g_LastGameUpdateMs.store(NowMs());   // host canlilik sinyali icin (oyun dongusu donarsa ping kesilir)
-    g_EngineInstance = (uintptr_t)thiz; 
-    g_CurrentMenu = MENU_INGAME; 
+    g_EngineInstance = (uintptr_t)thiz;
+    GuestBlockDialogs((uintptr_t)thiz);   // client: satis / tarla satin alma onay pencerelerini kapat
+    g_CurrentMenu = MENU_INGAME;
     MoneyFrame((uintptr_t)thiz);         // ortak para (her kare, tum oyun durumlarinda)
     {
         // Game::updateStateBase SADECE durum 6'da calisir; magaza/ayarlar (durum 7) acikken hic cagrilmaz.
@@ -7111,6 +7150,7 @@ void my_GameUpdate(void* thiz, float param_1) {
 
 void my_GameUpdateStateBase(void* thiz, float param_1, uint32_t param_2, uint32_t param_3, uint32_t param_4) {
     g_EngineInstance = (uintptr_t)thiz;
+    g_LastStateBaseMs.store(NowMs());   // dunya mantigi calisiyor (host duraklama algisi icin)
 
     // Kullanici isci (AI) dugmesine bastiysa giris cihazinda (device+0x28) bit 0x1000 yanar; oyunun kendi kodu
     // bunu bu fonksiyonun icinde temizler, bu yuzden orijinalden ONCE okunur.
@@ -7227,10 +7267,54 @@ static void AutoStartInject() {
 // Game+0x9c24'e yazilir. Logda Game+0x9c24'un bu olaylarda hep 0x42800000 (float 64.0)
 // oldugu goruldu (+0x583c ise saglam) ve buyItem bu numarayla cokuyordu.
 // Cozum: numaray oyunun kendi kaynagindan (+0x583c) geri yaz. Gecerli aralik 0..0x11.
+// ---- Client alisveris engeli ----
+// Oyun host'un; client arac/makine/alet/romork/tarla alip satamaz (host'un oyununu bozmasin).
+// Magaza olaylari (Game+0x9c20): 0x19 = satin al, 0x1a = sat (onay penceresi acar), 0x1c = satin al (IAP yolu).
+// Yeni kanca YOK: olay kodu oyunun kendi isleyicisi okumadan once 0 (olay yok) yapilir.
+static bool IsGuestInSession() {
+    return g_ClientPlaying.load() || (g_IsClient.load() && g_IsConnected.load());
+}
+static long long g_LastShopBlockToastMs = 0;
+static void GuestShopBlockToast() {
+    const long long now = NowMs();
+    if (now - g_LastShopBlockToastMs < 2000) return;
+    g_LastShopBlockToastMs = now;
+    ShowNativeToast("Only the host can buy or sell vehicles, tools and fields.");
+}
+// Onay pencereleri: 9 = tarla satin alma onayi, 0x10 = arac/alet satis onayi. Oyunun kendi "iptal"
+// koduyla ayni sey yapilir: Game+0x68 = 0 ve GUIInterfaceDesc::resetDialog (Game+0x8910) alanlari sifirlanir.
+static void GuestBlockDialogs(uintptr_t g) {
+    if (g == 0 || !IsGuestInSession()) return;
+    volatile uint32_t* dlg = (volatile uint32_t*)(g + 0x68);
+    const uint32_t d = *dlg;
+    if (d != 9 && d != 0x10) return;
+    *dlg = 0;
+    uint32_t* desc = (uint32_t*)(g + 0x8910);        // GUIInterfaceDesc::resetDialog() ile birebir ayni
+    desc[2] = 0;            // +0x08
+    desc[4] = 0xffffffffu;  // +0x10
+    desc[7] = 0;            // +0x1c
+    desc[5] = 0xffffffffu;  // +0x14
+    desc[8] = 0;            // +0x20
+    desc[6] = 0xffffffffu;  // +0x18
+    desc[9] = 0;            // +0x24
+    desc[10] = 0;           // +0x28
+    LOGI("[SHOPBLOCK] client: onay penceresi (0x%x) kapatildi", (unsigned)d);
+    GuestShopBlockToast();
+}
+
 static void RepairShopClick(void* gui, const char* where) {
     if (g_EngineInstance == 0 || gui == nullptr) return;
     const uintptr_t g = g_EngineInstance;
     if (*(volatile uint32_t*)(g + 0x64) != 7) return;        // sadece oyun ici menu
+    {
+        const uint32_t ev0 = *(volatile uint32_t*)(g + 0x9c20);
+        if ((ev0 == 0x19 || ev0 == 0x1a || ev0 == 0x1c) && IsGuestInSession()) {
+            *(volatile uint32_t*)(g + 0x9c20) = 0;           // oyun bu olayi hic gormez
+            LOGI("[SHOPBLOCK] %s: client magaza olayi 0x%x engellendi", where, (unsigned)ev0);
+            GuestShopBlockToast();
+            return;
+        }
+    }
     volatile uint32_t* selp = (volatile uint32_t*)((uintptr_t)gui + 0x583c);
     if (*selp > 0x11) {
         LOGI("[SHOP] %s: GUI secili urun bozuk: 0x%08x -> 0", where, (unsigned)*selp);
@@ -7330,7 +7414,7 @@ void* my_renderStartMenuMain(void* thiz, void* p1, void* p2, void* p3) {
 // ========================================================================
 __attribute__((constructor))
 void ModMain() {
-    LOGI(">>> MULTIPLAYER MOD STARTING <<< build=shopfix-13+bale-20hz+field-own+map-clock");
+    LOGI(">>> MULTIPLAYER MOD STARTING <<< build=shopfix-14+guest-shop-block+host-pause-release");
 
     ResetVehicleSyncState();
     std::thread(StartPONGResponderThread).detach();
