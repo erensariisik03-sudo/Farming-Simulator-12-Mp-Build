@@ -606,6 +606,9 @@ static const uint8_t PACKET_BALE_OP = 28;         // balya eklendi / silindi (to
 static const uint8_t PACKET_BALE_LIST = 29;       // host -> client: tum balyalar (yakinsama icin, degisken uzunluk)
 static const uint8_t PACKET_MAP_CLOCK = 30;       // host -> client: tarla buyume saati (Map zamanlayicisi)
 static const uint8_t PACKET_FIELD_OWN = 31;       // tarla satin alindi (sahiplik bayti 0 -> 1), host iletir
+static const uint8_t PACKET_DEMAND = 32;          // host -> client: fiyat listesi (buyuk talep, GreatDemandManager)
+static const uint8_t PACKET_MISSION = 33;         // host -> client: gorev durumu (MissionManager)
+static const uint8_t PACKET_MISSION_DONE = 34;    // client -> host: client gorevi tamamladi
 
 // Baglanti sagligi: bu sureden uzun sessizlik = karsi taraf gitti (donmus / zorla kapatilmis).
 static const long long HOST_SILENCE_TIMEOUT_MS = 10000;  // client: host'tan hicbir sey gelmedi
@@ -3304,6 +3307,208 @@ static void MapClockFrame(uintptr_t game, uint32_t st) {
     }
 }
 
+// ========================================================================
+// FIYAT LISTESI (BUYUK TALEP) + GOREVLER
+//  - Fiyat listesi: GreatDemandManager (Game+0x6d8). Alani: +0 sonraki rastgele talebe kalan sure, +4 sayi (en cok 2),
+//    +8/+0xC urun A, +0x20/+0x24 urun tipi B, +0x10/+0x14 fiyat carpani, +0x18/+0x1C kalan sure, +0x28 "yeni talep" bayragi.
+//    Carpan ayrica Map+0x724 tablosuna yazilir: tablo[(A+1)*0x80 + (B+0x16)*4] (suresi dolunca 1.0 yapilir).
+//    Host'un listesi 5 sn'de bir (degisince hemen) client'a gider; client kendi rastgele talebini URETMEZ (sayac sonsuz).
+//  - Gorev: MissionManager (Game+0x9c6c). +0xd4 durum (0 bos, 1 teklif, 2 aktif), +0xd8 zamanlayici, +0xdc esya tipi,
+//    +0xe0 bitis noktasi. Teklif/kabul host'ta; client'lara sadece "aktif gorev" (nokta, esya, kalan sure) gider.
+//    Client gorevi tamamlarsa (para oyunun kendi koduyla ortak para olarak zaten akar) host'a MISSION_DONE gider,
+//    host gorevi kapatir. Yeni kanca YOK: setMissionSpawnPoint ve cancelPending sadece CAGRILIR.
+// ========================================================================
+static const bool kSyncDemand = true;
+static const bool kSyncMission = true;
+struct __attribute__((packed)) DemandEntry { int32_t a; int32_t b; uint32_t multBits; uint32_t timerBits; };
+struct __attribute__((packed)) DemandPacket { uint8_t type; uint8_t count; DemandEntry e[2]; };
+struct __attribute__((packed)) MissionPacket { uint8_t type; uint8_t state; uint8_t item; uint8_t spawn; uint32_t timerBits; };
+struct __attribute__((packed)) MissionDonePacket { uint8_t type; uint8_t ownerId; };
+static DemandPacket g_PendingDemand;                  // g_VehicleEventMutex ile korunur
+static bool g_HasPendingDemand = false;
+static MissionPacket g_PendingMission;                // g_VehicleEventMutex ile korunur
+static bool g_HasPendingMission = false;
+static std::atomic<bool> g_MissionDoneFlag(false);    // host: bir client gorevi tamamladi
+typedef void (*Mission_setSpawn_t)(void* mm, uint32_t idx);
+typedef void (*Mission_cancel_t)(void* mm);
+static Mission_setSpawn_t g_MissionSetSpawnFn = nullptr;   // MissionManager::setMissionSpawnPoint(unsigned int)
+static Mission_cancel_t g_MissionCancelFn = nullptr;       // MissionManager::cancelPending()
+static bool g_MsPrevValid = false;
+static uint32_t g_MsPrevState = 0;
+static float g_MsPrevTimer = 0.0f;
+static long long g_MsIgnoreUntil = 0;
+static long long g_DemandSendMs = 0;
+static uint32_t g_DemandHash = 0;
+static long long g_MissionSendMs = 0;
+static int g_MsSentState = -1, g_MsSentItem = -1, g_MsSentSpawn = -1;
+
+static bool DemandSlot(uintptr_t map, int32_t a, int32_t b, volatile float** out) {
+    if (!map || a < 0 || b < 0 || b > 3) return false;
+    const uintptr_t tbl = *(volatile uintptr_t*)(map + 0x724);
+    const int32_t cnt = *(volatile int32_t*)(map + 0x728);
+    if (!tbl || cnt < 4 || a > cnt - 4) return false;
+    *out = (volatile float*)(tbl + (uintptr_t)(a + 1) * 0x80 + (uintptr_t)(b + 0x16) * 4);
+    return true;
+}
+
+// Client: host'un fiyat listesini oyunun kendi yapisina yaz (eski talepleri 1.0'a dondur, yenileri uygula).
+static void DemandApply(uintptr_t game, const DemandPacket& p) {
+    const uintptr_t gd = game + 0x6d8;
+    const uintptr_t map = *(uintptr_t*)(game + 0x704);
+    if (!map) return;
+    uint32_t oldN = *(volatile uint32_t*)(gd + 4);
+    if (oldN > 2) oldN = 0;
+    int32_t oa[2] = {-1, -1}, ob[2] = {-1, -1};
+    for (uint32_t i = 0; i < oldN; ++i) {
+        oa[i] = *(volatile int32_t*)(gd + 8 + 4 * i);
+        ob[i] = *(volatile int32_t*)(gd + 0x20 + 4 * i);
+        volatile float* s;
+        if (DemandSlot(map, oa[i], ob[i], &s)) *s = 1.0f;
+    }
+    uint32_t n = 0;
+    bool isNew = false;
+    const uint32_t cnt = p.count > 2 ? 2 : p.count;
+    for (uint32_t i = 0; i < cnt; ++i) {
+        const int32_t a = p.e[i].a, b = p.e[i].b;
+        volatile float* s;
+        if (!DemandSlot(map, a, b, &s)) continue;
+        float mult; memcpy(&mult, &p.e[i].multBits, sizeof(mult));
+        float tmr; memcpy(&tmr, &p.e[i].timerBits, sizeof(tmr));
+        if (!(mult == mult) || !(tmr == tmr) || mult < 0.0f || mult > 100.0f || tmr > 1.0e6f) continue;
+        *(volatile int32_t*)(gd + 8 + 4 * n) = a;
+        *(volatile int32_t*)(gd + 0x20 + 4 * n) = b;
+        *(volatile uint32_t*)(gd + 0x10 + 4 * n) = p.e[i].multBits;
+        *(volatile uint32_t*)(gd + 0x18 + 4 * n) = p.e[i].timerBits;
+        *s = mult;
+        bool known = false;
+        for (uint32_t k = 0; k < oldN; ++k) if (oa[k] == a && ob[k] == b) known = true;
+        if (!known) isNew = true;
+        ++n;
+    }
+    *(volatile uint32_t*)(gd + 4) = n;
+    if (isNew) *(volatile uint8_t*)(gd + 0x28) = 1;       // oyunun "yeni talep" bildirimi
+    LOGI("[DEMAND] client: host fiyat listesi uygulandi (talep=%u yeni=%d)", (unsigned)n, (int)isNew);
+}
+
+// Oyun thread'i, Game::updateStateBase orijinalinden ONCE (durum 6). Sadece client icin is yapar.
+static void MiscSyncPre(uintptr_t game) {
+    if (game == 0 || !g_IsConnected.load() || !g_IsClient.load()) { g_MsPrevValid = false; return; }
+    const uintptr_t gd = game + 0x6d8;
+    const uintptr_t mm = game + 0x9c6c;
+    if (kSyncDemand) {
+        *(volatile uint32_t*)gd = 0x7f7fffff;             // client kendi rastgele talebini uretmesin
+        DemandPacket dp; bool have = false;
+        {
+            std::lock_guard<std::mutex> lock(g_VehicleEventMutex);
+            if (g_HasPendingDemand) { dp = g_PendingDemand; g_HasPendingDemand = false; have = true; }
+        }
+        if (have) DemandApply(game, dp);
+    }
+    if (kSyncMission && g_MissionSetSpawnFn) {
+        MissionPacket mp; bool have = false;
+        {
+            std::lock_guard<std::mutex> lock(g_VehicleEventMutex);
+            if (g_HasPendingMission) { mp = g_PendingMission; g_HasPendingMission = false; have = true; }
+        }
+        const uint32_t cs = *(volatile uint32_t*)(mm + 0xd4);
+        if (have) {
+            if (mp.state == 2) {
+                float ht; memcpy(&ht, &mp.timerBits, sizeof(ht));
+                if (NowMs() >= g_MsIgnoreUntil && mp.spawn < 13 && mp.item < 5 && ht == ht && ht > 0.0f && ht < 1.0e5f) {
+                    if (cs != 2 || *(volatile uint32_t*)(mm + 0xe0) != mp.spawn || *(volatile uint32_t*)(mm + 0xdc) != mp.item) {
+                        *(volatile uint32_t*)(mm + 0xdc) = mp.item;
+                        g_MissionSetSpawnFn((void*)mm, mp.spawn);
+                        *(volatile uint32_t*)(mm + 0xd4) = 2;
+                        LOGI("[MISSION] client: host gorevi basladi nokta=%u esya=%u sure=%.0f", (unsigned)mp.spawn, (unsigned)mp.item, (double)ht);
+                    }
+                    *(volatile float*)(mm + 0xd8) = ht;   // kalan sureyi host'a esitle
+                }
+            } else if (cs == 2) {
+                *(volatile uint32_t*)(mm + 0xd4) = 0;
+                LOGI("[MISSION] client: host gorevi bitti");
+            }
+        }
+        // Client kendi gorev teklifi uretmesin: aktif degilken sayac sonsuz, teklif durumu (1) olmaz.
+        const uint32_t s2 = *(volatile uint32_t*)(mm + 0xd4);
+        if (s2 != 2) {
+            if (s2 != 0) *(volatile uint32_t*)(mm + 0xd4) = 0;
+            *(volatile float*)(mm + 0xd8) = 1.0e9f;
+        }
+        g_MsPrevState = *(volatile uint32_t*)(mm + 0xd4);
+        g_MsPrevTimer = *(volatile float*)(mm + 0xd8);
+        g_MsPrevValid = true;
+    }
+}
+
+// Oyun thread'i, Game::updateStateBase orijinalinden SONRA (durum 6).
+static void MiscSyncPost(uintptr_t game) {
+    if (game == 0 || !g_IsConnected.load()) return;
+    const uintptr_t gd = game + 0x6d8;
+    const uintptr_t mm = game + 0x9c6c;
+    const long long now = NowMs();
+    if (g_IsHost.load()) {
+        if (kSyncDemand) {
+            uint32_t n = *(volatile uint32_t*)(gd + 4);
+            if (n > 2) n = 0;
+            DemandPacket p; memset(&p, 0, sizeof(p));
+            p.type = PACKET_DEMAND; p.count = (uint8_t)n;
+            int32_t key[5]; memset(key, 0, sizeof(key)); key[0] = (int32_t)n;
+            for (uint32_t i = 0; i < n; ++i) {
+                p.e[i].a = *(volatile int32_t*)(gd + 8 + 4 * i);
+                p.e[i].b = *(volatile int32_t*)(gd + 0x20 + 4 * i);
+                p.e[i].multBits = *(volatile uint32_t*)(gd + 0x10 + 4 * i);
+                p.e[i].timerBits = *(volatile uint32_t*)(gd + 0x18 + 4 * i);
+                key[1 + i * 2] = p.e[i].a; key[2 + i * 2] = p.e[i].b;
+            }
+            uint32_t h = 2166136261u;                         // FNV-1a (Fnv1a() bu noktadan sonra tanimli)
+            for (size_t k = 0; k < sizeof(key); ++k) { h ^= ((const uint8_t*)key)[k]; h *= 16777619u; }
+            if (h != g_DemandHash || now - g_DemandSendMs >= 5000) {
+                g_DemandHash = h; g_DemandSendMs = now;
+                QueueVehicleEvent(&p, sizeof(p));
+            }
+        }
+        if (kSyncMission && g_MissionSetSpawnFn) {
+            uint32_t st = *(volatile uint32_t*)(mm + 0xd4);
+            if (g_MissionDoneFlag.exchange(false) && st == 2) {
+                // Client gorevi tamamladi: gorevi kapat ve oyunun kendi rastgele bekleme suresini kur (cancelPending: durum 1 -> 0).
+                if (g_MissionCancelFn) {
+                    *(volatile uint32_t*)(mm + 0xd4) = 1;
+                    g_MissionCancelFn((void*)mm);
+                } else {
+                    *(volatile uint32_t*)(mm + 0xd4) = 0;
+                    *(volatile float*)(mm + 0xd8) = 420.0f;
+                }
+                st = *(volatile uint32_t*)(mm + 0xd4);
+                LOGI("[MISSION] host: client gorevi tamamladi, gorev kapatildi");
+            }
+            const int s = (st == 2) ? 2 : 0;
+            const int item = (int)*(volatile uint32_t*)(mm + 0xdc);
+            const int spawn = (int)*(volatile uint32_t*)(mm + 0xe0);
+            const bool changed = (s != g_MsSentState) || (s == 2 && (item != g_MsSentItem || spawn != g_MsSentSpawn));
+            if (changed || now - g_MissionSendMs >= 3000) {
+                g_MsSentState = s; g_MsSentItem = item; g_MsSentSpawn = spawn; g_MissionSendMs = now;
+                MissionPacket p; memset(&p, 0, sizeof(p));
+                p.type = PACKET_MISSION; p.state = (uint8_t)s;
+                p.item = (uint8_t)(item < 0 || item > 255 ? 0 : item);
+                p.spawn = (uint8_t)(spawn < 0 || spawn > 255 ? 0 : spawn);
+                if (s == 2) p.timerBits = *(volatile uint32_t*)(mm + 0xd8);
+                QueueVehicleEvent(&p, sizeof(p));
+                if (changed) LOGI("[MISSION] host: durum yayinlandi state=%d nokta=%d esya=%d", s, spawn, item);
+            }
+        }
+    } else if (kSyncMission && g_MissionSetSpawnFn && g_MsPrevValid) {
+        const uint32_t cur = *(volatile uint32_t*)(mm + 0xd4);
+        // Aktif gorev bu karede "sure dolmadan" bitti = bu client tamamladi (para oyunun kendi kodundan geldi).
+        if (g_MsPrevState == 2 && cur == 0 && g_MsPrevTimer > 0.25f) {
+            MissionDonePacket p; memset(&p, 0, sizeof(p));
+            p.type = PACKET_MISSION_DONE; p.ownerId = g_LocalPlayerId.load();
+            QueueVehicleEvent(&p, sizeof(p));
+            g_MsIgnoreUntil = now + 2500;                  // host kapatana kadar eski "aktif" paketlerini yok say
+            LOGI("[MISSION] client: gorevi tamamladim, host'a bildirildi");
+        }
+    }
+}
+
 // Diger cihazdan gelen romork takma/cikarma ve durum paketlerini oyun thread'inde uygular.
 static void ApplyPendingTrailerEvents(uintptr_t game, uint8_t localOwner, uint64_t nowMs) {
     std::vector<TrailerAttachPacket> attaches;
@@ -4244,8 +4449,13 @@ static void ResetVehicleSyncState() {
         g_PendingBaleList.clear();
         g_HasPendingBaleList = false;
         g_HasPendingMapClock = false;
+        g_HasPendingDemand = false;
+        g_HasPendingMission = false;
         g_PendingFieldOwn.clear();
     }
+    g_MsPrevValid = false; g_MsIgnoreUntil = 0; g_MissionDoneFlag.store(false);
+    g_DemandHash = 0; g_DemandSendMs = 0; g_MissionSendMs = 0;
+    g_MsSentState = -1; g_MsSentItem = -1; g_MsSentSpawn = -1;
     g_OwnSnapValid = false; g_OwnMapPtr = 0;
     g_BaleTrk.clear();
     g_BaleTrkValid = false;
@@ -4535,6 +4745,9 @@ static bool ProcessPackets(uint8_t* buf, size_t& buffered, int peerId, std::vect
         else if (type == PACKET_POOL_OP) { size = sizeof(PoolOpPacket); relayIt = true; }
         else if (type == PACKET_BALE_OP) { size = sizeof(BaleOpPacket); relayIt = true; }
         else if (type == PACKET_MAP_CLOCK) size = sizeof(MapClockPacket);
+        else if (type == PACKET_DEMAND) size = sizeof(DemandPacket);
+        else if (type == PACKET_MISSION) size = sizeof(MissionPacket);
+        else if (type == PACKET_MISSION_DONE) size = sizeof(MissionDonePacket);
         else if (type == PACKET_FIELD_OWN) { size = sizeof(FieldOwnPacket); relayIt = true; }
         else if (type == PACKET_BALE_LIST) {
             if (buffered < sizeof(BaleListHeader)) break;
@@ -4786,6 +4999,20 @@ static bool ProcessPackets(uint8_t* buf, size_t& buffered, int peerId, std::vect
                 memcpy(&g_PendingMapClock, buf, sizeof(MapClockPacket));
                 g_HasPendingMapClock = true;
             }
+        } else if (type == PACKET_DEMAND) {
+            if (kSyncDemand && !g_IsHost.load() && !fromPeer) {
+                std::lock_guard<std::mutex> lock(g_VehicleEventMutex);
+                memcpy(&g_PendingDemand, buf, sizeof(DemandPacket));
+                g_HasPendingDemand = true;
+            }
+        } else if (type == PACKET_MISSION) {
+            if (kSyncMission && !g_IsHost.load() && !fromPeer) {
+                std::lock_guard<std::mutex> lock(g_VehicleEventMutex);
+                memcpy(&g_PendingMission, buf, sizeof(MissionPacket));
+                g_HasPendingMission = true;
+            }
+        } else if (type == PACKET_MISSION_DONE) {
+            if (kSyncMission && g_IsHost.load() && fromPeer) g_MissionDoneFlag.store(true);
         } else if (type == PACKET_SYNC_REQUEST) {
             if (g_IsHost.load() && fromPeer) {
                 g_HostForceTable.store(true);
@@ -7166,6 +7393,7 @@ void my_GameUpdateStateBase(void* thiz, float param_1, uint32_t param_2, uint32_
     // Balya satisi geliri: oyunun kendi guncellemesi (orijinal cagri) sirasinda kazanilan para (BaleCapture satis tespiti).
     const bool inGame6 = *(volatile uint32_t*)(g_EngineInstance + 0x64) == 6;
     const double moneyBefore = inGame6 ? ReadMoney(g_EngineInstance) : 0.0;
+    if (inGame6) MiscSyncPre(g_EngineInstance);        // client: host'un fiyat listesi + gorevi (oyun kendi rastgelesini uretmesin)
 
     if (orig_GameUpdateStateBase) {
         orig_GameUpdateStateBase(thiz, param_1, param_2, param_3, param_4);
@@ -7177,8 +7405,9 @@ void my_GameUpdateStateBase(void* thiz, float param_1, uint32_t param_2, uint32_
     // the engine to 120 FPS. We sample at up to 120 Hz when callbacks allow it,
     // and the network is independently capped at 30 snapshots/sec.
     if (*(volatile uint32_t*)(g_EngineInstance + 0x64) == 6) {
+        MiscSyncPost(g_EngineInstance);                    // host: fiyat listesi + gorev yayini | client: gorev tamamlama bildirimi
         ApplyRemoteVehicleStates(g_EngineInstance);
-        BaleFrame(g_EngineInstance);                       // CaptureAndQueueLocalVehicleState'ten ONCE (g_EntityResendAll orada silinir)
+        BaleFrame(g_EngineInstance);                     // CaptureAndQueueLocalVehicleState'ten ONCE (g_EntityResendAll orada silinir)
         CaptureAndQueueLocalVehicleState(g_EngineInstance);
         ActiveVehicleFrame(g_EngineInstance);
         HornFrame(g_EngineInstance, GetMonotonicMilliseconds());
@@ -7287,6 +7516,9 @@ static void GuestBlockDialogs(uintptr_t g) {
     if (g == 0 || !IsGuestInSession()) return;
     volatile uint32_t* dlg = (volatile uint32_t*)(g + 0x68);
     const uint32_t d = *dlg;
+    // Oyun, son kayittan 900 sn sonra "oyunu kaydet?" penceresini kendiliginden acar (Game+0xa3f8 sayaci > 900.0).
+    // Client kaydedemez: sayaci surekli sifirla, pencere hic acilmasin.
+    if (d == 0) *(volatile float*)(g + 0xa3f8) = 0.0f;
     if (d != 9 && d != 0x10) return;
     *dlg = 0;
     uint32_t* desc = (uint32_t*)(g + 0x8910);        // GUIInterfaceDesc::resetDialog() ile birebir ayni
@@ -7414,7 +7646,7 @@ void* my_renderStartMenuMain(void* thiz, void* p1, void* p2, void* p3) {
 // ========================================================================
 __attribute__((constructor))
 void ModMain() {
-    LOGI(">>> MULTIPLAYER MOD STARTING <<< build=shopfix-14+guest-shop-block+host-pause-release");
+    LOGI(">>> MULTIPLAYER MOD STARTING <<< build=shopfix-15+demand+mission+nosave-prompt");
 
     ResetVehicleSyncState();
     std::thread(StartPONGResponderThread).detach();
@@ -7536,6 +7768,11 @@ void ModMain() {
             g_MapUpdateFn = (Map_update_t)dlsym(appLib, "_ZN3Map6updateEf");
             g_MapGrowNowFn = (Map_grow_t)dlsym(appLib, "_ZN3Map13growFieldsNowEv");
             LOGI("[MAPCLK] symbols: Map::update=%p growFieldsNow=%p", (void*)g_MapUpdateFn, (void*)g_MapGrowNowFn);
+            g_MissionSetSpawnFn = (Mission_setSpawn_t)dlsym(appLib, "_ZN14MissionManager20setMissionSpawnPointEj");
+            if (!g_MissionSetSpawnFn) g_MissionSetSpawnFn = (Mission_setSpawn_t)FindElfSymbolByPrefix("libapp.so", "_ZN14MissionManager20setMissionSpawnPoint");
+            g_MissionCancelFn = (Mission_cancel_t)dlsym(appLib, "_ZN14MissionManager13cancelPendingEv");
+            if (!g_MissionCancelFn) g_MissionCancelFn = (Mission_cancel_t)FindElfSymbolByPrefix("libapp.so", "_ZN14MissionManager13cancelPending");
+            LOGI("[MISSION] symbols: setMissionSpawnPoint=%p cancelPending=%p", (void*)g_MissionSetSpawnFn, (void*)g_MissionCancelFn);
         }
         if (saveTask) {
             g_SaveStartTaskFn = saveTask;
