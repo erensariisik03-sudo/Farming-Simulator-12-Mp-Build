@@ -3017,7 +3017,7 @@ static void BaleSmoothStep(long long now) {
     s_last = now;
     if (dt < 1) dt = 1;
     if (dt > 100) dt = 100;
-    const float alpha = 1.0f - expf(-(float)dt / 40.0f);                   // ~40 ms zaman sabiti: akici ama arac kadar geride degil
+    const float alpha = 1.0f - expf(-(float)dt / 25.0f);                   // ~25 ms: hareket hedefini daha yakindan takip et
     for (size_t i = 0; i < g_BaleTrk.size(); ++i) {
         BaleTrack& t = g_BaleTrk[i];
         if (t.sensor && !t.hasTarget && now - t.remoteMs > 700) {          // uzaktan hareket bitti: yerel fizik geri gelsin
@@ -3090,10 +3090,9 @@ static void BaleApplyOp(uintptr_t game, const BaleOpPacket& op, uint8_t localOwn
         if (!cand) cand = BaleNearest(game, op.ox, op.oy, 1.5f * 1.5f);
         if (!cand) cand = BaleNearest(game, op.x, op.y, 0.6f * 0.6f);      // zaten orada
         if (!cand) return;
-        {   // Bu cihazin GERCEK araci balyayi itiyorsa kendi fizigi gecerli: uzaktan gelen hareket yok sayilir
-            BaleTrack* ct3 = BaleTrackOf(cand);
-            if (ct3 && ct3->nearMs != 0 && now - ct3->nearMs < 2500) return;
-        }
+        // Bir balyaya yakin yerel arac bulunmasi, uzaktan gelen hareketi reddetmek icin yeterli degildir.
+        // Aksi halde iki cihazdaki traktör/balya temasi ayni anda kontrol almaya calisip konumlari ayristirir.
+        // Gelen hareket sensor + hedef takibiyle uygulanir; yerel fizik ancak uzaktan kontrol sona erince geri gelir.
         BaleSetTarget(cand, op.x, op.y, op.a, now);
         if (s_moveLogs < 20) { ++s_moveLogs; LOGI("[BALE] uzaktan tasima uygulandi (%.1f,%.1f)->(%.1f,%.1f)", op.ox, op.oy, op.x, op.y); }
     }
@@ -3105,7 +3104,7 @@ static void BaleApplyOp(uintptr_t game, const BaleOpPacket& op, uint8_t localOwn
 // akisi gecerlidir ve gelen konum yerel fizigin ustune yazilir).
 static const float kBaleNearVehicleR2 = 12.0f * 12.0f;
 static const long long kBaleOwnHoldMs = 2500;                 // araci biraktiktan sonra balyanin kayip durmasi icin
-static const long long kBaleSendIntervalMs = 50;              // 20 Hz
+static const long long kBaleSendIntervalMs = 33;              // 30 Hz: balya hareketi daha dusuk gecikmeyle gitsin
 static void BaleLocalVehiclePoints(uintptr_t game, std::vector<float>* pts) {
     pts->clear();
     const uint8_t localOwner = g_LocalPlayerId.load();
@@ -3192,18 +3191,8 @@ static void BaleCapture(uintptr_t game, long long now) {
         }
         t = *old;
         t.x = c.x; t.y = c.y; t.a = c.a;
-        if (t.sensor || t.hasTarget) {                                     // uzaktan yonetilen balyaya BU cihazin gercek araci yaklasti: yerel fizik devralir
-            if (!vptsDone) { BaleLocalVehiclePoints(game, &vpts); vptsDone = true; }
-            for (size_t k = 0; k + 1 < vpts.size(); k += 2) {
-                const float vx = vpts[k] - c.x, vy = vpts[k + 1] - c.y;
-                if (vx * vx + vy * vy < 9.0f) {
-                    t.hasTarget = false;
-                    if (t.sensor) { BaleSetSensor(c.p, false); t.sensor = false; }
-                    t.nearMs = now; t.remoteMs = 0; t.sx = c.x; t.sy = c.y; t.sa = c.a;
-                    break;
-                }
-            }
-        }
+        // Yakinda yerel arac olmasi tek basina uzaktan gelen kontrolu iptal etmez.
+        // Yerel fizik/otorite, uzaktan hedef bitip sensor acildiktan sonra gercek hareketle devralinir.
         const float dx = c.x - t.sx, dy = c.y - t.sy;
         const bool moved = (dx * dx + dy * dy > 0.0004f) || GetAngleDelta(c.a, t.sa) > 0.03f;     // 2 cm / ~1.7 derece
         if (moved && !vptsDone) { BaleLocalVehiclePoints(game, &vpts); vptsDone = true; }
@@ -3214,9 +3203,9 @@ static void BaleCapture(uintptr_t game, long long now) {
             }
         }
         const bool mine = (now - t.nearMs) < kBaleOwnHoldMs;
-        if (now - t.remoteMs < 1500 || !mine) {                            // baska cihaz yonetiyor / sahibi biz degiliz: yayinlama, sadece izle
+        if (t.sensor || t.hasTarget || !mine) {                              // uzak balya aktif kontrol altindaysa yayinlama; sensor birakilinca yerel itis devralabilir
             t.sx = c.x; t.sy = c.y; t.sa = c.a;
-        } else if (moved && now - t.sentMs >= kBaleSendIntervalMs && moveBudget > 0) {   // 20 Hz; durunca son konum da gider
+        } else if (moved && now - t.sentMs >= kBaleSendIntervalMs && moveBudget > 0) {   // 30 Hz; durunca son konum da gider
             if (QueueBaleOp(3, t.sx, t.sy, c.x, c.y, c.a, 0)) {            // kuyruk doluysa sx/sentMs degismez: sonraki karede tekrar
                 t.sx = c.x; t.sy = c.y; t.sa = c.a; t.sentMs = now; --moveBudget;
             }
