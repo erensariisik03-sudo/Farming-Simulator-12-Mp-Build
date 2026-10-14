@@ -1986,6 +1986,9 @@ static uint64_t g_AiIntentMs = 0;             // bu cihazda kullanici isci (AI) 
 static int g_AiIntentVeh = -1;                // ... o anda aktif olan aracin netId'si
 static bool g_AiPrevOn[VEHICLE_SLOT_LIMIT];   // onceki karede isci acik miydi (basis yonunu anlamak icin)
 static uint64_t g_AiRestartMs[VEHICLE_SLOT_LIMIT];
+static uint64_t g_AiOriginMs[VEHICLE_SLOT_LIMIT];     // iscyi calistiran cihazdan en son "isci acik" bilgisi alinan an
+static uint64_t g_AiOrphanSince[VEHICLE_SLOT_LIMIT];  // aynali isci: sahipsiz kalma baslangici (devralma gecikmesi icin)
+static uint64_t g_AiYieldSince[VEHICLE_SLOT_LIMIT];   // gercek isci: aracin sahibi baskasi oldu (geri cekilme icin)
 static uint64_t g_AiStopHoldMs[VEHICLE_SLOT_LIMIT];   // bu cihazda kullanici iscyi durdurdu: bu ana kadar gelen ESKI "isci acik" periyodik paketleri yok sayilir
 static uint8_t g_AiRestartTries[VEHICLE_SLOT_LIMIT];
 static TrailerTrack g_ToolTrack[64];
@@ -2356,6 +2359,44 @@ static void CaptureAndQueueCombineStates(uintptr_t game, uint8_t localOwner, uin
         const bool remoteAi = c.rvalid && (c.rflags & 8) != 0;       // karsi cihaz "isci acik" diyor
 
         if (!ai && !g_AiMirrored[id]) g_AiRestartTries[id] = 0;
+
+        // ---- Isci SAHIPSIZ KALDI / SAHIP DEGISTI ----
+        // Iscyi calistiran cihaz oyunu durdurursa (ayarlar, arka plan, kopma) araci birakilir (PauseReleaseTick) ve o cihazdan
+        // artik "isci acik" bilgisi gelmez. Aynali simulasyonu olan cihazlardan biri (oyuncu numarasina gore kademeli gecikme)
+        // iscyi GERCEK isci olarak devralir ve konumu yayinlar; digerleri aracin yeni sahibini gorunce aynali kalir.
+        // Ilk cihaz geri donerse ve arac baskasina gectiyse geri cekilir (aynali olur): iki cihaz ayni araci yayinlayip titretmesin.
+        if (ai) {
+            uint8_t ow = VEHICLE_OWNER_NONE;
+            { std::lock_guard<std::mutex> lock(g_VehicleStateMutex); ow = g_VehicleAuthority[id].ownerId; }
+            if (g_AiMirrored[id]) {
+                if (ow == VEHICLE_OWNER_NONE && g_AiOriginMs[id] != 0 && (nowMs - g_AiOriginMs[id]) > 5000) {
+                    if (g_AiOrphanSince[id] == 0) g_AiOrphanSince[id] = nowMs;
+                    if (nowMs - g_AiOrphanSince[id] > 700ull * (uint64_t)(localOwner < MAX_PLAYERS ? localOwner : 0)) {
+                        g_AiMirrored[id] = false;
+                        g_AiOrphanSince[id] = 0;
+                        LOGI("[VEHSTATE] sahipsiz isci devralindi netId=%u", (unsigned)id);
+                    }
+                } else {
+                    g_AiOrphanSince[id] = 0;
+                }
+                g_AiYieldSince[id] = 0;
+            } else {
+                g_AiOrphanSince[id] = 0;
+                if (id != activeVehicleId && ow != VEHICLE_OWNER_NONE && ow != localOwner) {
+                    if (g_AiYieldSince[id] == 0) g_AiYieldSince[id] = nowMs;
+                    else if (nowMs - g_AiYieldSince[id] > 2000) {
+                        g_AiMirrored[id] = true;
+                        g_AiOriginMs[id] = nowMs;
+                        g_AiYieldSince[id] = 0;
+                        LOGI("[VEHSTATE] isci baska cihaza devredildi netId=%u yeni sahip=%u", (unsigned)id, (unsigned)ow);
+                    }
+                } else {
+                    g_AiYieldSince[id] = 0;
+                }
+            }
+        } else {
+            g_AiOrphanSince[id] = 0; g_AiYieldSince[id] = 0;
+        }
 
         // ---- Aynali isci (baska cihazin calistirdigi isci) ----
         if (g_AiMirrored[id]) {
@@ -2779,7 +2820,10 @@ struct BaleTrack {
     long long bornMs, sentMs, remoteMs;
     long long nearMs;           // bu cihazin GERCEK (yerel suruldugu) bir aracin yakininda oldugu son an
     float tx, ty, ta;           // uzaktan gelen hedef konum (yumusatma: her karede hedefe dogru yaklasir)
+    float vx, vy;               // hedefin tahmini hizi (m/s): arac hayalet olarak ileri tahmin edildigi icin balya da ileri tahmin edilir
+    long long tms;              // hedefin geldigi an
     bool hasTarget;
+    bool sensor;                // uzaktan yonetilirken yerel fizik kapali (arac balyanin icinden gecip itip firlatmasin)
 };
 struct BaleRecent { float x, y; long long ms; bool sale; bool local; bool used; double gain; };
 static std::vector<BaleTrack> g_BaleTrk;
@@ -2908,6 +2952,19 @@ static bool BaleRemoveLocal(uintptr_t game, uintptr_t p) {
     return true;
 }
 
+// Balyanin butun parcalarini (fixture) "sensor" yapar: carpisma TEPKISI olmaz (Box2D 2.1: b2Contact::Update her adimda
+// fixture+0x32 bayragini okur), ama konum/gorunum ayni kalir. Duzen (decompile'dan): b2Body+0x68 = fixture listesi,
+// fixture+0x14 = sonraki, fixture+0x32 = isSensor.
+static void BaleSetSensor(uintptr_t p, bool on) {
+    const uintptr_t body = p ? *(uintptr_t*)(p + 0x50) : 0;
+    if (!body) return;
+    const int fc = *(volatile int*)(body + 0x6C);
+    if (fc <= 0 || fc > 8) return;
+    uintptr_t f = *(uintptr_t*)(body + 0x68);
+    for (int n = 0; f != 0 && n < fc; ++n, f = *(uintptr_t*)(f + 0x14)) *(volatile uint8_t*)(f + 0x32) = on ? 1 : 0;
+    if (*(int*)body != 0) { *(uint16_t*)(body + 4) |= 2; *(float*)(body + 0x90) = 0.0f; }
+}
+
 // Uzaktan gelen tasimayi tek seferde isinlamak yerine hedef olarak isaretle; BaleSmoothStep her karede hedefe yaklastirir.
 static void BaleSetTarget(uintptr_t p, float x, float y, float a, long long now) {
     float cx, cy, ca;
@@ -2923,7 +2980,18 @@ static void BaleSetTarget(uintptr_t p, float x, float y, float a, long long now)
     BaleRemember(p, now);                                                  // iz yoksa olusturur, uzaktan yonetilen isaretler
     BaleTrack* t = BaleTrackOf(p);
     if (!t) return;
-    t->tx = x; t->ty = y; t->ta = a; t->hasTarget = true;
+    // Hiz tahmini: ardisik hedeflerden (dusuk gecirgen). Kesintiden sonra sifirdan baslar.
+    if (t->hasTarget && t->tms != 0 && now - t->tms >= 20 && now - t->tms <= 400) {
+        const float dt = (float)(now - t->tms) * 0.001f;
+        float nvx = (x - t->tx) / dt, nvy = (y - t->ty) / dt;
+        const float sp2 = nvx * nvx + nvy * nvy;
+        if (sp2 > 64.0f) { const float k = 8.0f / sqrtf(sp2); nvx *= k; nvy *= k; }   // en fazla 8 m/s
+        t->vx = 0.5f * t->vx + 0.5f * nvx; t->vy = 0.5f * t->vy + 0.5f * nvy;
+    } else {
+        t->vx = t->vy = 0.0f;
+    }
+    t->tx = x; t->ty = y; t->ta = a; t->tms = now; t->hasTarget = true;
+    if (!t->sensor) { BaleSetSensor(p, true); t->sensor = true; }
 }
 // Hedefi (op.ox, op.oy) olan, yumusatilan balyayi bul (yerel konum hedefin gerisinde kalabilir).
 static uintptr_t BaleByTarget(float ox, float oy) {
@@ -2942,18 +3010,27 @@ static void BaleSmoothStep(long long now) {
     s_last = now;
     if (dt < 1) dt = 1;
     if (dt > 100) dt = 100;
-    const float alpha = 1.0f - expf(-(float)dt / 60.0f);                   // ~60 ms zaman sabiti: 20 Hz akisi akici gosterir
+    const float alpha = 1.0f - expf(-(float)dt / 40.0f);                   // ~40 ms zaman sabiti: akici ama arac kadar geride degil
     for (size_t i = 0; i < g_BaleTrk.size(); ++i) {
         BaleTrack& t = g_BaleTrk[i];
+        if (t.sensor && !t.hasTarget && now - t.remoteMs > 700) {          // uzaktan hareket bitti: yerel fizik geri gelsin
+            BaleSetSensor(t.p, false);
+            t.sensor = false;
+        }
         if (!t.hasTarget) continue;
         float x, y, a;
-        if (!ReadBalePose(t.p, &x, &y, &a)) { t.hasTarget = false; continue; }
-        const float dx = t.tx - x, dy = t.ty - y, da = BaleWrapAngle(t.ta - a);
+        if (!ReadBalePose(t.p, &x, &y, &a)) { t.hasTarget = false; t.sensor = false; continue; }
+        float age = (float)(now - t.tms) * 0.001f;                         // hedef ne kadar once geldi: o kadar ileri tahmin (en fazla 120 ms)
+        if (now - t.tms > 250) { t.vx = t.vy = 0.0f; age = 0.0f; }
+        if (age > 0.12f) age = 0.12f;
+        const float gx = t.tx + t.vx * age, gy = t.ty + t.vy * age;
+        const float dx = gx - x, dy = gy - y, da = BaleWrapAngle(t.ta - a);
         float nx, ny, na;
-        if (dx * dx + dy * dy < 0.0004f && fabsf(da) < 0.02f) {
+        if (dx * dx + dy * dy < 0.0004f && fabsf(da) < 0.02f && t.vx == 0.0f && t.vy == 0.0f) {
             nx = t.tx; ny = t.ty; na = t.ta; t.hasTarget = false;
         } else {
             nx = x + dx * alpha; ny = y + dy * alpha; na = a + da * alpha;
+            if (now - t.tms > 3000) t.hasTarget = false;                   // olay kesildi
         }
         SetBalePose(t.p, nx, ny, na);
         t.x = t.sx = nx; t.y = t.sy = ny; t.a = t.sa = na;
@@ -3187,6 +3264,15 @@ static void BaleReconcile(uintptr_t game, const std::vector<float>& list, long l
 static void BaleFrame(uintptr_t game) {
     if (!kSyncBales || game == 0) return;
     if (!g_IsConnected.load() || !g_VehNetArmed.load() || !g_GameAddBaleFn || !g_GameRemoveBaleFn || !g_BaleDestroyFn) {
+        if (g_BaleTrkValid) {                                              // baglanti kesildi: uzaktan yonetilen balyalarin fizigini geri ac
+            const uint32_t bn = BaleCountOf(game);
+            for (size_t i = 0; i < g_BaleTrk.size(); ++i) {
+                if (!g_BaleTrk[i].sensor) continue;
+                for (uint32_t k = 0; k < bn; ++k)
+                    if (BalePtrAt(game, k) == g_BaleTrk[i].p) { BaleSetSensor(g_BaleTrk[i].p, false); break; }
+                g_BaleTrk[i].sensor = false; g_BaleTrk[i].hasTarget = false;
+            }
+        }
         g_BaleTrkValid = false;
         return;
     }
@@ -3794,6 +3880,45 @@ static void FieldSnapPauseTick() {
     }
 }
 
+// AG THREAD'i (BuildOutgoing basinda, hem host hem client). Oyun dongusu durduysa (ayarlar, dukkan, arka plan) bu cihazin
+// sahip oldugu TUM araclarin sahipligi birakilir; yoksa arac baska oyunculara kilitli kalir. Host dogrudan birakir,
+// client tek yuvali release paketiyle sirayla (yuva bosalinca bir sonraki) birakir.
+static void PauseReleaseTick() {
+    static bool s_paused = false;
+    static std::vector<uint16_t> s_q;
+    const long long now = NowMs();
+    const long long sb = g_LastStateBaseMs.load();
+    const bool paused = g_LocalInGame.load() && g_IsConnected.load() && g_VehNetArmed.load() && sb > 0 && (now - sb) > HOST_PAUSE_DETECT_MS;
+    const uint8_t me = g_LocalPlayerId.load();
+    if (paused && !s_paused) {
+        s_paused = true;
+        s_q.clear();
+        if (me < MAX_PLAYERS) {
+            std::lock_guard<std::mutex> lock(g_VehicleStateMutex);
+            for (uint16_t id = 0; id < VEHICLE_SLOT_LIMIT; ++id)
+                if (g_VehicleAuthority[id].ownerId == me) s_q.push_back(id);
+        }
+        LOGI("[PAUSE] oyun durdu: %u aracin sahipligi birakilacak", (unsigned)s_q.size());
+        if (g_IsHost.load()) {
+            for (size_t k = 0; k < s_q.size(); ++k) ReleaseVehicleAuthority(s_q[k], me, true);
+            if (!s_q.empty()) g_HostForceTable.store(true);
+            s_q.clear();
+        }
+    } else if (!paused && s_paused) {
+        s_paused = false;
+        s_q.clear();
+    }
+    if (!s_paused || s_q.empty() || g_IsHost.load()) return;
+    bool slotFree;
+    { std::lock_guard<std::mutex> lock(g_VehicleSendMutex); slotFree = !g_HasPendingReleasePacket; }
+    if (!slotFree) return;
+    const uint16_t id = s_q.back();
+    s_q.pop_back();
+    QueueVehicleRelease(id);
+    std::lock_guard<std::mutex> lock(g_VehicleStateMutex);
+    g_ClaimPending[id] = true;
+}
+
 // Diger cihazdan gelen romork takma/cikarma ve durum paketlerini oyun thread'inde uygular.
 static void ApplyPendingTrailerEvents(uintptr_t game, uint8_t localOwner, uint64_t nowMs) {
     std::vector<TrailerAttachPacket> attaches;
@@ -3913,7 +4038,11 @@ static void ApplyPendingTrailerEvents(uintptr_t game, uint8_t localOwner, uint64
             CombineTrack& c = g_CbTrack[st.id];
             // Bayraklar KENAR tetiklemeli: son bilinen durumdan (gonderdigimiz ya da aldigimiz) farkli olan bit uygulanir.
             // Boylece ayni arac iki cihazda secili olsa bile calisir, eski paket yerel degisikligi geri almaz.
-            const uint8_t rflagsNew = (uint8_t)(st.flags & kStateFlagMask);
+            uint8_t rflagsNew = (uint8_t)(st.flags & kStateFlagMask);
+            // Bu cihazda kullanici iscyi az once durdurdu: iscinin sahibinden gelen ESKI "isci acik" bilgisi (kenar olsa bile)
+            // yok sayilir; yoksa durdurma geri alinir ("cikiyor gibi olup tekrar isciye geciyor").
+            if ((rflagsNew & 8) && nowMs < g_AiStopHoldMs[st.id] && *(uint32_t*)(v + 0x730) == 0) rflagsNew = (uint8_t)(rflagsNew & ~8);
+            else if (rflagsNew & 8) g_AiOriginMs[st.id] = nowMs;                    // isciyi calistiran cihaz hala canli
             const uint8_t base = c.rvalid ? c.rflags : LocalVehicleFlags(v);
             const uint8_t diff = (uint8_t)(base ^ rflagsNew);
             if (combine && owner != localOwner) {
@@ -3937,9 +4066,9 @@ static void ApplyPendingTrailerEvents(uintptr_t game, uint8_t localOwner, uint64
                 }
             }
             if (diff & 8) {                                   // isci (AI): uzaktan baslat / durdur
-                const bool wantAi = (st.flags & 8) != 0;
+                const bool wantAi = (rflagsNew & 8) != 0;
                 const bool haveAi = *(uint32_t*)(v + 0x730) != 0;
-                if (wantAi && !haveAi && !((st.flags & kEdgeBit) == 0 && nowMs < g_AiStopHoldMs[st.id])) {   // az once biz durdurduk: eski periyodik paket yeniden baslatmasin
+                if (wantAi && !haveAi) {
                     if (kMirrorAiOnRemote && g_VehiclePrepareAiFn && g_VehicleAiStartFn) {
                         const uint32_t ok = g_VehiclePrepareAiFn((void*)v, (void*)game) & 0xFF;
                         if (ok) {
@@ -3971,8 +4100,16 @@ static void ApplyPendingTrailerEvents(uintptr_t game, uint8_t localOwner, uint64
                     }
                 } else if (!wantAi && haveAi && g_VehicleAiStopFn &&
                            ((st.flags & kEdgeBit) || g_AiMirrored[st.id])) {   // kullanici durdurdu (kenar) ya da aynali isci iscinin sahibinden durdu
+                    const bool wasMirrored = g_AiMirrored[st.id];
                     g_VehicleAiStopFn((void*)v);
                     g_AiMirrored[st.id] = false;
+                    // Iscyi bu cihaz calistiriyordu (aynali degil): yeni durumu KENAR olarak herkese duyur ki aynali simulasyonlar
+                    // durdurma istegi bu cihaza ulasmadan once gelen eski "isci acik" paketlerinden dolayi geri baslamasin.
+                    if (!wasMirrored && g_VehNetArmed.load()) {
+                        const bool cmb = *(uint8_t*)(v + 0x328) != 0;
+                        QueueEntityState(2, st.id, VehSeedSub(v), cmb ? *(uint32_t*)(v + 0x440) : 0, cmb ? *(uint32_t*)(v + 0x448) : 0,
+                                         (uint8_t)((LocalVehicleFlags(v) & ~8) | kEdgeBit));
+                    }
                     LOGI("[VEHSTATE] uzaktan isci durduruldu netId=%u", (unsigned)st.id);
                 }
             }
@@ -5353,6 +5490,7 @@ static bool ProcessPackets(uint8_t* buf, size_t& buffered, int peerId, std::vect
 // Bu cihazin gonderecegi her seyi (sohbet, sahiplik, arac anlik goruntusu) tek tamponda toplar.
 static void BuildOutgoing(std::vector<uint8_t>& out, std::vector<uint8_t>* fast = nullptr) {
     FieldSnapPauseTick();                                   // oyun durduysa son tarla durumunu yolla (duraklama devri)
+    PauseReleaseTick();                                     // oyun durduysa sahip olunan araclari birak
     {   // arac ekleme/silme olaylari (guvenilir kanal)
         std::lock_guard<std::mutex> lock(g_VehicleEventMutex);
         if (!g_VehicleEventOut.empty()) {
@@ -7967,7 +8105,7 @@ void* my_renderStartMenuMain(void* thiz, void* p1, void* p2, void* p3) {
 // ========================================================================
 __attribute__((constructor))
 void ModMain() {
-    LOGI(">>> MULTIPLAYER MOD STARTING <<< build=shopfix-19+field-pause-handoff+ai-stop");
+    LOGI(">>> MULTIPLAYER MOD STARTING <<< build=shopfix-20+pause-release+ai-takeover+bale-sensor");
 
     ResetVehicleSyncState();
     std::thread(StartPONGResponderThread).detach();
