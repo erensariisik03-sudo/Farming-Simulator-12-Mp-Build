@@ -609,6 +609,7 @@ static const uint8_t PACKET_FIELD_OWN = 31;       // tarla satin alindi (sahipli
 static const uint8_t PACKET_DEMAND = 32;          // host -> client: fiyat listesi (buyuk talep, GreatDemandManager)
 static const uint8_t PACKET_MISSION = 33;         // host -> client: gorev durumu (MissionManager)
 static const uint8_t PACKET_MISSION_DONE = 34;    // client -> host: client gorevi tamamladi
+static const uint8_t PACKET_FIELD_SNAP = 35;      // tek bir tarlanin tam durumu (ekili/bicilmis/surulmus/gubreli...), host iletir
 
 // Baglanti sagligi: bu sureden uzun sessizlik = karsi taraf gitti (donmus / zorla kapatilmis).
 static const long long HOST_SILENCE_TIMEOUT_MS = 10000;  // client: host'tan hicbir sey gelmedi
@@ -2040,8 +2041,11 @@ static void QueueEntityState(uint8_t kind, uint16_t id, uint8_t sub, uint32_t wa
     QueueVehicleEvent(&p, sizeof(p));
 }
 
+static std::atomic<long long> g_LastLocalFieldOpMs(0);    // bu cihazda en son yerel tarla islemi (hasat/ekim/isleme...)
+static std::atomic<long long> g_LastRemoteFieldOpMs(0);   // en son uzaktan gelen tarla isleminin uygulandigi an
 static void QueueFieldOp(uint32_t wtype, uint32_t wfruit, const uint32_t* pts) {
     if (!g_IsConnected.load()) return;
+    g_LastLocalFieldOpMs.store(NowMs());
     FieldOpPacket k;
     memset(&k, 0, sizeof(k));
     k.type = PACKET_FIELD_OP;
@@ -2732,6 +2736,7 @@ static void ApplyPendingFieldOps(uintptr_t game) {
         fn(map, op.p[0], op.p[1], op.p[2], op.p[3], op.p[4], op.p[5], op.p[6], op.p[7], fw);
     }
     g_ReplayingFieldOp = false;
+    g_LastRemoteFieldOpMs.store(NowMs());
     if (s_logs < 12) { ++s_logs; LOGI("[FIELD] uzaktan tarla islemi uygulandi: %u adet", (unsigned)ops.size()); }
 }
 
@@ -3505,6 +3510,182 @@ static void MiscSyncPost(uintptr_t game) {
             QueueVehicleEvent(&p, sizeof(p));
             g_MsIgnoreUntil = now + 2500;                  // host kapatana kadar eski "aktif" paketlerini yok say
             LOGI("[MISSION] client: gorevi tamamladim, host'a bildirildi");
+        }
+    }
+}
+
+// ========================================================================
+// TARLA DURUMU GORUNTUSU (saniyede bir, sadece DEGISEN tarlalar)
+// FIELD_OP paketleri (hasat/ekim/isleme alanlari) ag takilinca kaybolabiliyor (alici tamponu dolunca en eski islemler
+// silinir, arac isinlaninca aradaki alan hic islenmez). Bu bir guvenlik agi: oyunun tarla verisi her Field icin iki bit
+// dizisidir (Field+4: 32x32 hucre x 3 bit = 384 bayt, Field+0x14: 8x8 x 6 bit = 48 bayt; BitVector = {veri*, bit, bayt, bayrak}).
+// Tarama: Map+0x18 GridCell dizisi (sayac Map+0x24, hucre 100 bayt, hucre+0x48 = Field*). Her tarlanin ozeti (FNV-1a) tutulur;
+// ozeti degisen tarla tam olarak (432 bayt) yollanir, alici Field::deserialize(false) ile uygular (doku/vertex'i oyun kendisi yeniler).
+//  - Host: yakin zamanda tarla islemi olduysa degisen tarlalari yollar (buyume tek basina degisikligi yollamaz); ayrica saniyede
+//    1-3 tarlayi sirayla yeniden yollar (yavas tam tarama = kendini onaran).
+//  - Client: sadece KENDI islem yaptigi tarlalari host'a yollar (host diger client'lara iletir). Host'un goruntusunu uygular,
+//    ama kendisinin son 1.5 sn'de degistirdigi tarlayi atlar (kendi hasadi geri sarilmasin).
+// Yeni kanca YOK: sadece Field::deserialize CAGRILIR.
+// ========================================================================
+static const bool kSyncFieldSnap = true;
+static const uint32_t kFsB1 = 384, kFsB2 = 48;
+struct __attribute__((packed)) FieldSnapPacket { uint8_t type; uint8_t ownerId; uint16_t idx; uint8_t d[kFsB1 + kFsB2]; };
+static std::vector<FieldSnapPacket> g_PendingFieldSnaps;      // g_VehicleEventMutex ile korunur
+typedef uint8_t* (*Field_deserialize_t)(void* field, uint8_t* buf, bool full);
+static Field_deserialize_t g_FieldDeserFn = nullptr;          // Field::deserialize(unsigned char*, bool)
+static const uint32_t kFsMaxCells = 4096;
+static uint32_t g_FsKnown[kFsMaxCells];                       // son yollanan / uygulanan / kabul edilen ozet
+static long long g_FsLocalMs[kFsMaxCells];                    // bu tarlada yerel degisiklik gorulen son an
+static bool g_FsQueued[kFsMaxCells];
+static std::vector<uint16_t> g_FsSendQ;
+static uintptr_t g_FsMap = 0;
+static bool g_FsValid = false;
+static long long g_FsScanMs = 0;
+static uint32_t g_FsRoundRobin = 0;
+static bool g_FsBad = false;
+
+static uintptr_t FsFieldAt(uintptr_t map, uint32_t i) {
+    const uintptr_t cells = *(volatile uintptr_t*)(map + 0x18);
+    const uint32_t cnt = *(volatile uint32_t*)(map + 0x24);
+    if (!cells || i >= cnt || i >= kFsMaxCells) return 0;
+    return *(volatile uintptr_t*)(cells + (uintptr_t)i * 100 + 0x48);
+}
+// Tarlanin iki bit dizisini d[432]'ye kopyalar; boyutlar beklenenle uyusmazsa false.
+static bool FsRead(uintptr_t f, uint8_t* d) {
+    const uint8_t* d1 = *(volatile uint8_t* volatile*)(f + 4);
+    const uint32_t n1 = *(volatile uint32_t*)(f + 0xC);
+    const uint8_t* d2 = *(volatile uint8_t* volatile*)(f + 0x14);
+    const uint32_t n2 = *(volatile uint32_t*)(f + 0x1C);
+    if (!d1 || !d2 || n1 != kFsB1 || n2 != kFsB2) return false;
+    memcpy(d, d1, kFsB1);
+    memcpy(d + kFsB1, d2, kFsB2);
+    return true;
+}
+static uint32_t FsHash(const uint8_t* d) {
+    uint32_t h = 2166136261u;
+    for (uint32_t k = 0; k < kFsB1 + kFsB2; ++k) { h ^= d[k]; h *= 16777619u; }
+    return h;
+}
+static bool QueueFieldSnap(uint16_t idx, const uint8_t* d) {
+    if (!g_IsConnected.load()) return false;
+    FieldSnapPacket p; memset(&p, 0, sizeof(p));
+    p.type = PACKET_FIELD_SNAP; p.ownerId = g_LocalPlayerId.load(); p.idx = idx;
+    memcpy(p.d, d, sizeof(p.d));
+    std::lock_guard<std::mutex> lock(g_VehicleEventMutex);
+    if (g_FieldOpOut.size() > 5000) return false;          // tampon dolu: sonraki saniyede tekrar dene
+    const uint8_t* b = (const uint8_t*)&p;
+    g_FieldOpOut.insert(g_FieldOpOut.end(), b, b + sizeof(p));
+    return true;
+}
+
+// Oyun thread'i, durum 6 (Game::updateStateBase sonrasi).
+static void FieldSnapFrame(uintptr_t game) {
+    if (!kSyncFieldSnap || game == 0 || g_FsBad) return;
+    if (!g_IsConnected.load() || !g_FieldDeserFn) { g_FsValid = false; return; }
+    const uintptr_t map = *(uintptr_t*)(game + 0x704);
+    if (!map) { g_FsValid = false; return; }
+    const long long now = NowMs();
+    const bool host = g_IsHost.load();
+    if (map != g_FsMap) { g_FsMap = map; g_FsValid = false; }
+    const uint32_t cnt = *(volatile uint32_t*)(map + 0x24);
+    if (cnt == 0 || cnt > kFsMaxCells) return;
+
+    // 1) Uzaktan gelen tarla goruntulerini uygula.
+    std::vector<FieldSnapPacket> snaps;
+    {
+        std::lock_guard<std::mutex> lock(g_VehicleEventMutex);
+        snaps.swap(g_PendingFieldSnaps);
+    }
+    if (g_FsValid && !snaps.empty()) {
+        uint32_t applied = 0;
+        for (size_t k = 0; k < snaps.size(); ++k) {
+            FieldSnapPacket& sp = snaps[k];
+            const uintptr_t f = FsFieldAt(map, sp.idx);
+            if (!f) continue;
+            uint8_t cur[kFsB1 + kFsB2];
+            if (!FsRead(f, cur)) continue;
+            const uint32_t curH = FsHash(cur);
+            if (curH == FsHash(sp.d)) { g_FsKnown[sp.idx] = curH; continue; }
+            // Bu cihaz bu tarlada az once calisti (henuz yollanmamis yerel degisiklik var ya da son 1.5 sn'de yollandi): kendi durumu kalsin.
+            if (curH != g_FsKnown[sp.idx] || now - g_FsLocalMs[sp.idx] < 1500) continue;
+            g_FieldDeserFn((void*)f, sp.d, false);
+            uint8_t after[kFsB1 + kFsB2];
+            if (FsRead(f, after)) g_FsKnown[sp.idx] = FsHash(after);      // yerel degisiklik sanilip geri yollanmasin
+            ++applied;
+        }
+        if (applied) {
+            static int s_logs = 0;
+            if (s_logs < 20) { ++s_logs; LOGI("[FIELDSNAP] %u tarla goruntusu uygulandi", (unsigned)applied); }
+        }
+    }
+
+    // 2) Saniyede bir tarama: degisen tarlalari bul ve gonder.
+    if (now - g_FsScanMs < 1000) return;
+    g_FsScanMs = now;
+    if (!g_FsValid) {
+        uint32_t found = 0;
+        for (uint32_t i = 0; i < cnt; ++i) {
+            g_FsKnown[i] = 0; g_FsLocalMs[i] = 0; g_FsQueued[i] = false;
+            const uintptr_t f = FsFieldAt(map, i);
+            if (!f) continue;
+            uint8_t d[kFsB1 + kFsB2];
+            if (!FsRead(f, d)) { if (found == 0) { LOGI("[FIELDSNAP] beklenmeyen Field bit dizisi boyutu: ozellik kapatildi"); g_FsBad = true; return; } continue; }
+            g_FsKnown[i] = FsHash(d);
+            ++found;
+        }
+        g_FsSendQ.clear();
+        g_FsValid = true;
+        LOGI("[FIELDSNAP] hazir: %u tarla (hucre sayisi=%u) rol=%s", (unsigned)found, (unsigned)cnt, host ? "host" : "client");
+        return;
+    }
+    const long long lastWork = std::max(g_LastLocalFieldOpMs.load(), g_LastRemoteFieldOpMs.load());
+    const bool workRecent = (now - lastWork) < 5000;
+    const bool localRecent = (now - g_LastLocalFieldOpMs.load()) < 4000;
+    for (uint32_t i = 0; i < cnt; ++i) {
+        const uintptr_t f = FsFieldAt(map, i);
+        if (!f) continue;
+        uint8_t d[kFsB1 + kFsB2];
+        if (!FsRead(f, d)) continue;
+        const uint32_t h = FsHash(d);
+        if (h == g_FsKnown[i]) continue;
+        if (host) {
+            if (workRecent) {                                              // islem sirasinda degisti: yayinla
+                g_FsLocalMs[i] = now;
+                if (!g_FsQueued[i]) { g_FsQueued[i] = true; g_FsSendQ.push_back((uint16_t)i); }
+            } else {
+                g_FsKnown[i] = h;                                          // buyume vb.: herkeste zaten ayni ilerler; yavas tarama duzeltir
+            }
+        } else {
+            if (localRecent) {                                             // bu client'in kendi isi: host'a yolla
+                g_FsLocalMs[i] = now;
+                if (!g_FsQueued[i]) { g_FsQueued[i] = true; g_FsSendQ.push_back((uint16_t)i); }
+            } else {
+                g_FsKnown[i] = h;
+            }
+        }
+    }
+    uint32_t budget = 12;
+    while (budget > 0 && !g_FsSendQ.empty()) {
+        const uint16_t i = g_FsSendQ.front();
+        const uintptr_t f = FsFieldAt(map, i);
+        uint8_t d[kFsB1 + kFsB2];
+        if (!f || !FsRead(f, d)) { g_FsQueued[i] = false; g_FsSendQ.erase(g_FsSendQ.begin()); continue; }
+        if (!QueueFieldSnap(i, d)) break;                                  // tampon dolu: kuyrukta kalsin
+        g_FsKnown[i] = FsHash(d);
+        g_FsQueued[i] = false;
+        g_FsSendQ.erase(g_FsSendQ.begin());
+        --budget;
+    }
+    // Host: yavas tam tarama (iste bos olsun, islem varken biraz hizli): kayip paket / fark kendini onarir.
+    if (host && g_FsSendQ.empty()) {
+        const uint32_t n = workRecent ? 3 : 1;
+        for (uint32_t k = 0, sent = 0; k < cnt && sent < n; ++k) {
+            g_FsRoundRobin = (g_FsRoundRobin + 1) % cnt;
+            const uintptr_t f = FsFieldAt(map, g_FsRoundRobin);
+            if (!f) continue;
+            uint8_t d[kFsB1 + kFsB2];
+            if (!FsRead(f, d)) continue;
+            if (QueueFieldSnap((uint16_t)g_FsRoundRobin, d)) { g_FsKnown[g_FsRoundRobin] = FsHash(d); ++sent; }
         }
     }
 }
@@ -4451,8 +4632,10 @@ static void ResetVehicleSyncState() {
         g_HasPendingMapClock = false;
         g_HasPendingDemand = false;
         g_HasPendingMission = false;
+        g_PendingFieldSnaps.clear();
         g_PendingFieldOwn.clear();
     }
+    g_FsValid = false; g_FsMap = 0; g_FsScanMs = 0; g_FsSendQ.clear();
     g_MsPrevValid = false; g_MsIgnoreUntil = 0; g_MissionDoneFlag.store(false);
     g_DemandHash = 0; g_DemandSendMs = 0; g_MissionSendMs = 0;
     g_MsSentState = -1; g_MsSentItem = -1; g_MsSentSpawn = -1;
@@ -4745,6 +4928,7 @@ static bool ProcessPackets(uint8_t* buf, size_t& buffered, int peerId, std::vect
         else if (type == PACKET_POOL_OP) { size = sizeof(PoolOpPacket); relayIt = true; }
         else if (type == PACKET_BALE_OP) { size = sizeof(BaleOpPacket); relayIt = true; }
         else if (type == PACKET_MAP_CLOCK) size = sizeof(MapClockPacket);
+        else if (type == PACKET_FIELD_SNAP) { size = sizeof(FieldSnapPacket); relayIt = true; }
         else if (type == PACKET_DEMAND) size = sizeof(DemandPacket);
         else if (type == PACKET_MISSION) size = sizeof(MissionPacket);
         else if (type == PACKET_MISSION_DONE) size = sizeof(MissionDonePacket);
@@ -4998,6 +5182,20 @@ static bool ProcessPackets(uint8_t* buf, size_t& buffered, int peerId, std::vect
                 std::lock_guard<std::mutex> lock(g_VehicleEventMutex);
                 memcpy(&g_PendingMapClock, buf, sizeof(MapClockPacket));
                 g_HasPendingMapClock = true;
+            }
+        } else if (type == PACKET_FIELD_SNAP) {
+            FieldSnapPacket sp;
+            memcpy(&sp, buf, sizeof(sp));
+            if (fromPeer) { sp.ownerId = (uint8_t)peerId; memcpy(buf, &sp, sizeof(sp)); }
+            if (kSyncFieldSnap && sp.ownerId != g_LocalPlayerId.load() && sp.idx < kFsMaxCells) {
+                std::lock_guard<std::mutex> lock(g_VehicleEventMutex);
+                bool replaced = false;
+                for (size_t k = 0; k < g_PendingFieldSnaps.size(); ++k)
+                    if (g_PendingFieldSnaps[k].idx == sp.idx) { g_PendingFieldSnaps[k] = sp; replaced = true; break; }
+                if (!replaced) {
+                    if (g_PendingFieldSnaps.size() >= 200) g_PendingFieldSnaps.erase(g_PendingFieldSnaps.begin());
+                    g_PendingFieldSnaps.push_back(sp);
+                }
             }
         } else if (type == PACKET_DEMAND) {
             if (kSyncDemand && !g_IsHost.load() && !fromPeer) {
@@ -7405,6 +7603,7 @@ void my_GameUpdateStateBase(void* thiz, float param_1, uint32_t param_2, uint32_
     // the engine to 120 FPS. We sample at up to 120 Hz when callbacks allow it,
     // and the network is independently capped at 30 snapshots/sec.
     if (*(volatile uint32_t*)(g_EngineInstance + 0x64) == 6) {
+        FieldSnapFrame(g_EngineInstance);                  // tarla durumu goruntusu (saniyede bir, sadece degisenler)
         MiscSyncPost(g_EngineInstance);                    // host: fiyat listesi + gorev yayini | client: gorev tamamlama bildirimi
         ApplyRemoteVehicleStates(g_EngineInstance);
         BaleFrame(g_EngineInstance);                     // CaptureAndQueueLocalVehicleState'ten ONCE (g_EntityResendAll orada silinir)
@@ -7646,7 +7845,7 @@ void* my_renderStartMenuMain(void* thiz, void* p1, void* p2, void* p3) {
 // ========================================================================
 __attribute__((constructor))
 void ModMain() {
-    LOGI(">>> MULTIPLAYER MOD STARTING <<< build=shopfix-15+demand+mission+nosave-prompt");
+    LOGI(">>> MULTIPLAYER MOD STARTING <<< build=shopfix-16+field-snapshot");
 
     ResetVehicleSyncState();
     std::thread(StartPONGResponderThread).detach();
@@ -7773,6 +7972,9 @@ void ModMain() {
             g_MissionCancelFn = (Mission_cancel_t)dlsym(appLib, "_ZN14MissionManager13cancelPendingEv");
             if (!g_MissionCancelFn) g_MissionCancelFn = (Mission_cancel_t)FindElfSymbolByPrefix("libapp.so", "_ZN14MissionManager13cancelPending");
             LOGI("[MISSION] symbols: setMissionSpawnPoint=%p cancelPending=%p", (void*)g_MissionSetSpawnFn, (void*)g_MissionCancelFn);
+            g_FieldDeserFn = (Field_deserialize_t)dlsym(appLib, "_ZN5Field11deserializeEPhb");
+            if (!g_FieldDeserFn) g_FieldDeserFn = (Field_deserialize_t)FindElfSymbolByPrefix("libapp.so", "_ZN5Field11deserialize");
+            LOGI("[FIELDSNAP] symbols: Field::deserialize=%p", (void*)g_FieldDeserFn);
         }
         if (saveTask) {
             g_SaveStartTaskFn = saveTask;
