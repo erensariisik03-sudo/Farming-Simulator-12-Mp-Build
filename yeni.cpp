@@ -3552,9 +3552,9 @@ static uintptr_t FsFieldAt(uintptr_t map, uint32_t i) {
 }
 // Tarlanin iki bit dizisini d[432]'ye kopyalar; boyutlar beklenenle uyusmazsa false.
 static bool FsRead(uintptr_t f, uint8_t* d) {
-    const uint8_t* d1 = *(volatile uint8_t* volatile*)(f + 4);
+    const uint8_t* d1 = (const uint8_t*)*(volatile uintptr_t*)(f + 4);
     const uint32_t n1 = *(volatile uint32_t*)(f + 0xC);
-    const uint8_t* d2 = *(volatile uint8_t* volatile*)(f + 0x14);
+    const uint8_t* d2 = (const uint8_t*)*(volatile uintptr_t*)(f + 0x14);
     const uint32_t n2 = *(volatile uint32_t*)(f + 0x1C);
     if (!d1 || !d2 || n1 != kFsB1 || n2 != kFsB2) return false;
     memcpy(d, d1, kFsB1);
