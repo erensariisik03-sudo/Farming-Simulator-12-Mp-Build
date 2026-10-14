@@ -609,6 +609,9 @@ static const uint8_t PACKET_FIELD_OWN = 31;       // tarla satin alindi (sahipli
 static const uint8_t PACKET_DEMAND = 32;          // host -> client: fiyat listesi (buyuk talep, GreatDemandManager)
 static const uint8_t PACKET_MISSION = 33;         // host -> client: gorev durumu (MissionManager)
 static const uint8_t PACKET_MISSION_DONE = 34;    // client -> host: client gorevi tamamladi
+static const uint8_t PACKET_RESUME = 36;          // client -> host: oyun arka plandan / ayarlardan dondu: son tarla durumu + arac konumlarini gonder
+static const uint8_t PACKET_HOST_RESUME = 37;     // host -> client'lar: host oyuna dondu: son tarla durumu + arac konumlarini gonderin
+static const uint8_t PACKET_REST_POSE = 38;       // duran (sahipsiz) araclarin son konumlari (degisken uzunluk, iletilmez)
 static const uint8_t PACKET_FIELD_SNAP = 35;      // tek bir tarlanin tam durumu (ekili/bicilmis/surulmus/gubreli...), host iletir
 
 // Baglanti sagligi: bu sureden uzun sessizlik = karsi taraf gitti (donmus / zorla kapatilmis).
@@ -2355,6 +2358,10 @@ static void CaptureAndQueueCombineStates(uintptr_t game, uint8_t localOwner, uin
         bool ai = *(uint32_t*)(v + 0x730) != 0;
         const bool prevOn = g_AiPrevOn[id];
         g_AiPrevOn[id] = ai;
+        // Ekrandaki HUD dugmesi cihaz biti (0x1000) DEGIL GUI olayi 4 uretir (Game::handleIngameGuiEvent -> aiHelperEvent);
+        // bu yuzden niyet ayrica "aktif aracin isci durumu bu karede degisti" ile de anlasilir (oyun kendi dugme kodunu calistirdi).
+        // Uzaktan uygulanan degisiklikler g_AiPrevOn'u kendisi gunceller, o yuzden kullanici sanilmaz.
+        if (id == activeVehicleId && ai != prevOn) { g_AiIntentVeh = (int)id; g_AiIntentMs = nowMs; }
         const bool intent = (g_AiIntentVeh == (int)id) && (nowMs - g_AiIntentMs) < 1500;
         const bool remoteAi = c.rvalid && (c.rflags & 8) != 0;       // karsi cihaz "isci acik" diyor
 
@@ -3083,6 +3090,10 @@ static void BaleApplyOp(uintptr_t game, const BaleOpPacket& op, uint8_t localOwn
         if (!cand) cand = BaleNearest(game, op.ox, op.oy, 1.5f * 1.5f);
         if (!cand) cand = BaleNearest(game, op.x, op.y, 0.6f * 0.6f);      // zaten orada
         if (!cand) return;
+        {   // Bu cihazin GERCEK araci balyayi itiyorsa kendi fizigi gecerli: uzaktan gelen hareket yok sayilir
+            BaleTrack* ct3 = BaleTrackOf(cand);
+            if (ct3 && ct3->nearMs != 0 && now - ct3->nearMs < 2500) return;
+        }
         BaleSetTarget(cand, op.x, op.y, op.a, now);
         if (s_moveLogs < 20) { ++s_moveLogs; LOGI("[BALE] uzaktan tasima uygulandi (%.1f,%.1f)->(%.1f,%.1f)", op.ox, op.oy, op.x, op.y); }
     }
@@ -3181,6 +3192,18 @@ static void BaleCapture(uintptr_t game, long long now) {
         }
         t = *old;
         t.x = c.x; t.y = c.y; t.a = c.a;
+        if (t.sensor || t.hasTarget) {                                     // uzaktan yonetilen balyaya BU cihazin gercek araci yaklasti: yerel fizik devralir
+            if (!vptsDone) { BaleLocalVehiclePoints(game, &vpts); vptsDone = true; }
+            for (size_t k = 0; k + 1 < vpts.size(); k += 2) {
+                const float vx = vpts[k] - c.x, vy = vpts[k + 1] - c.y;
+                if (vx * vx + vy * vy < 9.0f) {
+                    t.hasTarget = false;
+                    if (t.sensor) { BaleSetSensor(c.p, false); t.sensor = false; }
+                    t.nearMs = now; t.remoteMs = 0; t.sx = c.x; t.sy = c.y; t.sa = c.a;
+                    break;
+                }
+            }
+        }
         const float dx = c.x - t.sx, dy = c.y - t.sy;
         const bool moved = (dx * dx + dy * dy > 0.0004f) || GetAngleDelta(c.a, t.sa) > 0.03f;     // 2 cm / ~1.7 derece
         if (moved && !vptsDone) { BaleLocalVehiclePoints(game, &vpts); vptsDone = true; }
@@ -3244,7 +3267,7 @@ static void BaleReconcile(uintptr_t game, const std::vector<float>& list, long l
         lmatched[best] = 1;
         if (bd > 0.35f * 0.35f) {                                                  // eslesti ama yeri farkli
             BaleTrack* t = BaleTrackOf(locals[best]);
-            if (t && !t->hasTarget && now - t->sentMs > 1500 && now - t->remoteMs > 1500) { SetBalePose(locals[best], hx, hy, ha); BaleRemember(locals[best], now); ++fixes; }
+            if (t && !t->hasTarget && !(t->nearMs != 0 && now - t->nearMs < 2500) && now - t->sentMs > 1500 && now - t->remoteMs > 1500) { SetBalePose(locals[best], hx, hy, ha); BaleRemember(locals[best], now); ++fixes; }
         }
     }
     for (size_t k = 0; k < unmatchedHost.size() && adds < 6; ++k) {
@@ -3716,6 +3739,8 @@ static std::atomic<uintptr_t> g_FsMap(0);
 static std::atomic<bool> g_FsValid(false);
 static long long g_FsScanMs = 0;
 static bool g_FsBad = false;
+static std::atomic<bool> g_FsResendAll(false);                // geri donen cihaz icin: TUM tarlalari tekrar yolla
+static std::vector<uint16_t> g_FsResendQ;                     // sadece oyun thread'i
 static uint32_t g_FsStatSent = 0, g_FsStatApplied = 0, g_FsStatRecv = 0, g_FsStatSkipped = 0;
 
 static uintptr_t FsFieldAt(uintptr_t map, uint32_t i) {
@@ -3794,6 +3819,21 @@ static void FieldSnapFrame(uintptr_t game) {
         LOGI("[FIELDSNAP] duraklama devri alindi=%u uygulanan=%u atlanan=%u (yerel is sessiz=%d)", (unsigned)snaps.size(),
              (unsigned)g_FsStatApplied, (unsigned)g_FsStatSkipped, (int)quiet);
         g_FsStatApplied = g_FsStatSkipped = 0;
+    }
+
+    // 1b) Geri donen (arka plandan / ayarlardan) cihaz icin tum tarlalari kare basina birkac tane yolla.
+    if (g_FsValid.load() && g_FsResendAll.exchange(false)) {
+        std::lock_guard<std::mutex> lock(g_FsMutex);
+        g_FsResendQ = g_FsFields;
+        LOGI("[FIELDSNAP] geri donen cihaz icin %u tarla yollanacak", (unsigned)g_FsResendQ.size());
+    }
+    for (int n = 0; n < 6 && !g_FsResendQ.empty(); ++n) {
+        const uint16_t i = g_FsResendQ.back();
+        const uintptr_t f = FsFieldAt(map, i);
+        uint8_t d[kFsB1 + kFsB2];
+        if (!f || !FsRead(f, d)) { g_FsResendQ.pop_back(); continue; }
+        if (!QueueFieldSnap(i, d)) break;                                  // tampon dolu: sonraki karede
+        g_FsResendQ.pop_back();
     }
 
     // 2) Saniyede bir YEREL tarama: bu cihazin son zamanlarda isledigi tarlalari isaretle.
@@ -3917,6 +3957,92 @@ static void PauseReleaseTick() {
     QueueVehicleRelease(id);
     std::lock_guard<std::mutex> lock(g_VehicleStateMutex);
     g_ClaimPending[id] = true;
+}
+
+// ========================================================================
+// GERI DONUS (RESUME) SENKRONU
+// Oyun arka plana atilinca (ya da ayarlar uzun acik kalinca) bu cihazda her sey durur; bu sirada tarla islemleri / arac
+// konumlari kacirilir. Oyun tekrar calismaya basladigi an (updateStateBase bosluktan sonra ilk kez calisir):
+//  - client: host'tan "son tarla durumu + duran araclarin son konumlari" ister (PACKET_RESUME),
+//  - host: client'lardan ayni seyi ister (PACKET_HOST_RESUME).
+// Cevap veren cihaz TUM tarlalarini (FIELD_SNAP) ve sahipsiz araclarinin konumunu (REST_POSE) yollar.
+// ========================================================================
+struct __attribute__((packed)) RestPoseHeader { uint8_t type; uint8_t count; };
+struct __attribute__((packed)) RestPoseEntry { uint16_t id; float x, y, a; };
+static const uint32_t kRestPoseMax = 32;
+static std::atomic<bool> g_RestResendAll(false);
+static std::vector<RestPoseEntry> g_PendingRestPoses;          // g_VehicleEventMutex ile korunur
+
+static void SendRestPoses(uintptr_t game) {
+    uint8_t buf[sizeof(RestPoseHeader) + kRestPoseMax * sizeof(RestPoseEntry)];
+    RestPoseHeader h; h.type = PACKET_REST_POSE; h.count = 0;
+    size_t off = sizeof(h);
+    const uint32_t vn = VehicleCount(game);
+    for (uint32_t i = 0; i < vn && h.count < kRestPoseMax; ++i) {
+        const uintptr_t v = RawVehicleSlot(game, i);
+        if (!v) continue;
+        const int nid = NetIdOfVehicle(v);
+        if (nid < 0) continue;
+        uint8_t owner;
+        { std::lock_guard<std::mutex> lock(g_VehicleStateMutex); owner = g_VehicleAuthority[nid].ownerId; }
+        if (owner != VEHICLE_OWNER_NONE) continue;                         // sahipli arac normal akisla gelir
+        const uintptr_t body = *(uintptr_t*)(v + 0x528);
+        if (!body) continue;
+        RestPoseEntry e;
+        e.id = (uint16_t)nid; e.x = *(float*)(body + 0x0C); e.y = *(float*)(body + 0x10); e.a = *(float*)(body + 0x40);
+        if (!(e.x == e.x) || !(e.y == e.y) || !(e.a == e.a)) continue;
+        memcpy(buf + off, &e, sizeof(e));
+        off += sizeof(e); ++h.count;
+    }
+    if (h.count == 0) return;
+    memcpy(buf, &h, sizeof(h));
+    QueueVehicleEvent(buf, off);
+    LOGI("[RESUME] %u sahipsiz aracin konumu yollandi", (unsigned)h.count);
+}
+
+static void ApplyRestPoses(uintptr_t game) {
+    std::vector<RestPoseEntry> poses;
+    {
+        std::lock_guard<std::mutex> lock(g_VehicleEventMutex);
+        poses.swap(g_PendingRestPoses);
+    }
+    if (poses.empty() || !g_b2BodySetTransform) return;
+    int applied = 0;
+    for (size_t k = 0; k < poses.size(); ++k) {
+        const RestPoseEntry& e = poses[k];
+        if (e.id >= VEHICLE_SLOT_LIMIT || !(e.x == e.x) || !(e.y == e.y) || !(e.a == e.a)) continue;
+        if (fabsf(e.x) > 1.0e5f || fabsf(e.y) > 1.0e5f) continue;
+        uint8_t owner;
+        { std::lock_guard<std::mutex> lock(g_VehicleStateMutex); owner = g_VehicleAuthority[e.id].ownerId; }
+        if (owner != VEHICLE_OWNER_NONE) continue;                         // sahibi var: konumunu sahibi belirler
+        if ((int)e.id == *(volatile int*)&g_LocalActiveNetId) continue;    // bu cihazda surulen arac
+        const uintptr_t v = GetVehicleFromIndex(game, e.id);
+        if (!v || *(uint32_t*)(v + 0x730) != 0) continue;                  // isci calisan araca dokunma
+        const uintptr_t body = *(uintptr_t*)(v + 0x528);
+        if (!body) continue;
+        const float dx = *(float*)(body + 0x0C) - e.x, dy = *(float*)(body + 0x10) - e.y;
+        if (dx * dx + dy * dy < 0.09f && GetAngleDelta(*(float*)(body + 0x40), e.a) < 0.05f) continue;
+        TestB2Vec2 pos; pos.x = e.x; pos.y = e.y;
+        g_b2BodySetTransform((void*)body, &pos, e.a);
+        SetRemoteBodyVelocity(body, 0.0f, 0.0f, 0.0f);
+        ++applied;
+    }
+    if (applied) LOGI("[RESUME] %d aracin son konumu uygulandi", applied);
+}
+
+// Oyun thread'i, durum 6, her karede.
+static void ResumeSyncFrame(uintptr_t game) {
+    if (g_RestResendAll.exchange(false)) SendRestPoses(game);
+    ApplyRestPoses(game);
+}
+
+// my_GameUpdateStateBase basinda, bosluk suresiyle cagrilir (updateStateBase bu kadar ms calismadi).
+static void OnGameResumed(long long gapMs) {
+    if (!g_IsConnected.load() || !g_VehNetArmed.load()) return;
+    LOGI("[RESUME] oyun geri dondu (bosluk=%lld ms) rol=%s", gapMs, g_IsHost.load() ? "host" : "client");
+    const uint8_t t = g_IsHost.load() ? PACKET_HOST_RESUME : PACKET_RESUME;
+    QueueVehicleEvent(&t, 1);
+    if (!g_IsHost.load()) g_SyncRequestOut.store(true);
 }
 
 // Diger cihazdan gelen romork takma/cikarma ve durum paketlerini oyun thread'inde uygular.
@@ -4073,6 +4199,7 @@ static void ApplyPendingTrailerEvents(uintptr_t game, uint8_t localOwner, uint64
                         const uint32_t ok = g_VehiclePrepareAiFn((void*)v, (void*)game) & 0xFF;
                         if (ok) {
                             g_VehicleAiStartFn((void*)v, (void*)game);
+                            g_AiPrevOn[st.id] = *(uint32_t*)(v + 0x730) != 0;     // uzaktan baslatma: kullanici basisi sanilmasin
                             g_AiMirrored[st.id] = true;
                             g_AiRestartTries[st.id] = 0;
                             // Araci bu cihaz suruyordu (sahibi bu cihaz): yetkiyi birak ki iscyi baslatan cihaz konumu yayinlasin.
@@ -4102,6 +4229,7 @@ static void ApplyPendingTrailerEvents(uintptr_t game, uint8_t localOwner, uint64
                            ((st.flags & kEdgeBit) || g_AiMirrored[st.id])) {   // kullanici durdurdu (kenar) ya da aynali isci iscinin sahibinden durdu
                     const bool wasMirrored = g_AiMirrored[st.id];
                     g_VehicleAiStopFn((void*)v);
+                    g_AiPrevOn[st.id] = false;                                         // uzaktan durdurma: kullanici basisi sanilmasin
                     g_AiMirrored[st.id] = false;
                     // Iscyi bu cihaz calistiriyordu (aynali degil): yeni durumu KENAR olarak herkese duyur ki aynali simulasyonlar
                     // durdurma istegi bu cihaza ulasmadan once gelen eski "isci acik" paketlerinden dolayi geri baslamasin.
@@ -4875,6 +5003,7 @@ static void ResetVehicleSyncState() {
         g_HasPendingMission = false;
         g_PendingFieldSnaps.clear();
         g_PendingFieldOwn.clear();
+        g_PendingRestPoses.clear();
     }
     g_FsValid.store(false); g_FsMap.store(0); g_FsScanMs = 0;
     g_MsPrevValid = false; g_MsIgnoreUntil = 0; g_MissionDoneFlag.store(false);
@@ -5188,6 +5317,13 @@ static bool ProcessPackets(uint8_t* buf, size_t& buffered, int peerId, std::vect
             size = 3 + (size_t)cnt * 2;
         }
         else if (type == PACKET_SYNC_REQUEST) size = 1;
+        else if (type == PACKET_RESUME) size = 1;
+        else if (type == PACKET_HOST_RESUME) size = 1;
+        else if (type == PACKET_REST_POSE) {
+            if (buffered < sizeof(RestPoseHeader)) break;
+            if (buf[1] > kRestPoseMax) return false;
+            size = sizeof(RestPoseHeader) + (size_t)buf[1] * sizeof(RestPoseEntry);
+        }
         else if (type == PACKET_PING) size = 1;
         else if (type == PACKET_AUTH_TABLE) {
             if (buffered < 3) break;
@@ -5466,6 +5602,30 @@ static bool ProcessPackets(uint8_t* buf, size_t& buffered, int peerId, std::vect
             }
         } else if (type == PACKET_MISSION_DONE) {
             if (kSyncMission && g_IsHost.load() && fromPeer) g_MissionDoneFlag.store(true);
+        } else if (type == PACKET_RESUME) {
+            if (g_IsHost.load() && fromPeer) {                 // client geri dondu: tarlalar + duran araclar + normal tam senkron
+                g_FsResendAll.store(true);
+                g_RestResendAll.store(true);
+                g_HostForceTable.store(true);
+                g_ForceResendAll.store(true);
+                g_EntityResendAll.store(true);
+            }
+        } else if (type == PACKET_HOST_RESUME) {
+            if (!g_IsHost.load() && !fromPeer) {               // host geri dondu: bu cihaz kendi tarla/arac durumunu yollasin
+                g_FsResendAll.store(true);
+                g_RestResendAll.store(true);
+                g_ForceResendAll.store(true);
+                g_EntityResendAll.store(true);
+            }
+        } else if (type == PACKET_REST_POSE) {
+            if (buf[1] > 0 && buf[1] <= kRestPoseMax) {
+                std::lock_guard<std::mutex> lock(g_VehicleEventMutex);
+                for (uint8_t k = 0; k < buf[1] && g_PendingRestPoses.size() < 64; ++k) {
+                    RestPoseEntry e;
+                    memcpy(&e, buf + sizeof(RestPoseHeader) + (size_t)k * sizeof(RestPoseEntry), sizeof(e));
+                    g_PendingRestPoses.push_back(e);
+                }
+            }
         } else if (type == PACKET_SYNC_REQUEST) {
             if (g_IsHost.load() && fromPeer) {
                 g_HostForceTable.store(true);
@@ -5977,6 +6137,27 @@ static void HostNetworkLoop(int serverFd, int gen) {
                 else if (errno != EWOULDBLOCK && errno != EAGAIN && errno != EINTR) p->dead = true;
             }
             if (p->dead) continue;
+            {   // client oyunu arka plana attiysa (ping dahil hicbir sey gelmiyor) araclarini birak: baskalari kullanabilsin
+                static bool s_silentReleased[MAX_PLAYERS];
+                if (p->id < MAX_PLAYERS) {
+                    if (nowT - p->lastRecvMs > 3000) {
+                        if (!s_silentReleased[p->id]) {
+                            s_silentReleased[p->id] = true;
+                            std::vector<uint16_t> owned;
+                            {
+                                std::lock_guard<std::mutex> lock(g_VehicleStateMutex);
+                                for (uint16_t v = 0; v < VEHICLE_SLOT_LIMIT; ++v)
+                                    if (g_VehicleAuthority[v].ownerId == p->id) owned.push_back(v);
+                            }
+                            for (uint16_t v : owned) ReleaseVehicleAuthority(v, p->id, true);
+                            if (!owned.empty()) g_HostForceTable.store(true);
+                            LOGI("[PAUSE] oyuncu %u sessiz (arka plan?): %u aracin sahipligi birakildi", (unsigned)p->id, (unsigned)owned.size());
+                        }
+                    } else {
+                        s_silentReleased[p->id] = false;
+                    }
+                }
+            }
             if (nowT - p->lastRecvMs > PEER_SILENCE_TIMEOUT_MS) { p->dead = true; continue; }
             relay.clear();
             relayFast.clear();
@@ -7835,6 +8016,11 @@ void my_GameUpdate(void* thiz, float param_1) {
 
 void my_GameUpdateStateBase(void* thiz, float param_1, uint32_t param_2, uint32_t param_3, uint32_t param_4) {
     g_EngineInstance = (uintptr_t)thiz;
+    {
+        const long long nowSb = NowMs();
+        const long long prevSb = g_LastStateBaseMs.load();
+        if (prevSb > 0 && nowSb - prevSb > 2500 && *(volatile uint32_t*)(thiz ? (uintptr_t)thiz + 0x64 : 0) == 6) OnGameResumed(nowSb - prevSb);
+    }
     g_LastStateBaseMs.store(NowMs());   // dunya mantigi calisiyor (host duraklama algisi icin)
 
     // Kullanici isci (AI) dugmesine bastiysa giris cihazinda (device+0x28) bit 0x1000 yanar; oyunun kendi kodu
@@ -7863,7 +8049,8 @@ void my_GameUpdateStateBase(void* thiz, float param_1, uint32_t param_2, uint32_
     // the engine to 120 FPS. We sample at up to 120 Hz when callbacks allow it,
     // and the network is independently capped at 30 snapshots/sec.
     if (*(volatile uint32_t*)(g_EngineInstance + 0x64) == 6) {
-        FieldSnapFrame(g_EngineInstance);                  // tarla durumu goruntusu (saniyede bir, sadece degisenler)
+        FieldSnapFrame(g_EngineInstance);                  // duraklama devri / geri donus icin tarla goruntusu (surekli ag trafigi yok)
+        ResumeSyncFrame(g_EngineInstance);                 // geri donus: duran araclarin son konumlari
         MiscSyncPost(g_EngineInstance);                    // host: fiyat listesi + gorev yayini | client: gorev tamamlama bildirimi
         ApplyRemoteVehicleStates(g_EngineInstance);
         BaleFrame(g_EngineInstance);                     // CaptureAndQueueLocalVehicleState'ten ONCE (g_EntityResendAll orada silinir)
@@ -8105,7 +8292,7 @@ void* my_renderStartMenuMain(void* thiz, void* p1, void* p2, void* p3) {
 // ========================================================================
 __attribute__((constructor))
 void ModMain() {
-    LOGI(">>> MULTIPLAYER MOD STARTING <<< build=shopfix-20+pause-release+ai-takeover+bale-sensor");
+    LOGI(">>> MULTIPLAYER MOD STARTING <<< build=shopfix-21+resume-sync+ai-press-detect+bale-local-owner");
 
     ResetVehicleSyncState();
     std::thread(StartPONGResponderThread).detach();
