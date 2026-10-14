@@ -1986,6 +1986,7 @@ static uint64_t g_AiIntentMs = 0;             // bu cihazda kullanici isci (AI) 
 static int g_AiIntentVeh = -1;                // ... o anda aktif olan aracin netId'si
 static bool g_AiPrevOn[VEHICLE_SLOT_LIMIT];   // onceki karede isci acik miydi (basis yonunu anlamak icin)
 static uint64_t g_AiRestartMs[VEHICLE_SLOT_LIMIT];
+static uint64_t g_AiStopHoldMs[VEHICLE_SLOT_LIMIT];   // bu cihazda kullanici iscyi durdurdu: bu ana kadar gelen ESKI "isci acik" periyodik paketleri yok sayilir
 static uint8_t g_AiRestartTries[VEHICLE_SLOT_LIMIT];
 static TrailerTrack g_ToolTrack[64];
 static CombineTrack g_CbTrack[VEHICLE_SLOT_LIMIT];
@@ -2358,9 +2359,19 @@ static void CaptureAndQueueCombineStates(uintptr_t game, uint8_t localOwner, uin
 
         // ---- Aynali isci (baska cihazin calistirdigi isci) ----
         if (g_AiMirrored[id]) {
-            if (!ai) {
-                if (intent && prevOn) {                               // kullanici bu cihazda durdurdu
+            // Herhangi bir cihaz (sahip olmasa bile) iscyi istedigi an durdurabilir: dugmeye basildiysa ve ortak durumda
+            // isci aciksa niyet "durdur"dur. Dugme simulasyon kendi kendine durmusken basildiysa oyun iscyi YENIDEN baslatir;
+            // onu da geri alip durdurma istegini gonderiyoruz.
+            if (ai && intent && remoteAi && g_VehicleAiStopFn) {
+                g_VehicleAiStopFn((void*)v);
+                ai = *(uint32_t*)(v + 0x730) != 0;
+                g_AiPrevOn[id] = ai;
+                g_AiMirrored[id] = false;
+                g_AiStopHoldMs[id] = nowMs + 3000;
+            } else if (!ai) {
+                if (intent) {                                         // kullanici bu cihazda durdurdu
                     g_AiMirrored[id] = false;
+                    g_AiStopHoldMs[id] = nowMs + 3000;
                 } else if (!remoteAi) {
                     g_AiMirrored[id] = false;                         // karsi taraf da durdurmus
                 } else if (!intent && g_AiRestartTries[id] < 8 && (nowMs - g_AiRestartMs[id]) >= 1500 &&
@@ -2392,6 +2403,7 @@ static void CaptureAndQueueCombineStates(uintptr_t game, uint8_t localOwner, uin
                                  (uint8_t)((LocalVehicleFlags(v) & ~8) | kEdgeBit));
                 c.rvalid = true; c.rflags = (uint8_t)(c.rflags & ~8);
                 g_AiIntentMs = 0;                                   // niyet tuketildi
+                g_AiStopHoldMs[id] = nowMs + 3000;
                 LOGI("[VEHSTATE] isci durdurma istegi gonderildi netId=%u", (unsigned)id);
                 continue;
             }
@@ -2766,6 +2778,8 @@ struct BaleTrack {
     float sx, sy, sa;           // en son yayinlanan / uygulanan konum
     long long bornMs, sentMs, remoteMs;
     long long nearMs;           // bu cihazin GERCEK (yerel suruldugu) bir aracin yakininda oldugu son an
+    float tx, ty, ta;           // uzaktan gelen hedef konum (yumusatma: her karede hedefe dogru yaklasir)
+    bool hasTarget;
 };
 struct BaleRecent { float x, y; long long ms; bool sale; bool local; bool used; double gain; };
 static std::vector<BaleTrack> g_BaleTrk;
@@ -2846,12 +2860,24 @@ static BaleRecent* BaleLocalRemovalNear(float x, float y, long long now) {
     }
     return best;
 }
-static void QueueBaleOp(uint8_t op, float ox, float oy, float x, float y, float a, uint8_t sale) {
-    if (!g_IsConnected.load()) return;
+// Tasima (op 3) olaylari kuyruk doluyken YOLLANMAZ (geri basinc): QueueVehicleEvent 4096 bayti asinca tum kuyrugu siler
+// (ekleme/silme olaylari dahil). Tasima zaten bir sonraki karede en guncel konumla tekrar denenir. false = yollanmadi.
+static bool QueueBaleOp(uint8_t op, float ox, float oy, float x, float y, float a, uint8_t sale) {
+    if (!g_IsConnected.load()) return true;
+    if (op == 3) {
+        std::lock_guard<std::mutex> lock(g_VehicleEventMutex);
+        if (g_VehicleEventOut.size() > 2400) return false;
+    }
     BaleOpPacket p; memset(&p, 0, sizeof(p));
     p.type = PACKET_BALE_OP; p.ownerId = g_LocalPlayerId.load(); p.op = op; p.sale = sale;
     p.ox = ox; p.oy = oy; p.x = x; p.y = y; p.a = a;
     QueueVehicleEvent(&p, sizeof(p));
+    return true;
+}
+static float BaleWrapAngle(float d) {
+    while (d > 3.14159265f) d -= 6.28318531f;
+    while (d < -3.14159265f) d += 6.28318531f;
+    return d;
 }
 static void SetBalePose(uintptr_t p, float x, float y, float a) {
     const uintptr_t body = *(uintptr_t*)(p + 0x50);
@@ -2880,6 +2906,59 @@ static bool BaleRemoveLocal(uintptr_t game, uintptr_t p) {
     g_BaleDestroyFn((void*)p);
     BaleForget(p);
     return true;
+}
+
+// Uzaktan gelen tasimayi tek seferde isinlamak yerine hedef olarak isaretle; BaleSmoothStep her karede hedefe yaklastirir.
+static void BaleSetTarget(uintptr_t p, float x, float y, float a, long long now) {
+    float cx, cy, ca;
+    if (!ReadBalePose(p, &cx, &cy, &ca)) return;
+    const float dx = x - cx, dy = y - cy;
+    if (dx * dx + dy * dy > 16.0f) {                                       // 4 m'den uzak: yumusatma anlamsiz, direkt koy
+        SetBalePose(p, x, y, a);
+        BaleRemember(p, now);
+        BaleTrack* t0 = BaleTrackOf(p);
+        if (t0) t0->hasTarget = false;
+        return;
+    }
+    BaleRemember(p, now);                                                  // iz yoksa olusturur, uzaktan yonetilen isaretler
+    BaleTrack* t = BaleTrackOf(p);
+    if (!t) return;
+    t->tx = x; t->ty = y; t->ta = a; t->hasTarget = true;
+}
+// Hedefi (op.ox, op.oy) olan, yumusatilan balyayi bul (yerel konum hedefin gerisinde kalabilir).
+static uintptr_t BaleByTarget(float ox, float oy) {
+    uintptr_t best = 0; float bd = 0.25f * 0.25f;
+    for (size_t i = 0; i < g_BaleTrk.size(); ++i) {
+        const BaleTrack& t = g_BaleTrk[i];
+        if (!t.hasTarget) continue;
+        const float dx = t.tx - ox, dy = t.ty - oy, d2 = dx * dx + dy * dy;
+        if (d2 <= bd) { bd = d2; best = t.p; }
+    }
+    return best;
+}
+static void BaleSmoothStep(long long now) {
+    static long long s_last = 0;
+    long long dt = s_last ? now - s_last : 16;
+    s_last = now;
+    if (dt < 1) dt = 1;
+    if (dt > 100) dt = 100;
+    const float alpha = 1.0f - expf(-(float)dt / 60.0f);                   // ~60 ms zaman sabiti: 20 Hz akisi akici gosterir
+    for (size_t i = 0; i < g_BaleTrk.size(); ++i) {
+        BaleTrack& t = g_BaleTrk[i];
+        if (!t.hasTarget) continue;
+        float x, y, a;
+        if (!ReadBalePose(t.p, &x, &y, &a)) { t.hasTarget = false; continue; }
+        const float dx = t.tx - x, dy = t.ty - y, da = BaleWrapAngle(t.ta - a);
+        float nx, ny, na;
+        if (dx * dx + dy * dy < 0.0004f && fabsf(da) < 0.02f) {
+            nx = t.tx; ny = t.ty; na = t.ta; t.hasTarget = false;
+        } else {
+            nx = x + dx * alpha; ny = y + dy * alpha; na = a + da * alpha;
+        }
+        SetBalePose(t.p, nx, ny, na);
+        t.x = t.sx = nx; t.y = t.sy = ny; t.a = t.sa = na;
+        t.sentMs = now; t.remoteMs = now;                                  // yerel olarak yayinlanmasin (yanki yok)
+    }
 }
 
 // Karsi cihazdan gelen tek bir balya olayini uygular.
@@ -2923,11 +3002,11 @@ static void BaleApplyOp(uintptr_t game, const BaleOpPacket& op, uint8_t localOwn
         return;
     }
     if (op.op == 3) {                                                      // tasindi
-        uintptr_t cand = BaleNearest(game, op.ox, op.oy, 1.5f * 1.5f);
+        uintptr_t cand = BaleByTarget(op.ox, op.oy);                       // onceki hedefi bu olayin baslangici olan balya
+        if (!cand) cand = BaleNearest(game, op.ox, op.oy, 1.5f * 1.5f);
         if (!cand) cand = BaleNearest(game, op.x, op.y, 0.6f * 0.6f);      // zaten orada
         if (!cand) return;
-        SetBalePose(cand, op.x, op.y, op.a);
-        BaleRemember(cand, now);
+        BaleSetTarget(cand, op.x, op.y, op.a, now);
         if (s_moveLogs < 20) { ++s_moveLogs; LOGI("[BALE] uzaktan tasima uygulandi (%.1f,%.1f)->(%.1f,%.1f)", op.ox, op.oy, op.x, op.y); }
     }
 }
@@ -2963,8 +3042,9 @@ static void BaleLocalVehiclePoints(uintptr_t game, std::vector<float>* pts) {
 
 // Yerel degisiklikleri yakala ve yayinla.
 static void BaleCapture(uintptr_t game, long long now) {
-    std::vector<float> vpts;
-    BaleLocalVehiclePoints(game, &vpts);
+    static std::vector<float> vpts;                                        // yeniden kullanilir (her karede ayirma yok)
+    bool vptsDone = false;                                                 // arac noktalari sadece bir balya oynadiginda hesaplanir
+    int moveBudget = 12;                                                   // kare basina en fazla 12 tasima olayi (kuyrugu bogmaz)
     struct Cur { uintptr_t p; float x, y, a; };
     Cur cur[kBaleMax];
     uint32_t cn = 0;
@@ -3006,8 +3086,8 @@ static void BaleCapture(uintptr_t game, long long now) {
         LOGI("[BALE] yerel silme (%.1f,%.1f)%s", gone[i].x, gone[i].y, sale ? " [satis]" : "");
     }
     // 2) yeni + tasinanlar
-    std::vector<BaleTrack> nt;
-    nt.reserve(cn);
+    static std::vector<BaleTrack> nt;
+    nt.clear();
     for (uint32_t i = 0; i < cn; ++i) {
         const Cur& c = cur[i];
         BaleTrack* old = BaleTrackOf(c.p);
@@ -3024,18 +3104,22 @@ static void BaleCapture(uintptr_t game, long long now) {
         }
         t = *old;
         t.x = c.x; t.y = c.y; t.a = c.a;
-        for (size_t k = 0; k + 1 < vpts.size(); k += 2) {                  // yerel gercek bir aracin yakininda mi
-            const float vx = vpts[k] - c.x, vy = vpts[k + 1] - c.y;
-            if (vx * vx + vy * vy < kBaleNearVehicleR2) { t.nearMs = now; break; }
-        }
         const float dx = c.x - t.sx, dy = c.y - t.sy;
-        const bool moved = (dx * dx + dy * dy > 0.0001f) || GetAngleDelta(c.a, t.sa) > 0.02f;
+        const bool moved = (dx * dx + dy * dy > 0.0004f) || GetAngleDelta(c.a, t.sa) > 0.03f;     // 2 cm / ~1.7 derece
+        if (moved && !vptsDone) { BaleLocalVehiclePoints(game, &vpts); vptsDone = true; }
+        if (moved) {
+            for (size_t k = 0; k + 1 < vpts.size(); k += 2) {              // yerel gercek bir aracin yakininda mi
+                const float vx = vpts[k] - c.x, vy = vpts[k + 1] - c.y;
+                if (vx * vx + vy * vy < kBaleNearVehicleR2) { t.nearMs = now; break; }
+            }
+        }
         const bool mine = (now - t.nearMs) < kBaleOwnHoldMs;
         if (now - t.remoteMs < 1500 || !mine) {                            // baska cihaz yonetiyor / sahibi biz degiliz: yayinlama, sadece izle
             t.sx = c.x; t.sy = c.y; t.sa = c.a;
-        } else if (moved && now - t.sentMs >= kBaleSendIntervalMs) {       // 20 Hz; durunca son konum da gider
-            QueueBaleOp(3, t.sx, t.sy, c.x, c.y, c.a, 0);
-            t.sx = c.x; t.sy = c.y; t.sa = c.a; t.sentMs = now;
+        } else if (moved && now - t.sentMs >= kBaleSendIntervalMs && moveBudget > 0) {   // 20 Hz; durunca son konum da gider
+            if (QueueBaleOp(3, t.sx, t.sy, c.x, c.y, c.a, 0)) {            // kuyruk doluysa sx/sentMs degismez: sonraki karede tekrar
+                t.sx = c.x; t.sy = c.y; t.sa = c.a; t.sentMs = now; --moveBudget;
+            }
         }
         nt.push_back(t);
     }
@@ -3083,7 +3167,7 @@ static void BaleReconcile(uintptr_t game, const std::vector<float>& list, long l
         lmatched[best] = 1;
         if (bd > 0.35f * 0.35f) {                                                  // eslesti ama yeri farkli
             BaleTrack* t = BaleTrackOf(locals[best]);
-            if (t && now - t->sentMs > 1500 && now - t->remoteMs > 1500) { SetBalePose(locals[best], hx, hy, ha); BaleRemember(locals[best], now); ++fixes; }
+            if (t && !t->hasTarget && now - t->sentMs > 1500 && now - t->remoteMs > 1500) { SetBalePose(locals[best], hx, hy, ha); BaleRemember(locals[best], now); ++fixes; }
         }
     }
     for (size_t k = 0; k < unmatchedHost.size() && adds < 6; ++k) {
@@ -3108,9 +3192,10 @@ static void BaleFrame(uintptr_t game) {
     }
     const long long now = NowMs();
     BaleCapture(game, now);                                                // once yerel degisiklikleri yakala (yanki/cift silme icin)
-    std::vector<BaleOpPacket> ops;
+    static std::vector<BaleOpPacket> ops;                                  // yeniden kullanilir
     std::vector<float> list;
     bool haveList = false;
+    ops.clear();
     {
         std::lock_guard<std::mutex> lock(g_VehicleEventMutex);
         ops.swap(g_PendingBaleOps);
@@ -3118,6 +3203,7 @@ static void BaleFrame(uintptr_t game) {
     }
     const uint8_t localOwner = g_LocalPlayerId.load();
     for (size_t i = 0; i < ops.size(); ++i) BaleApplyOp(game, ops[i], localOwner, now);
+    BaleSmoothStep(now);                                                   // uzaktan gelen hareketleri hedefe dogru akici yaklastir
     if (g_IsHost.load()) BaleHostBroadcast(game, now, g_EntityResendAll.load());
     else if (haveList) BaleReconcile(game, list, now);
 }
@@ -3515,17 +3601,16 @@ static void MiscSyncPost(uintptr_t game) {
 }
 
 // ========================================================================
-// TARLA DURUMU GORUNTUSU (saniyede bir, sadece DEGISEN tarlalar)
-// FIELD_OP paketleri (hasat/ekim/isleme alanlari) ag takilinca kaybolabiliyor (alici tamponu dolunca en eski islemler
-// silinir, arac isinlaninca aradaki alan hic islenmez). Bu bir guvenlik agi: oyunun tarla verisi her Field icin iki bit
-// dizisidir (Field+4: 32x32 hucre x 3 bit = 384 bayt, Field+0x14: 8x8 x 6 bit = 48 bayt; BitVector = {veri*, bit, bayt, bayrak}).
-// Tarama: Map+0x18 GridCell dizisi (sayac Map+0x24, hucre 100 bayt, hucre+0x48 = Field*). Her tarlanin ozeti (FNV-1a) tutulur;
-// ozeti degisen tarla tam olarak (432 bayt) yollanir, alici Field::deserialize(false) ile uygular (doku/vertex'i oyun kendisi yeniler).
-//  - Host: yakin zamanda tarla islemi olduysa degisen tarlalari yollar (buyume tek basina degisikligi yollamaz); ayrica saniyede
-//    1-3 tarlayi sirayla yeniden yollar (yavas tam tarama = kendini onaran).
-//  - Client: sadece KENDI islem yaptigi tarlalari host'a yollar (host diger client'lara iletir). Host'un goruntusunu uygular,
-//    ama kendisinin son 1.5 sn'de degistirdigi tarlayi atlar (kendi hasadi geri sarilmasin).
-// Yeni kanca YOK: sadece Field::deserialize CAGRILIR.
+// TARLA DURUMU GORUNTUSU — SADECE "DURAKLAMA DEVRI" ICIN
+// Tarla islemi her cihazda yerel calisir (arac her cihazda hareket ettigi icin tarla orada da islenir) ve FIELD_OP ile
+// desteklenir. Surekli tarla verisi YOLLANMAZ. Goruntu yalnizca su durumda gider: araci/iscisi tarlayi isleyen cihaz
+// oyunu durdurursa (ayarlar, dukkan, arka plana alma, kisa kopma) o cihazin AG THREAD'i, son kendi islem yaptigi tarlalarin
+// son halini yollar; diger cihazlar bunu uygular ve oyundaki aktif biri isi devralir. Herkes ayarlardaysa zaten herkeste
+// oyun durur, sorun olmaz.
+// Veri: her Field icin iki bit dizisi (Field+4: 384 bayt, Field+0x14: 48 bayt; BitVector = {veri*, bit, bayt, bayrak}).
+// Tarlalar Map+0x18 GridCell dizisinden (sayac Map+0x24, hucre 100 bayt, hucre+0x48 = Field*) bulunur.
+// Oyun thread'i saniyede bir SADECE YEREL olarak "bu cihazin son 30 sn'de isledigi tarlalari" isaretler (ag yok).
+// Alici: kendisi son 3 sn'de yerel tarla isi yaptiysa goruntuyu atlar; aksi halde Field::deserialize(false) ile uygular.
 // ========================================================================
 static const bool kSyncFieldSnap = true;
 static const uint32_t kFsB1 = 384, kFsB2 = 48;
@@ -3533,16 +3618,19 @@ struct __attribute__((packed)) FieldSnapPacket { uint8_t type; uint8_t ownerId; 
 static std::vector<FieldSnapPacket> g_PendingFieldSnaps;      // g_VehicleEventMutex ile korunur
 typedef uint8_t* (*Field_deserialize_t)(void* field, uint8_t* buf, bool full);
 static Field_deserialize_t g_FieldDeserFn = nullptr;          // Field::deserialize(unsigned char*, bool)
-static const uint32_t kFsMaxCells = 4096;
-static uint32_t g_FsKnown[kFsMaxCells];                       // son yollanan / uygulanan / kabul edilen ozet
-static long long g_FsLocalMs[kFsMaxCells];                    // bu tarlada yerel degisiklik gorulen son an
-static bool g_FsQueued[kFsMaxCells];
-static std::vector<uint16_t> g_FsSendQ;
-static uintptr_t g_FsMap = 0;
-static bool g_FsValid = false;
+static const uint32_t kFsMaxCells = 65535;                    // Field kimligi = GridCell sirasi (uint16)
+static const long long kFsDirtyWindowMs = 30000;              // bu kadar sure icinde islenen tarlalar duraklamada yollanir
+static const long long kFsApplyQuietMs = 3000;                // alici: yerel tarla isinden bu kadar sonra uygular
+static const size_t kFsFlushMax = 24;                         // bir duraklamada en fazla bu kadar tarla
+static std::mutex g_FsMutex;                                  // g_FsKnown / g_FsDirtyMs / g_FsFields
+static std::vector<uint32_t> g_FsKnown;                       // son gorulen ozet (yerel degisiklik tespiti icin)
+static std::vector<long long> g_FsDirtyMs;                    // yerel isleme zamani; 0 = temiz
+static std::vector<uint16_t> g_FsFields;                      // Field* bulunan hucrelerin sirasi
+static std::atomic<uintptr_t> g_FsMap(0);
+static std::atomic<bool> g_FsValid(false);
 static long long g_FsScanMs = 0;
-static uint32_t g_FsRoundRobin = 0;
 static bool g_FsBad = false;
+static uint32_t g_FsStatSent = 0, g_FsStatApplied = 0, g_FsStatRecv = 0, g_FsStatSkipped = 0;
 
 static uintptr_t FsFieldAt(uintptr_t map, uint32_t i) {
     const uintptr_t cells = *(volatile uintptr_t*)(map + 0x18);
@@ -3572,121 +3660,137 @@ static bool QueueFieldSnap(uint16_t idx, const uint8_t* d) {
     p.type = PACKET_FIELD_SNAP; p.ownerId = g_LocalPlayerId.load(); p.idx = idx;
     memcpy(p.d, d, sizeof(p.d));
     std::lock_guard<std::mutex> lock(g_VehicleEventMutex);
-    if (g_FieldOpOut.size() > 5000) return false;          // tampon dolu: sonraki saniyede tekrar dene
+    if (g_FieldOpOut.size() > 5000) return false;          // tampon dolu: sonraki turda tekrar dene
     const uint8_t* b = (const uint8_t*)&p;
     g_FieldOpOut.insert(g_FieldOpOut.end(), b, b + sizeof(p));
     return true;
 }
 
-// Oyun thread'i, durum 6 (Game::updateStateBase sonrasi).
+// Oyun thread'i, durum 6 (Game::updateStateBase sonrasi). Ag trafigi URETMEZ.
 static void FieldSnapFrame(uintptr_t game) {
     if (!kSyncFieldSnap || game == 0 || g_FsBad) return;
-    if (!g_IsConnected.load() || !g_FieldDeserFn) { g_FsValid = false; return; }
+    if (!g_IsConnected.load()) { g_FsValid.store(false); return; }
     const uintptr_t map = *(uintptr_t*)(game + 0x704);
-    if (!map) { g_FsValid = false; return; }
+    if (!map) { g_FsValid.store(false); return; }
     const long long now = NowMs();
-    const bool host = g_IsHost.load();
-    if (map != g_FsMap) { g_FsMap = map; g_FsValid = false; }
+    if (map != g_FsMap.load()) { g_FsValid.store(false); g_FsMap.store(map); }
     const uint32_t cnt = *(volatile uint32_t*)(map + 0x24);
     if (cnt == 0 || cnt > kFsMaxCells) return;
+    const long long localOp = g_LastLocalFieldOpMs.load();
 
-    // 1) Uzaktan gelen tarla goruntulerini uygula.
+    // 1) Duraklayan cihazdan gelen tarla goruntulerini uygula (kendimiz calismiyorsak).
     std::vector<FieldSnapPacket> snaps;
     {
         std::lock_guard<std::mutex> lock(g_VehicleEventMutex);
         snaps.swap(g_PendingFieldSnaps);
     }
-    if (g_FsValid && !snaps.empty()) {
-        uint32_t applied = 0;
-        for (size_t k = 0; k < snaps.size(); ++k) {
-            FieldSnapPacket& sp = snaps[k];
-            const uintptr_t f = FsFieldAt(map, sp.idx);
-            if (!f) continue;
-            uint8_t cur[kFsB1 + kFsB2];
-            if (!FsRead(f, cur)) continue;
-            const uint32_t curH = FsHash(cur);
-            if (curH == FsHash(sp.d)) { g_FsKnown[sp.idx] = curH; continue; }
-            // Bu cihaz bu tarlada az once calisti (henuz yollanmamis yerel degisiklik var ya da son 1.5 sn'de yollandi): kendi durumu kalsin.
-            if (curH != g_FsKnown[sp.idx] || now - g_FsLocalMs[sp.idx] < 1500) continue;
-            g_FieldDeserFn((void*)f, sp.d, false);
-            uint8_t after[kFsB1 + kFsB2];
-            if (FsRead(f, after)) g_FsKnown[sp.idx] = FsHash(after);      // yerel degisiklik sanilip geri yollanmasin
-            ++applied;
+    if (!snaps.empty()) {
+        g_FsStatRecv += (uint32_t)snaps.size();
+        const bool quiet = localOp == 0 || (now - localOp) >= kFsApplyQuietMs;
+        if (g_FsValid.load() && g_FieldDeserFn && quiet) {
+            for (size_t k = 0; k < snaps.size(); ++k) {
+                FieldSnapPacket& sp = snaps[k];
+                const uintptr_t f = FsFieldAt(map, sp.idx);
+                if (!f) continue;
+                uint8_t cur[kFsB1 + kFsB2];
+                if (!FsRead(f, cur) || FsHash(cur) == FsHash(sp.d)) continue;
+                g_FieldDeserFn((void*)f, sp.d, false);
+                uint8_t after[kFsB1 + kFsB2];
+                if (FsRead(f, after)) {
+                    std::lock_guard<std::mutex> lock(g_FsMutex);
+                    if (sp.idx < g_FsKnown.size()) g_FsKnown[sp.idx] = FsHash(after);   // yerel degisiklik sanilmasin
+                }
+                ++g_FsStatApplied;
+            }
+        } else {
+            g_FsStatSkipped += (uint32_t)snaps.size();
         }
-        if (applied) {
-            static int s_logs = 0;
-            if (s_logs < 20) { ++s_logs; LOGI("[FIELDSNAP] %u tarla goruntusu uygulandi", (unsigned)applied); }
-        }
+        LOGI("[FIELDSNAP] duraklama devri alindi=%u uygulanan=%u atlanan=%u (yerel is sessiz=%d)", (unsigned)snaps.size(),
+             (unsigned)g_FsStatApplied, (unsigned)g_FsStatSkipped, (int)quiet);
+        g_FsStatApplied = g_FsStatSkipped = 0;
     }
 
-    // 2) Saniyede bir tarama: degisen tarlalari bul ve gonder.
+    // 2) Saniyede bir YEREL tarama: bu cihazin son zamanlarda isledigi tarlalari isaretle.
     if (now - g_FsScanMs < 1000) return;
     g_FsScanMs = now;
-    if (!g_FsValid) {
-        uint32_t found = 0;
+    std::lock_guard<std::mutex> lock(g_FsMutex);
+    if (!g_FsValid.load()) {
+        g_FsKnown.assign(cnt, 0);
+        g_FsDirtyMs.assign(cnt, 0);
+        g_FsFields.clear();
         for (uint32_t i = 0; i < cnt; ++i) {
-            g_FsKnown[i] = 0; g_FsLocalMs[i] = 0; g_FsQueued[i] = false;
             const uintptr_t f = FsFieldAt(map, i);
             if (!f) continue;
             uint8_t d[kFsB1 + kFsB2];
-            if (!FsRead(f, d)) { if (found == 0) { LOGI("[FIELDSNAP] beklenmeyen Field bit dizisi boyutu: ozellik kapatildi"); g_FsBad = true; return; } continue; }
+            if (!FsRead(f, d)) {
+                if (g_FsFields.empty()) { LOGI("[FIELDSNAP] beklenmeyen Field bit dizisi boyutu: ozellik kapatildi"); g_FsBad = true; return; }
+                continue;
+            }
             g_FsKnown[i] = FsHash(d);
-            ++found;
+            g_FsFields.push_back((uint16_t)i);
         }
-        g_FsSendQ.clear();
-        g_FsValid = true;
-        LOGI("[FIELDSNAP] hazir: %u tarla (hucre sayisi=%u) rol=%s", (unsigned)found, (unsigned)cnt, host ? "host" : "client");
+        g_FsValid.store(true);
+        LOGI("[FIELDSNAP] hazir (sadece duraklama devri): %u tarla, hucre=%u deserialize=%p", (unsigned)g_FsFields.size(),
+             (unsigned)cnt, (void*)g_FieldDeserFn);
         return;
     }
-    const long long lastWork = std::max(g_LastLocalFieldOpMs.load(), g_LastRemoteFieldOpMs.load());
-    const bool workRecent = (now - lastWork) < 5000;
-    const bool localRecent = (now - g_LastLocalFieldOpMs.load()) < 4000;
-    for (uint32_t i = 0; i < cnt; ++i) {
+    const bool localRecent = localOp != 0 && (now - localOp) < 4000;
+    for (size_t k = 0; k < g_FsFields.size(); ++k) {
+        const uint32_t i = g_FsFields[k];
+        if (i >= g_FsKnown.size()) continue;
         const uintptr_t f = FsFieldAt(map, i);
         if (!f) continue;
         uint8_t d[kFsB1 + kFsB2];
         if (!FsRead(f, d)) continue;
         const uint32_t h = FsHash(d);
         if (h == g_FsKnown[i]) continue;
-        if (host) {
-            if (workRecent) {                                              // islem sirasinda degisti: yayinla
-                g_FsLocalMs[i] = now;
-                if (!g_FsQueued[i]) { g_FsQueued[i] = true; g_FsSendQ.push_back((uint16_t)i); }
-            } else {
-                g_FsKnown[i] = h;                                          // buyume vb.: herkeste zaten ayni ilerler; yavas tarama duzeltir
-            }
-        } else {
-            if (localRecent) {                                             // bu client'in kendi isi: host'a yolla
-                g_FsLocalMs[i] = now;
-                if (!g_FsQueued[i]) { g_FsQueued[i] = true; g_FsSendQ.push_back((uint16_t)i); }
-            } else {
-                g_FsKnown[i] = h;
-            }
-        }
+        g_FsKnown[i] = h;
+        if (localRecent) g_FsDirtyMs[i] = now;
     }
-    uint32_t budget = 12;
-    while (budget > 0 && !g_FsSendQ.empty()) {
-        const uint16_t i = g_FsSendQ.front();
+}
+
+// AG THREAD'i (BuildOutgoing basinda, hem host hem client). Oyun dongusu (updateStateBase) durduysa — ayarlar, dukkan, arka plan,
+// kisa kopma — bu cihazin son isledigi tarlalarin son halini bir kez yollar. Oyun durdugu icin tarla verisi bu sirada degismez.
+static void FieldSnapPauseTick() {
+    if (!kSyncFieldSnap || g_FsBad) return;
+    static bool s_paused = false;
+    static std::vector<uint16_t> s_flushQ;
+    const long long now = NowMs();
+    const long long sb = g_LastStateBaseMs.load();
+    const bool paused = g_LocalInGame.load() && g_IsConnected.load() && sb > 0 && (now - sb) > HOST_PAUSE_DETECT_MS;
+    if (paused && !s_paused) {
+        s_paused = true;
+        s_flushQ.clear();
+        if (g_FsValid.load()) {
+            std::vector<std::pair<long long, uint16_t> > dirty;
+            {
+                std::lock_guard<std::mutex> lock(g_FsMutex);
+                for (size_t i = 0; i < g_FsDirtyMs.size(); ++i)
+                    if (g_FsDirtyMs[i] != 0 && now - g_FsDirtyMs[i] < kFsDirtyWindowMs) dirty.push_back(std::make_pair(g_FsDirtyMs[i], (uint16_t)i));
+            }
+            std::sort(dirty.begin(), dirty.end());                              // en eski basta
+            const size_t from = dirty.size() > kFsFlushMax ? dirty.size() - kFsFlushMax : 0;   // en yeni kFsFlushMax tarla
+            for (size_t k = from; k < dirty.size(); ++k) s_flushQ.push_back(dirty[k].second);
+        }
+        LOGI("[FIELDSNAP] oyun durdu: %u tarlanin son hali yollanacak", (unsigned)s_flushQ.size());
+    } else if (!paused && s_paused) {
+        s_paused = false;
+        s_flushQ.clear();
+        std::lock_guard<std::mutex> lock(g_FsMutex);
+        std::fill(g_FsDirtyMs.begin(), g_FsDirtyMs.end(), 0LL);                // yollandi / gecerliligi bitti
+    }
+    if (!s_paused || s_flushQ.empty()) return;
+    const uintptr_t map = g_FsMap.load();
+    if (!map) { s_flushQ.clear(); return; }
+    for (int n = 0; n < 8 && !s_flushQ.empty(); ++n) {
+        const uint16_t i = s_flushQ.back();
         const uintptr_t f = FsFieldAt(map, i);
         uint8_t d[kFsB1 + kFsB2];
-        if (!f || !FsRead(f, d)) { g_FsQueued[i] = false; g_FsSendQ.erase(g_FsSendQ.begin()); continue; }
-        if (!QueueFieldSnap(i, d)) break;                                  // tampon dolu: kuyrukta kalsin
-        g_FsKnown[i] = FsHash(d);
-        g_FsQueued[i] = false;
-        g_FsSendQ.erase(g_FsSendQ.begin());
-        --budget;
-    }
-    // Host: yavas tam tarama (iste bos olsun, islem varken biraz hizli): kayip paket / fark kendini onarir.
-    if (host && g_FsSendQ.empty()) {
-        const uint32_t n = workRecent ? 3 : 1;
-        for (uint32_t k = 0, sent = 0; k < cnt && sent < n; ++k) {
-            g_FsRoundRobin = (g_FsRoundRobin + 1) % cnt;
-            const uintptr_t f = FsFieldAt(map, g_FsRoundRobin);
-            if (!f) continue;
-            uint8_t d[kFsB1 + kFsB2];
-            if (!FsRead(f, d)) continue;
-            if (QueueFieldSnap((uint16_t)g_FsRoundRobin, d)) { g_FsKnown[g_FsRoundRobin] = FsHash(d); ++sent; }
-        }
+        if (!f || !FsRead(f, d)) { s_flushQ.pop_back(); continue; }
+        if (!QueueFieldSnap(i, d)) break;                                       // tampon dolu: sonraki turda
+        s_flushQ.pop_back();
+        ++g_FsStatSent;
+        if (s_flushQ.empty()) { LOGI("[FIELDSNAP] duraklama devri yollandi (toplam=%u)", (unsigned)g_FsStatSent); g_FsStatSent = 0; }
     }
 }
 
@@ -3835,7 +3939,7 @@ static void ApplyPendingTrailerEvents(uintptr_t game, uint8_t localOwner, uint64
             if (diff & 8) {                                   // isci (AI): uzaktan baslat / durdur
                 const bool wantAi = (st.flags & 8) != 0;
                 const bool haveAi = *(uint32_t*)(v + 0x730) != 0;
-                if (wantAi && !haveAi) {
+                if (wantAi && !haveAi && !((st.flags & kEdgeBit) == 0 && nowMs < g_AiStopHoldMs[st.id])) {   // az once biz durdurduk: eski periyodik paket yeniden baslatmasin
                     if (kMirrorAiOnRemote && g_VehiclePrepareAiFn && g_VehicleAiStartFn) {
                         const uint32_t ok = g_VehiclePrepareAiFn((void*)v, (void*)game) & 0xFF;
                         if (ok) {
@@ -4635,7 +4739,7 @@ static void ResetVehicleSyncState() {
         g_PendingFieldSnaps.clear();
         g_PendingFieldOwn.clear();
     }
-    g_FsValid = false; g_FsMap = 0; g_FsScanMs = 0; g_FsSendQ.clear();
+    g_FsValid.store(false); g_FsMap.store(0); g_FsScanMs = 0;
     g_MsPrevValid = false; g_MsIgnoreUntil = 0; g_MissionDoneFlag.store(false);
     g_DemandHash = 0; g_DemandSendMs = 0; g_MissionSendMs = 0;
     g_MsSentState = -1; g_MsSentItem = -1; g_MsSentSpawn = -1;
@@ -5157,8 +5261,22 @@ static bool ProcessPackets(uint8_t* buf, size_t& buffered, int peerId, std::vect
             if (fromPeer) { bp.ownerId = (uint8_t)peerId; memcpy(buf, &bp, sizeof(bp)); }
             if (kSyncBales && bp.ownerId != g_LocalPlayerId.load() && bp.op >= 1 && bp.op <= 3) {
                 std::lock_guard<std::mutex> lock(g_VehicleEventMutex);
-                if (g_PendingBaleOps.size() >= 128) g_PendingBaleOps.erase(g_PendingBaleOps.begin());
-                g_PendingBaleOps.push_back(bp);
+                bool merged = false;
+                if (bp.op == 3) {                                          // ayni balyanin bekleyen tasimasi: zincirle (sadece son konum onemli)
+                    for (size_t k = g_PendingBaleOps.size(); k-- > 0;) {
+                        BaleOpPacket& q = g_PendingBaleOps[k];
+                        if (q.op != 3 || q.ownerId != bp.ownerId) continue;
+                        if (fabsf(q.x - bp.ox) < 0.01f && fabsf(q.y - bp.oy) < 0.01f) { q.x = bp.x; q.y = bp.y; q.a = bp.a; merged = true; break; }
+                    }
+                }
+                if (!merged) {
+                    if (g_PendingBaleOps.size() >= 128) {                  // tasimalar once atilir; ekleme/silme olaylari korunur
+                        size_t drop = 0;
+                        for (size_t k = 0; k < g_PendingBaleOps.size(); ++k) if (g_PendingBaleOps[k].op == 3) { drop = k; break; }
+                        g_PendingBaleOps.erase(g_PendingBaleOps.begin() + drop);
+                    }
+                    g_PendingBaleOps.push_back(bp);
+                }
             }
         } else if (type == PACKET_FIELD_OWN) {
             FieldOwnPacket fo;
@@ -5234,6 +5352,7 @@ static bool ProcessPackets(uint8_t* buf, size_t& buffered, int peerId, std::vect
 
 // Bu cihazin gonderecegi her seyi (sohbet, sahiplik, arac anlik goruntusu) tek tamponda toplar.
 static void BuildOutgoing(std::vector<uint8_t>& out, std::vector<uint8_t>* fast = nullptr) {
+    FieldSnapPauseTick();                                   // oyun durduysa son tarla durumunu yolla (duraklama devri)
     {   // arac ekleme/silme olaylari (guvenilir kanal)
         std::lock_guard<std::mutex> lock(g_VehicleEventMutex);
         if (!g_VehicleEventOut.empty()) {
@@ -7392,12 +7511,15 @@ static void my_Map_updateFields(void* map, uint32_t f1, uint32_t f2, uint32_t f3
                          g_VehNetArmed.load() && g_EngineInstance != 0;
     uint32_t wt = 0, wf = 0;
     if (capture) { wt = ((uint32_t*)fw)[0]; wf = ((uint32_t*)fw)[1]; }
+    // Tarla isi HER cihazda yerel olarak calisir: uzaktan surulen (hayalet) arac ve aynalanan isci de bu cihazda
+    // tarlayi isler (herkes ayni isi kendi kopyasinda yapar). Sadece YAYIN sofor/isciyi baslatan cihazdan gider;
+    // hayalet ve aynali aracin islemi yollanmaz (yanki olmasin).
     if (orig_Map_updateFields) orig_Map_updateFields(map, f1, f2, f3, s0, s1, s2, s3, s4, fw);
     if (!capture || wt >= 16) return;
     uintptr_t veh = 0;
     if (FieldSourceKind(g_EngineInstance, (uintptr_t)fw, &veh) == 0 || veh == 0) return;
     const int nid = NetIdOfVehicle(veh);
-    if (nid < 0 || g_AiMirrored[nid] || IsGhostVehiclePtr(veh)) return;     // uzaktan surulen / taklit isci: gonderme
+    if (nid < 0 || g_AiMirrored[nid] || IsGhostVehiclePtr(veh)) return;
     const uint32_t pts[8] = { f1, f2, f3, s0, s1, s2, s3, s4 };
     const long long now = NowMs();
     FieldSrcCache* c = nullptr;
@@ -7845,7 +7967,7 @@ void* my_renderStartMenuMain(void* thiz, void* p1, void* p2, void* p3) {
 // ========================================================================
 __attribute__((constructor))
 void ModMain() {
-    LOGI(">>> MULTIPLAYER MOD STARTING <<< build=shopfix-16+field-snapshot");
+    LOGI(">>> MULTIPLAYER MOD STARTING <<< build=shopfix-19+field-pause-handoff+ai-stop");
 
     ResetVehicleSyncState();
     std::thread(StartPONGResponderThread).detach();
