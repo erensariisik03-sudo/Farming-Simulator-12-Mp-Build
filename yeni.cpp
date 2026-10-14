@@ -2825,7 +2825,8 @@ struct BaleTrack {
     float x, y, a;              // son gozlenen konum
     float sx, sy, sa;           // en son yayinlanan / uygulanan konum
     long long bornMs, sentMs, remoteMs;
-    long long nearMs;           // bu cihazin GERCEK (yerel suruldugu) bir aracin yakininda oldugu son an
+    long long nearMs;           // bu cihazin otorite sahibi araci balyayi en son ne zaman itti
+    uint16_t nearVehicleId;     // hareketi baslatan yerel arac; sahiplik degisirse eski cihaz yayin yapamaz
     float tx, ty, ta;           // uzaktan gelen hedef konum (yumusatma: her karede hedefe dogru yaklasir)
     float vx, vy;               // hedefin tahmini hizi (m/s): arac hayalet olarak ileri tahmin edildigi icin balya da ileri tahmin edilir
     long long tms;              // hedefin geldigi an
@@ -2869,7 +2870,7 @@ static void BaleRemember(uintptr_t p, long long now) {
     BaleTrack* t = BaleTrackOf(p);
     if (!t) {
         BaleTrack nt; memset(&nt, 0, sizeof(nt));
-        nt.p = p; nt.bornMs = now;
+        nt.p = p; nt.bornMs = now; nt.nearVehicleId = VEHICLE_ID_INVALID;
         g_BaleTrk.push_back(nt);
         t = &g_BaleTrk.back();
     }
@@ -3105,31 +3106,63 @@ static void BaleApplyOp(uintptr_t game, const BaleOpPacket& op, uint8_t localOwn
 static const float kBaleNearVehicleR2 = 12.0f * 12.0f;
 static const long long kBaleOwnHoldMs = 2500;                 // araci biraktiktan sonra balyanin kayip durmasi icin
 static const long long kBaleSendIntervalMs = 33;              // 30 Hz: balya hareketi daha dusuk gecikmeyle gitsin
-static void BaleLocalVehiclePoints(uintptr_t game, std::vector<float>* pts) {
+struct BaleLocalVehiclePoint {
+    float x;
+    float y;
+    uint16_t vehicleId;
+};
+
+// Tek yonlu balya hareketi: yalnizca host'un araca verdigi otorite sahibi cihaz
+// balyanin yerel hareketini yayin kaynagi kabul edilir. Aktif arac indisi tek basina
+// sahiplik degildir; ayni araci iki cihaz aktif gosterse bile ikinci cihaz kaynak olamaz.
+static void BaleLocalVehiclePoints(uintptr_t game, std::vector<BaleLocalVehiclePoint>* pts) {
     pts->clear();
     const uint8_t localOwner = g_LocalPlayerId.load();
-    const uint32_t activeIdx = *(volatile uint32_t*)(game + 0xA8);
+    if (localOwner >= MAX_PLAYERS) return;
+
     const uint32_t vn = VehicleCount(game);
     for (uint32_t i = 0; i < vn; ++i) {
         const uintptr_t v = RawVehicleSlot(game, i);
         if (!v) continue;
         const int nid = NetIdOfVehicle(v);
-        bool local = (i == activeIdx);
-        if (!local && nid >= 0) {
-            { std::lock_guard<std::mutex> lock(g_VehicleStateMutex); local = (g_VehicleAuthority[nid].ownerId == localOwner); }
-            if (!local) local = (*(uint32_t*)(v + 0x730) != 0) && !g_AiMirrored[nid];
+        // Net kimligi veya host tarafindan atanmis sahipligi olmayan arac,
+        // balya konumu icin otorite kaynagi olamaz.
+        if (nid < 0 || nid >= (int)VEHICLE_SLOT_LIMIT || g_AiMirrored[nid]) continue;
+
+        uint8_t owner = VEHICLE_OWNER_NONE;
+        {
+            std::lock_guard<std::mutex> lock(g_VehicleStateMutex);
+            owner = g_VehicleAuthority[nid].ownerId;
         }
-        if (!local) continue;
+        if (owner != localOwner) continue;
+
         const uintptr_t vb = *(uintptr_t*)(v + 0x528);
         if (!vb) continue;
-        pts->push_back(*(float*)(vb + 0x0C));
-        pts->push_back(*(float*)(vb + 0x10));
+        BaleLocalVehiclePoint point;
+        point.x = *(float*)(vb + 0x0C);
+        point.y = *(float*)(vb + 0x10);
+        point.vehicleId = (uint16_t)nid;
+        pts->push_back(point);
     }
+}
+
+// Bale source araci hala bu cihazin kontrolunde mi? Otorite baska oyuncuya gectiyse
+// onceki cihaz, nearMs tutma suresi dolmamis olsa bile balya hareketi gondermeyi birakir.
+static bool BaleSourceVehicleStillLocal(uintptr_t game, uint16_t vehicleId, uint8_t localOwner) {
+    if (vehicleId >= VEHICLE_SLOT_LIMIT || GetVehicleFromIndex(game, vehicleId) == 0) return false;
+    uint8_t owner = VEHICLE_OWNER_NONE;
+    {
+        std::lock_guard<std::mutex> lock(g_VehicleStateMutex);
+        owner = g_VehicleAuthority[vehicleId].ownerId;
+    }
+    // Sahiplik kisa sureligine bosaltilinca son balya hareketinin tamamlanmasina izin ver;
+    // fakat baska bir oyuncu yetkiyi aldiysa eski kaynak artik yayin yapamaz.
+    return owner == localOwner || owner == VEHICLE_OWNER_NONE;
 }
 
 // Yerel degisiklikleri yakala ve yayinla.
 static void BaleCapture(uintptr_t game, long long now) {
-    static std::vector<float> vpts;                                        // yeniden kullanilir (her karede ayirma yok)
+    static std::vector<BaleLocalVehiclePoint> vpts;                        // sadece otorite sahibi araclar (yeniden kullanilir)
     bool vptsDone = false;                                                 // arac noktalari sadece bir balya oynadiginda hesaplanir
     int moveBudget = 12;                                                   // kare basina en fazla 12 tasima olayi (kuyrugu bogmaz)
     struct Cur { uintptr_t p; float x, y, a; };
@@ -3147,7 +3180,7 @@ static void BaleCapture(uintptr_t game, long long now) {
         for (uint32_t i = 0; i < cn; ++i) {
             BaleTrack t; memset(&t, 0, sizeof(t));
             t.p = cur[i].p; t.x = t.sx = cur[i].x; t.y = t.sy = cur[i].y; t.a = t.sa = cur[i].a;
-            t.bornMs = now - 60000; t.sentMs = now; t.remoteMs = 0;
+            t.bornMs = now - 60000; t.sentMs = now; t.remoteMs = 0; t.nearVehicleId = VEHICLE_ID_INVALID;
             g_BaleTrk.push_back(t);
         }
         g_BaleTrkValid = true;
@@ -3182,7 +3215,7 @@ static void BaleCapture(uintptr_t game, long long now) {
         if (!old) {
             memset(&t, 0, sizeof(t));
             t.p = c.p; t.x = t.sx = c.x; t.y = t.sy = c.y; t.a = t.sa = c.a;
-            t.bornMs = now; t.sentMs = now; t.remoteMs = 0;
+            t.bornMs = now; t.sentMs = now; t.remoteMs = 0; t.nearVehicleId = VEHICLE_ID_INVALID;
             QueueBaleOp(1, 0.0f, 0.0f, c.x, c.y, c.a, 0);
             g_BaleLocalChangeMs = now;
             LOGI("[BALE] yerel ekleme (%.1f,%.1f)", c.x, c.y);
@@ -3191,18 +3224,26 @@ static void BaleCapture(uintptr_t game, long long now) {
         }
         t = *old;
         t.x = c.x; t.y = c.y; t.a = c.a;
-        // Yakinda yerel arac olmasi tek basina uzaktan gelen kontrolu iptal etmez.
-        // Yerel fizik/otorite, uzaktan hedef bitip sensor acildiktan sonra gercek hareketle devralinir.
+        // Uzak cihaz balyayi yonetiyorsa, o cihazdan gelen fizik hareketini yerel surucuya
+        // mal etme. Aksi halde her iki cihaz da ayni balyanin konum paketini uretmeye baslayabilir.
         const float dx = c.x - t.sx, dy = c.y - t.sy;
         const bool moved = (dx * dx + dy * dy > 0.0004f) || GetAngleDelta(c.a, t.sa) > 0.03f;     // 2 cm / ~1.7 derece
-        if (moved && !vptsDone) { BaleLocalVehiclePoints(game, &vpts); vptsDone = true; }
-        if (moved) {
-            for (size_t k = 0; k + 1 < vpts.size(); k += 2) {              // yerel gercek bir aracin yakininda mi
-                const float vx = vpts[k] - c.x, vy = vpts[k + 1] - c.y;
-                if (vx * vx + vy * vy < kBaleNearVehicleR2) { t.nearMs = now; break; }
+        if (moved && !t.sensor && !t.hasTarget && !vptsDone) {
+            BaleLocalVehiclePoints(game, &vpts);
+            vptsDone = true;
+        }
+        if (moved && !t.sensor && !t.hasTarget) {
+            for (size_t k = 0; k < vpts.size(); ++k) {
+                const float vx = vpts[k].x - c.x, vy = vpts[k].y - c.y;
+                if (vx * vx + vy * vy < kBaleNearVehicleR2) {
+                    t.nearMs = now;
+                    t.nearVehicleId = vpts[k].vehicleId;
+                    break;
+                }
             }
         }
-        const bool mine = (now - t.nearMs) < kBaleOwnHoldMs;
+        const bool mine = (now - t.nearMs) < kBaleOwnHoldMs &&
+                          BaleSourceVehicleStillLocal(game, t.nearVehicleId, g_LocalPlayerId.load());
         if (t.sensor || t.hasTarget || !mine) {                              // uzak balya aktif kontrol altindaysa yayinlama; sensor birakilinca yerel itis devralabilir
             t.sx = c.x; t.sy = c.y; t.sa = c.a;
         } else if (moved && now - t.sentMs >= kBaleSendIntervalMs && moveBudget > 0) {   // 30 Hz; durunca son konum da gider
@@ -6373,8 +6414,8 @@ void StartPONGResponderThread() {
             int n = recvfrom(sockfd, buffer, sizeof(buffer)-1, 0, (struct sockaddr*)&client_addr, &client_len);
             if (n > 0) {
                 buffer[n] = '\0';
-                if (strcmp(buffer, "FS14_PING") == 0 && g_IsHost.load()) {
-                    std::string reply = "FS14_PONG|" + std::string(g_Nickname) + "'s Room";
+                if (strcmp(buffer, "FS12_PING") == 0 && g_IsHost.load()) {
+                    std::string reply = "FS12_PONG|" + std::string(g_Nickname) + "'s Room";
                     sendto(sockfd, reply.c_str(), reply.length(), 0, (struct sockaddr*)&client_addr, client_len);
                 }
             } else if (errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR) {
@@ -6407,7 +6448,7 @@ void StartLANDiscoveryThread() {
     broadcast_addr.sin_addr.s_addr = inet_addr("255.255.255.255");
     broadcast_addr.sin_port = htons(DISCOVERY_PORT);
     
-    std::string pingMsg = "FS14_PING";
+    std::string pingMsg = "FS12_PING";
     sendto(sockfd, pingMsg.c_str(), pingMsg.length(), 0, (struct sockaddr*)&broadcast_addr, sizeof(broadcast_addr));
     
     struct timeval tv;
@@ -6423,7 +6464,7 @@ void StartLANDiscoveryThread() {
         if (n > 0) {
             buffer[n] = '\0';
             std::string msg(buffer);
-            if (msg.find("FS14_PONG|") == 0) {
+            if (msg.find("FS12_PONG|") == 0) {
                 std::string roomName = msg.substr(10); 
                 std::string devIP = inet_ntoa(sender_addr.sin_addr);
                 
@@ -6575,6 +6616,10 @@ int32_t my_AInputQueue_getEvent(void* queue, AInputEvent** outEvent) {
                         g_TouchY.store(AMotionEvent_getY(*outEvent, 0));
                         g_TouchDown.store(true);
                     } else if (action == AMOTION_EVENT_ACTION_UP) {
+                        // Release position is needed for click-on-release behavior;
+                        // otherwise a finger may be dragged out and still activate a button.
+                        g_TouchX.store(AMotionEvent_getX(*outEvent, 0));
+                        g_TouchY.store(AMotionEvent_getY(*outEvent, 0));
                         g_TouchDown.store(false);
                     }
                 }
@@ -6770,50 +6815,50 @@ static void PlayGameClickSound() {
 
 static bool DrawGameStyleButton(const char* id, const char* label, ImVec2 size,
                                 float textScale = 1.0f, bool rightAligned = false, bool playSound = true) {
-    ImVec2 pos = ImGui::GetCursorScreenPos();
+    const ImVec2 pos = ImGui::GetCursorScreenPos();
 
-    // Görselin tamamını tıklanabilir yap: texture maskesi dokunma alanını daraltmasın.
+    // Keep the full hit area stable, but only activate when the finger is released
+    // inside it (the same click-release behavior as a normal ImGui button).
     ImGui::SetCursorScreenPos(pos);
-    ImGui::InvisibleButton(id, size);
-    const bool hovered = ImGui::IsItemHovered();
-    const bool active = hovered && ImGui::IsItemActive();
-    const bool clicked = ImGui::IsItemClicked(ImGuiMouseButton_Left);
+    const bool clicked = ImGui::InvisibleButton(id, size);
+    const bool pressed = ImGui::IsItemActive() && ImGui::IsMouseDown(ImGuiMouseButton_Left);
     if (clicked && playSound) PlayGameClickSound();
 
-    ImGui::SetCursorScreenPos(pos);
-
+    // Press animation affects the artwork, never the hitbox or layout.
+    const float visualScale = pressed ? 0.96f : 1.0f;
+    const ImVec2 visualSize(size.x * visualScale, size.y * visualScale);
+    const ImVec2 visualPos(pos.x + (size.x - visualSize.x) * 0.5f,
+                           pos.y + (size.y - visualSize.y) * 0.5f);
     ImDrawList* draw = ImGui::GetWindowDrawList();
 
     if (g_MultiplayerButtonTexture != 0) {
         if (!rightAligned) {
             draw->AddImage(ToImGuiTexture(g_MultiplayerButtonTexture),
-                           pos, ImVec2(pos.x + size.x, pos.y + size.y),
+                           visualPos,
+                           ImVec2(visualPos.x + visualSize.x, visualPos.y + visualSize.y),
                            ImVec2(0.0f, 0.0f), ImVec2(1.0f, 1.0f));
         } else {
             draw->AddImage(ToImGuiTexture(g_MultiplayerButtonTexture),
-                           pos, ImVec2(pos.x + size.x, pos.y + size.y),
+                           visualPos,
+                           ImVec2(visualPos.x + visualSize.x, visualPos.y + visualSize.y),
                            ImVec2(1.0f, 0.0f), ImVec2(0.0f, 1.0f));
         }
-
-        if (hovered) {
-            draw->AddRectFilled(pos, ImVec2(pos.x + size.x, pos.y + size.y),
-                                IM_COL32(255, 255, 255, active ? 26 : 12));
-        }
+        // No rectangular hover overlay: the original button texture stays clean.
     } else {
-        draw->AddRectFilled(pos, ImVec2(pos.x + size.x, pos.y + size.y),
+        draw->AddRectFilled(visualPos,
+                            ImVec2(visualPos.x + visualSize.x, visualPos.y + visualSize.y),
                             IM_COL32(20, 24, 28, 205), 2.0f);
     }
 
     ImFont* font = g_GameUIFont ? g_GameUIFont : ImGui::GetFont();
     const float textSizePx = std::max(31.0f, 36.0f * textScale *
                                              std::max(0.90f, std::min(1.12f, ImGui::GetIO().DisplaySize.y / 1080.0f)));
-    ImVec2 measured = font->CalcTextSizeA(textSizePx, FLT_MAX, 0.0f, label);
-    ImVec2 textPos(
-        pos.x + (size.x - measured.x) * 0.5f,
-        pos.y + (size.y - measured.y) * 0.5f - 1.0f
+    const ImVec2 measured = font->CalcTextSizeA(textSizePx, FLT_MAX, 0.0f, label);
+    const ImVec2 textPos(
+        visualPos.x + (visualSize.x - measured.x) * 0.5f,
+        visualPos.y + (visualSize.y - measured.y) * 0.5f - 1.0f
     );
-    draw->AddText(font, textSizePx, textPos,
-                  IM_COL32(245, 245, 245, 255), label);
+    draw->AddText(font, textSizePx, textPos, IM_COL32(245, 245, 245, 255), label);
     return clicked;
 }
 
@@ -6823,35 +6868,35 @@ static bool DrawCenteredMirroredGameButton(const char* id, const char* label,
     const ImVec2 start = ImGui::GetCursorScreenPos();
 
     ImGui::SetCursorScreenPos(start);
-    ImGui::InvisibleButton(id, ImVec2(totalW, h));
-    bool clicked = ImGui::IsItemClicked(ImGuiMouseButton_Left);
+    const bool clicked = ImGui::InvisibleButton(id, ImVec2(totalW, h));
+    const bool pressed = ImGui::IsItemActive() && ImGui::IsMouseDown(ImGuiMouseButton_Left);
     if (clicked) PlayGameClickSound();
 
-    ImGui::SetCursorScreenPos(start);
+    const float visualScale = pressed ? 0.96f : 1.0f;
+    const ImVec2 visualSize(totalW * visualScale, h * visualScale);
+    const ImVec2 visualStart(start.x + (totalW - visualSize.x) * 0.5f,
+                             start.y + (h - visualSize.y) * 0.5f);
 
     if (g_MultiplayerButtonTexture != 0) {
-        // Buton 4 parcadan olusur: [sol uc][sol orta][sag orta][sag uc].
-        // Iki yarinin bulustugu orta noktada dokunun KENAR sutunu degil, ic kismi (midU)
-        // kullanilir; boylece birlesim yerinde bosluk/cizgi olmaz ve ust uste binme yoktur.
-        // Uclar (egimli kisim) eski olcekte cizilir, aradaki duz kisim gerilir.
-        const float overlap = std::min(42.0f, totalW * 0.055f);
-        const float refW = (totalW + overlap) * 0.5f;   // eski tasarimda dokunun tamaminin genisligi
-        const float capU0 = 0.86f;                      // egimli ucun basladigi u
-        const float midU  = 0.50f;                      // iki yarinin bulustugu (ic) u
+        // Keep the existing four-part mirrored texture; only its visual bounds shrink.
+        const float overlap = std::min(42.0f, visualSize.x * 0.055f);
+        const float refW = (visualSize.x + overlap) * 0.5f;
+        const float capU0 = 0.86f;
+        const float midU  = 0.50f;
         const float capPx = floorf((1.0f - capU0) * refW + 0.5f);
 
-        const float x0 = floorf(start.x + 0.5f);
-        const float x1 = x0 + floorf(totalW + 0.5f);
+        const float x0 = floorf(visualStart.x + 0.5f);
+        const float x1 = x0 + floorf(visualSize.x + 0.5f);
         const float xc = floorf((x0 + x1) * 0.5f + 0.5f);
-        const float y0 = start.y, y1 = start.y + h;
+        const float y0 = visualStart.y, y1 = visualStart.y + visualSize.y;
         ImTextureID tex = ToImGuiTexture(g_MultiplayerButtonTexture);
 
-        // Sag yari (duz)
+        // Right half (flat middle + right cap).
         draw->AddImage(tex, ImVec2(xc, y0), ImVec2(x1 - capPx, y1),
                        ImVec2(midU, 0.0f), ImVec2(capU0, 1.0f));
         draw->AddImage(tex, ImVec2(x1 - capPx, y0), ImVec2(x1, y1),
                        ImVec2(capU0, 0.0f), ImVec2(1.0f, 1.0f));
-        // Sol yari (aynali)
+        // Mirrored left half.
         draw->AddImage(tex, ImVec2(x0 + capPx, y0), ImVec2(xc, y1),
                        ImVec2(capU0, 0.0f), ImVec2(midU, 1.0f));
         draw->AddImage(tex, ImVec2(x0, y0), ImVec2(x0 + capPx, y1),
@@ -6861,11 +6906,11 @@ static bool DrawCenteredMirroredGameButton(const char* id, const char* label,
     ImFont* font = g_GameUIFont ? g_GameUIFont : ImGui::GetFont();
     const float textSizePx = std::max(31.0f, 36.0f * textScale *
                                              std::max(0.90f, std::min(1.12f, ImGui::GetIO().DisplaySize.y / 1080.0f)));
-    ImVec2 measured = font->CalcTextSizeA(textSizePx, FLT_MAX, 0.0f, label);
+    const ImVec2 measured = font->CalcTextSizeA(textSizePx, FLT_MAX, 0.0f, label);
     draw->AddText(font, textSizePx,
-                  ImVec2(start.x + (totalW - measured.x) * 0.5f,
-                         start.y + (h - measured.y) * 0.5f - 1.0f),
-                  IM_COL32(245,245,245,255), label);
+                  ImVec2(visualStart.x + (visualSize.x - measured.x) * 0.5f,
+                         visualStart.y + (visualSize.y - measured.y) * 0.5f - 1.0f),
+                  IM_COL32(245, 245, 245, 255), label);
     return clicked;
 }
 
@@ -6981,22 +7026,37 @@ static void DrawTypingBar(const ImVec2& screen) {
     ImGui::GetWindowDrawList()->AddLine(ImVec2(mn.x, mx.y + 2.0f), ImVec2(mx.x, mx.y + 2.0f),
                                         IM_COL32(0, 128, 128, 255), 2.0f);
 
-    // TAMAM button (clicked via ImGui or the raw touch, like the other buttons).
-    const ImVec2 winPos = ImGui::GetWindowPos();
+    // TAMAM also activates on release, not at the beginning of a touch.
     const ImVec2 btnLocal(screen.x - btnW - 16.0f, (barH - fh * 1.3f) * 0.5f);
     ImGui::SetCursorPos(btnLocal);
-    const bool btnClicked = ImGui::Button("TAMAM", ImVec2(btnW, fh * 1.3f));
-    const bool btnTouch = ConsumePendingTouchForRect(
-        ImVec2(winPos.x + btnLocal.x, winPos.y + btnLocal.y),
-        ImVec2(winPos.x + btnLocal.x + btnW, winPos.y + btnLocal.y + fh * 1.3f));
+    const ImVec2 btnSize(btnW, fh * 1.3f);
+    const ImVec2 btnPos = ImGui::GetCursorScreenPos();
+    const bool btnClicked = ImGui::InvisibleButton("##TypingBarDone", btnSize);
+    const bool btnPressed = ImGui::IsItemActive() && ImGui::IsMouseDown(ImGuiMouseButton_Left);
+    const float btnScale = btnPressed ? 0.96f : 1.0f;
+    const ImVec2 btnVisualSize(btnSize.x * btnScale, btnSize.y * btnScale);
+    const ImVec2 btnVisualPos(btnPos.x + (btnSize.x - btnVisualSize.x) * 0.5f,
+                              btnPos.y + (btnSize.y - btnVisualSize.y) * 0.5f);
+    ImDrawList* btnDraw = ImGui::GetWindowDrawList();
+    btnDraw->AddRectFilled(btnVisualPos,
+                           ImVec2(btnVisualPos.x + btnVisualSize.x, btnVisualPos.y + btnVisualSize.y),
+                           btnPressed ? IM_COL32(224, 224, 224, 255) : IM_COL32(245, 245, 245, 255), 4.0f);
+    btnDraw->AddRect(btnVisualPos,
+                     ImVec2(btnVisualPos.x + btnVisualSize.x, btnVisualPos.y + btnVisualSize.y),
+                     IM_COL32(115, 125, 130, 255), 4.0f, 0, 1.0f);
+    const char* doneLabel = "TAMAM";
+    const ImVec2 doneTextSize = ImGui::CalcTextSize(doneLabel);
+    btnDraw->AddText(ImVec2(btnVisualPos.x + (btnVisualSize.x - doneTextSize.x) * 0.5f,
+                            btnVisualPos.y + (btnVisualSize.y - doneTextSize.y) * 0.5f),
+                     IM_COL32(24, 30, 32, 255), doneLabel);
 
     ImGui::PopFont();
     ImGui::End();
     ImGui::PopStyleVar(2);
     ImGui::PopStyleColor(8);
 
-    if (btnClicked || btnTouch) PlayGameClickSound();
-    if (enterPressed || btnClicked || btnTouch) {
+    if (btnClicked) PlayGameClickSound();
+    if (enterPressed || btnClicked) {
         if (mode == 2) SubmitChatInput();
         s_barFocused = false;
         CloseAndroidKeyboard();
@@ -7230,6 +7290,7 @@ static void MpProceedToGame() {
 }
 
 void DrawImGui() {
+    static bool s_HudChatPressArmed = false;
     LoadOrCreateProfile();
     PersistNicknameIfChanged(g_AndroidKeyboardOpen.load() && g_KeyboardFieldMode.load() == 1);
     if (!g_ImGuiInitialized) {
@@ -7340,30 +7401,43 @@ void DrawImGui() {
         g_HudBtnX.store(cx); g_HudBtnY.store(cy); g_HudBtnR.store(r);
 
         const float dx = g_TouchX.load() - cx, dy = g_TouchY.load() - cy;
-        const bool pressed = g_TouchDown.load() && dx * dx + dy * dy <= r * r * 1.44f;
+        const bool insideNow = dx * dx + dy * dy <= r * r * 1.44f;
+        const bool pressed = g_TouchDown.load() && insideNow;
+        const float visualScale = pressed ? 0.95f : 1.0f;
+        const float vr = r * visualScale;
         ImDrawList* d = ImGui::GetForegroundDrawList();
         const ImVec2 c(cx, cy);
-        d->AddCircleFilled(c, r, pressed ? IM_COL32(60, 60, 60, 240) : IM_COL32(18, 18, 18, 235), 48);
-        d->AddCircle(c, r - r * 0.04f, IM_COL32(120, 120, 120, 255), 48, r * 0.07f);
-        // Sohbet balonu
+        d->AddCircleFilled(c, vr, pressed ? IM_COL32(60, 60, 60, 240) : IM_COL32(18, 18, 18, 235), 48);
+        d->AddCircle(c, vr - vr * 0.04f, IM_COL32(120, 120, 120, 255), 48, vr * 0.07f);
+        // Chat bubble scales with the pressed button, while its hitbox remains unchanged.
         const ImU32 white = IM_COL32(245, 245, 245, 255), dark = IM_COL32(18, 18, 18, 255);
-        d->AddRectFilled(ImVec2(cx - r * 0.50f, cy - r * 0.38f), ImVec2(cx + r * 0.50f, cy + r * 0.20f),
-                         white, r * 0.20f);
-        d->AddTriangleFilled(ImVec2(cx - r * 0.28f, cy + r * 0.15f), ImVec2(cx - r * 0.34f, cy + r * 0.46f),
-                             ImVec2(cx - r * 0.02f, cy + r * 0.15f), white);
+        d->AddRectFilled(ImVec2(cx - vr * 0.50f, cy - vr * 0.38f), ImVec2(cx + vr * 0.50f, cy + vr * 0.20f),
+                         white, vr * 0.20f);
+        d->AddTriangleFilled(ImVec2(cx - vr * 0.28f, cy + vr * 0.15f), ImVec2(cx - vr * 0.34f, cy + vr * 0.46f),
+                             ImVec2(cx - vr * 0.02f, cy + vr * 0.15f), white);
         for (int i = -1; i <= 1; ++i)
-            d->AddCircleFilled(ImVec2(cx + i * r * 0.24f, cy - r * 0.09f), r * 0.07f, dark, 12);
+            d->AddCircleFilled(ImVec2(cx + i * vr * 0.24f, cy - vr * 0.09f), vr * 0.07f, dark, 12);
 
+        // A raw DOWN only arms the button. The menu opens after UP, provided release
+        // is still inside the hitbox; this prevents instant activation on touch-down.
         if (g_PendingTouchDown.load()) {
             const float px = g_PendingTouchX.load() - cx, py = g_PendingTouchY.load() - cy;
             g_PendingTouchDown.store(false);
-            if (px * px + py * py <= r * r * 1.44f) {
+            s_HudChatPressArmed = (px * px + py * py <= r * r * 1.44f);
+        }
+        if (s_HudChatPressArmed && !g_TouchDown.load()) {
+            s_HudChatPressArmed = false;
+            const float rx = g_TouchX.load() - cx, ry = g_TouchY.load() - cy;
+            if (rx * rx + ry * ry <= r * r * 1.44f) {
                 PlayGameClickSound();
                 g_MpFromLan = false;
                 g_MpView = MPV_ROOM;
                 g_IsMultiplayerMenuActive = true;
             }
         }
+    } else {
+        // Do not leave a stale press armed when the HUD button is not visible.
+        s_HudChatPressArmed = false;
     }
 
     if (g_IsMultiplayerMenuActive) {
@@ -7612,15 +7686,6 @@ void DrawImGui() {
                         // child sınırını büyütmek için SetCursorScreenPos kullanmıyoruz.
                         // Dummy() her oda satırını temiz şekilde aşağı taşır ve ImGui
                         // parent sınırlarını da doğru hesaplar.
-                        const ImVec2 roomButtonMin = ImGui::GetCursorScreenPos();
-                        const ImVec2 roomButtonMax(
-                            roomButtonMin.x + roomW,
-                            roomButtonMin.y + roomH
-                        );
-
-                        const bool roomTouch =
-                            ConsumePendingTouchForRect(roomButtonMin, roomButtonMax);
-
                         const bool roomClicked = DrawGameStyleButton(
                             roomId,
                             roomLabel.c_str(),
@@ -7629,8 +7694,7 @@ void DrawImGui() {
                             false
                         );
 
-                        if (roomTouch && !roomClicked) PlayGameClickSound();
-                        if (roomClicked || roomTouch) {
+                        if (roomClicked) {
                             if (!g_IsHost.load() && !g_IsClient.load()) {
                                 ClearChat();
                                 g_IsClient.store(true);
