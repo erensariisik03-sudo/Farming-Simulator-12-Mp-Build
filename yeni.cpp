@@ -1873,6 +1873,41 @@ static uint8_t g_RemoteToolType[64];
 static bool g_TrailerMine[256];                // bu cihaz bu romorkun konumunu yayinliyor
 static uint8_t g_RemoteTrailerType[256];       // uzaktan gelen son tip (dogrulama icin)
 
+// ---- Serbest (araca bagli olmayan) alet/romork icin tek yonlu aktarim ----
+// Balya sistemindeki mantigin aynisi: hareketi yalnizca TEK cihaz (arac otoritesi yakinda olan, yoksa host) yayinlar;
+// diger cihazlar gelen konumu "sensor" modunda (carpisma tepkisi yok) uygular, uzaktan hareket bitince yerel fizik geri gelir.
+// Boylece ust uste duran 10 pulluk her cihazda farkli yone kaymaz.
+static const float kLooseNearVehicleR2 = 10.0f * 10.0f;       // otorite sahibi arac bu mesafedeyse nesneyi o iter
+static const uint64_t kLooseRemoteFreshMs = 1500;             // uzaktan akis bu kadar tazeyse bu cihaz yayin yapmaz
+static const uint64_t kLooseSensorIdleMs = 800;               // uzaktan hareket bitince fizik bu sure sonra geri gelir
+static uintptr_t g_AttSensorBody[2][256];                     // [alet?1:0][sira]: sensor yapilan govde (0 = degil)
+static uint32_t  g_AttSensorMask[2][256];                     // sensor yapmadan once SENSOR OLMAYAN fixture'lar (bit = fixture sirasi)
+static uint64_t  g_AttSensorMs[2][256];
+
+// Govdenin sensor OLMAYAN butun fixture'larini sensor yapar; hangilerini degistirdigini maske olarak dondurur.
+static uint32_t B2BodyMakeSensor(uintptr_t body) {
+    if (!body) return 0;
+    const int fc = *(volatile int*)(body + 0x6C);
+    if (fc <= 0 || fc > 32) return 0;
+    uint32_t mask = 0;
+    uintptr_t f = *(uintptr_t*)(body + 0x68);
+    for (int n = 0; f != 0 && n < fc; ++n, f = *(uintptr_t*)(f + 0x14)) {
+        if (*(volatile uint8_t*)(f + 0x32) == 0) { *(volatile uint8_t*)(f + 0x32) = 1; mask |= (1u << n); }
+    }
+    return mask;
+}
+// B2BodyMakeSensor'un degistirdigi fixture'lari eski haline dondurur ve govdeyi uyandirir.
+static void B2BodyRestoreSensor(uintptr_t body, uint32_t mask) {
+    if (!body) return;
+    const int fc = *(volatile int*)(body + 0x6C);
+    if (fc <= 0 || fc > 32) return;
+    uintptr_t f = *(uintptr_t*)(body + 0x68);
+    for (int n = 0; f != 0 && n < fc; ++n, f = *(uintptr_t*)(f + 0x14)) {
+        if (mask & (1u << n)) *(volatile uint8_t*)(f + 0x32) = 0;
+    }
+    if (*(int*)body != 0) { *(uint16_t*)(body + 4) |= 2; *(float*)(body + 0x90) = 0.0f; }
+}
+
 // ---- Romork takma/cikarma olayi ve varlik durumu (doluluk, bicer) paketleri ----
 struct __attribute__((packed)) TrailerAttachPacket {
     uint8_t type;
@@ -2595,6 +2630,9 @@ static void PoolTake(uintptr_t game, std::vector<uintptr_t>* snap) {
 static void PoolOnChanged() {
     memset(g_TrailerMine, 0, sizeof(g_TrailerMine));
     memset(g_ToolMine, 0, sizeof(g_ToolMine));
+    memset(g_AttSensorBody, 0, sizeof(g_AttSensorBody));
+    memset(g_AttSensorMask, 0, sizeof(g_AttSensorMask));
+    memset(g_AttSensorMs, 0, sizeof(g_AttSensorMs));
     std::lock_guard<std::mutex> lock(g_VehicleStateMutex);
     for (uint16_t i = 0; i < 64; ++i) ClearVehicleStateSlot((uint16_t)(TRAILER_ID_BASE + i));
     for (uint16_t i = 0; i < 64; ++i) ClearVehicleStateSlot((uint16_t)(TOOL_ID_BASE + i));
@@ -4307,6 +4345,8 @@ static void CaptureAndQueueLocalTrailerStates(uintptr_t game, uint8_t localOwner
     const uintptr_t bodyOff = tool ? 0x228 : 0x180;
     const uintptr_t avOff = tool ? 0x23C : 0x184;
     const uintptr_t activeVeh = LocalActiveVehiclePtr(game);
+    static std::vector<BaleLocalVehiclePoint> vpts;               // otorite sahibi yerel araclar (gerekince, kare basina bir kez)
+    bool vptsDone = false;
     for (uint32_t i = 0; i < n; ++i) {
         const uintptr_t tp = tool ? RawToolSlot(game, i) : RawTrailerSlot(game, i);
         if (tp == 0) continue;
@@ -4343,6 +4383,36 @@ static void CaptureAndQueueLocalTrailerStates(uintptr_t game, uint8_t localOwner
                 }
             }
             if (towedByMe) mineArr[i] = true;
+        } else {
+            // Serbest nesne (pulluk/romork araca bagli degil): tek yonlu yayin kurali (balya sistemiyle ayni).
+            //  1) Yerel otorite sahibi arac yakindaysa ve nesne oynuyorsa: bu cihaz yayinlar (araci iten cihaz).
+            //  2) Yakinda otorite araci yoksa, oynayan nesneyi host yayinlar (ust uste duran aletlerin kaymasi tek kaynaktan gelir).
+            //  3) Baska cihazdan taze akis varsa ve yakinda yerel otorite araci yoksa bu cihaz yayini birakir.
+            const bool wasMine = mineArr[i];
+            bool nearAuth = false;
+            if (moving || wasMine) {
+                if (!vptsDone) { BaleLocalVehiclePoints(game, &vpts); vptsDone = true; }
+                for (size_t k = 0; k < vpts.size(); ++k) {
+                    const float dx = vpts[k].x - x, dy = vpts[k].y - y;
+                    if (dx * dx + dy * dy <= kLooseNearVehicleR2) { nearAuth = true; break; }
+                }
+            }
+            bool remoteFresh = false;
+            {
+                std::lock_guard<std::mutex> lock(g_VehicleStateMutex);
+                const VehicleRemoteState& rs = g_RemoteVehicles[sid];
+                remoteFresh = rs.valid && rs.ownerId != localOwner && rs.ownerId != VEHICLE_OWNER_NONE &&
+                              nowMs >= rs.lastReceiveMs && (nowMs - rs.lastReceiveMs) < kLooseRemoteFreshMs;
+            }
+            if (!wasMine && moving) {
+                if (nearAuth || (g_IsHost.load() && !remoteFresh)) mineArr[i] = true;
+            } else if (wasMine && !nearAuth && remoteFresh) {
+                mineArr[i] = false;                                 // baska cihaz iteliyor: akisi ona birak
+                g_LocalStationarySince[sid] = 0;
+                std::lock_guard<std::mutex> lock(g_VehicleStateMutex);
+                g_LastSentLocalVehicles[sid].valid = false;
+                continue;
+            }
         }
         if (!mineArr[i]) continue;
 
@@ -4554,8 +4624,20 @@ static void ApplyRemoteAttachablePoses(uintptr_t game, uint8_t localOwner, uint6
     const bool* mineArr = tool ? g_ToolMine : g_TrailerMine;
     const uintptr_t bodyOff = tool ? 0x228 : 0x180;
     const uintptr_t avOff = tool ? 0x23C : 0x184;
-    for (uint32_t i = 0; i < tn; ++i) {
+    const int ti = tool ? 1 : 0;
+    for (uint32_t i = 0; i < tn && i < 256; ++i) {
         const uint16_t sid = (uint16_t)(idBase + i);
+        // Uzaktan hareket bitti / nesne baglandi / bu cihaz yayinlamaya basladi: yerel fizigi geri ver.
+        if (g_AttSensorBody[ti][i] != 0) {
+            const uintptr_t tp0 = tool ? RawToolSlot(game, i) : RawTrailerSlot(game, i);
+            const uintptr_t b0 = tp0 ? *(uintptr_t*)(tp0 + bodyOff) : 0;
+            const bool same = (b0 == g_AttSensorBody[ti][i]);
+            const bool attached0 = tp0 && *(uintptr_t*)(tp0 + avOff) != 0;
+            if (!same || mineArr[i] || attached0 || nowMs - g_AttSensorMs[ti][i] > kLooseSensorIdleMs) {
+                if (same) B2BodyRestoreSensor(b0, g_AttSensorMask[ti][i]);
+                g_AttSensorBody[ti][i] = 0; g_AttSensorMask[ti][i] = 0;
+            }
+        }
         VehicleRemoteState state;
         {
             std::lock_guard<std::mutex> lock(g_VehicleStateMutex);
@@ -4586,6 +4668,15 @@ static void ApplyRemoteAttachablePoses(uintptr_t game, uint8_t localOwner, uint6
         TestB2Vec2 position;
         position.x = poseX + state.errX;
         position.y = poseY + state.errY;
+        // Uzaktan yonetilen serbest nesne: yerel carpisma tepkisi kapali (sensor) -> ust uste duran/itilen aletler
+        // bu cihazda ayrica kaymaz, yalnizca gelen akisi izler.
+        if (g_AttSensorBody[ti][i] != body) {
+            if (g_AttSensorBody[ti][i] != 0) { g_AttSensorBody[ti][i] = 0; g_AttSensorMask[ti][i] = 0; }
+            const uint32_t m = B2BodyMakeSensor(body);
+            g_AttSensorBody[ti][i] = body;
+            g_AttSensorMask[ti][i] = m;
+        }
+        g_AttSensorMs[ti][i] = nowMs;
         g_b2BodySetTransform((void*)body, &position, poseAngle + state.errA);
 
         if (state.moving) {
@@ -5015,6 +5106,9 @@ static void ResetVehicleSyncState() {
     memset(g_TrTrack, 0, sizeof(g_TrTrack));
     memset(g_ToolTrack, 0, sizeof(g_ToolTrack));
     memset(g_ToolMine, 0, sizeof(g_ToolMine));
+    memset(g_AttSensorBody, 0, sizeof(g_AttSensorBody));
+    memset(g_AttSensorMask, 0, sizeof(g_AttSensorMask));
+    memset(g_AttSensorMs, 0, sizeof(g_AttSensorMs));
     memset(g_CbTrack, 0, sizeof(g_CbTrack));
     memset(g_AiMirrored, 0, sizeof(g_AiMirrored));
     g_RemoteHornUntilMs.store(0);
@@ -8345,7 +8439,7 @@ void* my_renderStartMenuMain(void* thiz, void* p1, void* p2, void* p3) {
 // ========================================================================
 __attribute__((constructor))
 void ModMain() {
-    LOGI(">>> MULTIPLAYER MOD STARTING <<< build=shopfix-21+resume-sync+ai-press-detect+bale-local-owner");
+    LOGI(">>> MULTIPLAYER MOD STARTING <<< build=shopfix-22+loose-tool-oneway+bale-local-owner");
 
     ResetVehicleSyncState();
     std::thread(StartPONGResponderThread).detach();
