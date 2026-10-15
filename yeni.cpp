@@ -4340,6 +4340,155 @@ static void TrafficFrame(uintptr_t game) {
     }
 }
 
+// ========================================================================
+// DUNYA DURUMU: SILO STOGU, BIYOGAZ, SATIS NOKTASI FIYATLARI
+// Oyun bu degerleri varlik (arac/romork/alet) update'leri icinde degistirir: romork silodan dolarken ya da bosaltirken
+// Game+0x6a8.. (4 mahsul stogu) azalir/artar, Game+0x6b8 biyogaz dolulugu artar, satista TipSite fiyati (+0x10+4*mahsul) duser.
+// Bu degerler cihazlar arasinda AKTARILMIYORDU (yalnizca para aktariliyordu).
+// Kural (para korumasiyla ayni): GERCEK (hayalet olmayan) varlik update'indeki degisim bu cihazin "delta"sidir ve 150 ms'de
+// bir yayinlanir; HAYALET varlik update'indeki degisim geri alinir (ayni olay her cihazda tekrar sayilmasin, ayni aractaki iki
+// kisi de 2 kat saymasin). Gelen deltalar yerel degere eklenir. Ayrica host her 4 sn'de mutlak durumu (stoklar + tum
+// satis fiyatlari) yollar; client son 2 sn'de yerel degisiklik yaptiysa onu atlar.
+// ========================================================================
+static const bool kSyncWorld = true;
+static const uint8_t PACKET_WORLD_DELTA = 40;     // [type][ownerId][count] + count*{u16 idx, float delta}; host iletir
+static const uint8_t PACKET_PRICE_TABLE = 41;     // host -> client: [type][sites] + 5 stok + sites*4 fiyat (mutlak)
+static const int kWorldSites = 16;
+static const int kWorldStocks = 5;                // idx 0..3: Game+0x6a8+4*i, idx 4: Game+0x6b8 (biyogaz)
+static const int kWorldN = kWorldStocks + kWorldSites * 4;
+struct __attribute__((packed)) WorldDeltaHeader { uint8_t type; uint8_t ownerId; uint8_t count; };
+struct __attribute__((packed)) WorldDeltaEntry { uint16_t idx; float d; };
+struct __attribute__((packed)) PriceTableHeader { uint8_t type; uint8_t sites; };
+static const size_t kPriceTableMaxBytes = sizeof(PriceTableHeader) + (size_t)(kWorldStocks + kWorldSites * 4) * 4;
+static float g_WorldAcc[kWorldN];                              // sadece oyun thread'i
+static long long g_WorldLocalMs = 0;
+static long long g_WorldFlushMs = 0, g_PriceTblMs = 0;
+static std::vector<WorldDeltaEntry> g_PendingWorld;            // g_VehicleEventMutex ile korunur
+static uint8_t g_PendingPriceBuf[kPriceTableMaxBytes];         // g_VehicleEventMutex ile korunur
+static size_t g_PendingPriceLen = 0;
+static int g_WorldLogs = 0;
+
+static volatile float* WorldPtr(uintptr_t game, int idx) {
+    if (!game || idx < 0) return nullptr;
+    if (idx < 4) return (volatile float*)(game + 0x6A8 + (uintptr_t)idx * 4u);
+    if (idx == 4) return (volatile float*)(game + 0x6B8);
+    const int k = idx - kWorldStocks;
+    const int s = k >> 2, f = k & 3;
+    if (s >= kWorldSites) return nullptr;
+    const uintptr_t map = *(volatile uintptr_t*)(game + 0x704);
+    if (!map) return nullptr;
+    const uintptr_t tbl = *(volatile uintptr_t*)(map + 0x724);
+    const int32_t cnt = *(volatile int32_t*)(map + 0x728);
+    if (!tbl || cnt <= 0 || cnt > 64 || s >= cnt) return nullptr;
+    return (volatile float*)(tbl + (uintptr_t)s * 0x80u + 0x10u + (uintptr_t)f * 4u);
+}
+
+static int WorldSiteCount(uintptr_t game) {
+    const uintptr_t map = *(volatile uintptr_t*)(game + 0x704);
+    if (!map) return 0;
+    const int32_t cnt = *(volatile int32_t*)(map + 0x728);
+    if (cnt <= 0 || cnt > 64 || !*(volatile uintptr_t*)(map + 0x724)) return 0;
+    return cnt > kWorldSites ? kWorldSites : cnt;
+}
+
+// Tum izlenen degerleri okur; dondurdugu sayi = gecerli idx sayisi (idx 0..n-1).
+static int WorldRead(uintptr_t game, float* out) {
+    const int n = kWorldStocks + WorldSiteCount(game) * 4;
+    for (int i = 0; i < n; ++i) {
+        volatile float* p = WorldPtr(game, i);
+        out[i] = p ? *p : 0.0f;
+    }
+    return n;
+}
+
+// Oyun thread'i, durum 6, her karede.
+static void WorldSyncFrame(uintptr_t game) {
+    if (!kSyncWorld || game == 0) return;
+    if (!g_IsConnected.load() || !g_VehNetArmed.load()) {
+        memset(g_WorldAcc, 0, sizeof(g_WorldAcc));
+        std::lock_guard<std::mutex> lock(g_VehicleEventMutex);
+        g_PendingWorld.clear();
+        g_PendingPriceLen = 0;
+        return;
+    }
+    const long long now = NowMs();
+
+    // 1) bu cihazin gercek varliklarindan biriken degisimleri yayinla
+    if (now - g_WorldFlushMs >= 150) {
+        g_WorldFlushMs = now;
+        uint8_t buf[sizeof(WorldDeltaHeader) + 16 * sizeof(WorldDeltaEntry)];
+        WorldDeltaHeader h; h.type = PACKET_WORLD_DELTA; h.ownerId = g_LocalPlayerId.load(); h.count = 0;
+        size_t off = sizeof(h);
+        for (int i = 0; i < kWorldN && h.count < 16; ++i) {
+            const float d = g_WorldAcc[i];
+            if (!(d == d) || fabsf(d) < 1.0e-4f) { if (!(d == d)) g_WorldAcc[i] = 0.0f; continue; }
+            WorldDeltaEntry e; e.idx = (uint16_t)i; e.d = d;
+            memcpy(buf + off, &e, sizeof(e)); off += sizeof(e); ++h.count;
+            g_WorldAcc[i] = 0.0f;
+        }
+        if (h.count > 0) {
+            memcpy(buf, &h, sizeof(h));
+            QueueVehicleEvent(buf, off);
+            g_WorldLocalMs = now;
+        }
+    }
+
+    // 2) baska cihazlardan gelen degisimleri uygula
+    std::vector<WorldDeltaEntry> pend;
+    uint8_t tbl[kPriceTableMaxBytes];
+    size_t tblLen = 0;
+    {
+        std::lock_guard<std::mutex> lock(g_VehicleEventMutex);
+        pend.swap(g_PendingWorld);
+        if (g_PendingPriceLen > 0) { memcpy(tbl, g_PendingPriceBuf, g_PendingPriceLen); tblLen = g_PendingPriceLen; g_PendingPriceLen = 0; }
+    }
+    for (size_t k = 0; k < pend.size(); ++k) {
+        const int idx = pend[k].idx;
+        const float d = pend[k].d;
+        if (!(d == d) || fabsf(d) > 1.0e7f) continue;
+        volatile float* p = WorldPtr(game, idx);
+        if (!p) continue;
+        float v = *p + d;
+        if (!(v == v) || v < 0.0f) v = 0.0f;
+        if (idx == 4 && v > 100000.0f) v = 100000.0f;
+        if (idx >= kWorldStocks) {                                 // fiyat: satis noktasinin azami fiyatini (+0x30) gecmesin
+            const float mx = *(volatile float*)((uintptr_t)p + 0x20);
+            if (mx > 0.0f && v > mx) v = mx;
+        }
+        *p = v;
+    }
+    if (tblLen >= sizeof(PriceTableHeader) && !g_IsHost.load() && now - g_WorldLocalMs >= 2000) {
+        PriceTableHeader th; memcpy(&th, tbl, sizeof(th));
+        const size_t need = sizeof(th) + (size_t)(kWorldStocks + (size_t)th.sites * 4) * 4;
+        if (th.sites <= kWorldSites && need <= tblLen) {
+            const int mySites = WorldSiteCount(game);
+            const int n = kWorldStocks + (th.sites < mySites ? th.sites : mySites) * 4;
+            for (int i = 0; i < n; ++i) {
+                float v; memcpy(&v, tbl + sizeof(th) + (size_t)i * 4, sizeof(v));
+                if (!(v == v) || v < 0.0f || v > 1.0e8f) continue;
+                volatile float* p = WorldPtr(game, i);
+                if (p) *p = v;
+            }
+            if (g_WorldLogs < 5) { ++g_WorldLogs; LOGI("[WORLD] client: host stok+fiyat tablosu uygulandi (satis noktasi=%u)", (unsigned)th.sites); }
+        }
+    }
+
+    // 3) host: mutlak durumu (stoklar + fiyatlar) periyodik yayinla
+    if (g_IsHost.load() && now - g_PriceTblMs >= 4000) {
+        g_PriceTblMs = now;
+        const int sites = WorldSiteCount(game);
+        uint8_t buf[kPriceTableMaxBytes];
+        PriceTableHeader th; th.type = PACKET_PRICE_TABLE; th.sites = (uint8_t)sites;
+        memcpy(buf, &th, sizeof(th));
+        float vals[kWorldN];
+        const int n = WorldRead(game, vals);
+        if (n == kWorldStocks + sites * 4) {
+            memcpy(buf + sizeof(th), vals, (size_t)n * 4);
+            QueueVehicleEvent(buf, sizeof(th) + (size_t)n * 4);
+        }
+    }
+}
+
 // Oyun thread'i, durum 6, her karede.
 static void ResumeSyncFrame(uintptr_t game) {
     if (g_RestResendAll.exchange(false)) SendRestPoses(game);
@@ -5701,6 +5850,17 @@ static bool ProcessPackets(uint8_t* buf, size_t& buffered, int peerId, std::vect
             if (buf[1] > kRestPoseMax) return false;
             size = sizeof(RestPoseHeader) + (size_t)buf[1] * sizeof(RestPoseEntry);
         }
+        else if (type == PACKET_WORLD_DELTA) {
+            if (buffered < sizeof(WorldDeltaHeader)) break;
+            if (buf[2] > 16) return false;
+            size = sizeof(WorldDeltaHeader) + (size_t)buf[2] * sizeof(WorldDeltaEntry);
+            relayIt = true;
+        }
+        else if (type == PACKET_PRICE_TABLE) {
+            if (buffered < sizeof(PriceTableHeader)) break;
+            if (buf[1] > kWorldSites) return false;
+            size = sizeof(PriceTableHeader) + (size_t)(kWorldStocks + (size_t)buf[1] * 4) * 4;
+        }
         else if (type == PACKET_TRAFFIC) {
             if (buffered < sizeof(TrafficHeader)) break;
             if (buf[2] > kTrafficMax) return false;
@@ -5999,6 +6159,21 @@ static bool ProcessPackets(uint8_t* buf, size_t& buffered, int peerId, std::vect
                 g_RestResendAll.store(true);
                 g_ForceResendAll.store(true);
                 g_EntityResendAll.store(true);
+            }
+        } else if (type == PACKET_WORLD_DELTA) {
+            if (kSyncWorld && buf[1] != g_LocalPlayerId.load() && buf[2] > 0 && buf[2] <= 16) {
+                std::lock_guard<std::mutex> lock(g_VehicleEventMutex);
+                for (uint8_t k = 0; k < buf[2] && g_PendingWorld.size() < 256; ++k) {
+                    WorldDeltaEntry e;
+                    memcpy(&e, buf + sizeof(WorldDeltaHeader) + (size_t)k * sizeof(WorldDeltaEntry), sizeof(e));
+                    g_PendingWorld.push_back(e);
+                }
+            }
+        } else if (type == PACKET_PRICE_TABLE) {
+            if (kSyncWorld && !g_IsHost.load() && !fromPeer && size <= kPriceTableMaxBytes) {
+                std::lock_guard<std::mutex> lock(g_VehicleEventMutex);
+                memcpy(g_PendingPriceBuf, buf, size);
+                g_PendingPriceLen = size;
             }
         } else if (type == PACKET_TRAFFIC) {
             if (buf[1] != g_LocalPlayerId.load()) g_TrLastRxMs.store(NowMs());
@@ -8180,15 +8355,45 @@ static void* GuardedEntityUpdate(EntityUpdate_t orig, uintptr_t ownerVeh, const 
                                  uint32_t a, uint32_t b, uint32_t c, uint32_t d, uint32_t e) {
     if (!orig) return nullptr;
     const uintptr_t g = g_EngineInstance;
-    if (g == 0 || !kSharedMoney || !g_IsConnected.load() || !g_VehNetArmed.load() || !IsGhostVehiclePtr(ownerVeh))
+    if (g == 0 || !kSharedMoney || !g_IsConnected.load() || !g_VehNetArmed.load())
         return orig(thiz, a, b, c, d, e);
-    const double before = ReadMoney(g);
+    const bool ghost = IsGhostVehiclePtr(ownerVeh);
+
+    // Dunya durumu (silo stogu, biyogaz, satis fiyatlari): en dis update'te olc. Hayalette geri al, gercekte delta olarak biriktir.
+    static int s_worldDepth = 0;
+    const bool measureWorld = kSyncWorld && s_worldDepth == 0;
+    float wBefore[kWorldN];
+    int wN = 0;
+    if (measureWorld) wN = WorldRead(g, wBefore);
+    ++s_worldDepth;
+
+    const double before = ghost ? ReadMoney(g) : 0.0;
     void* r = orig(thiz, a, b, c, d, e);
-    const double after = ReadMoney(g);
-    if (after != before) {
-        WriteMoney(g, before);
-        if (g_MoneyGuardLogs.fetch_add(1) < 30)
-            LOGI("[MONEY] hayalet %s para degisimi geri alindi: %+.2f", name, after - before);
+    --s_worldDepth;
+    if (ghost) {
+        const double after = ReadMoney(g);
+        if (after != before) {
+            WriteMoney(g, before);
+            if (g_MoneyGuardLogs.fetch_add(1) < 30)
+                LOGI("[MONEY] hayalet %s para degisimi geri alindi: %+.2f", name, after - before);
+        }
+    }
+    if (measureWorld && wN > 0) {
+        float wAfter[kWorldN];
+        const int n2 = WorldRead(g, wAfter);
+        if (n2 == wN) {
+            for (int i = 0; i < wN; ++i) {
+                if (wAfter[i] == wBefore[i]) continue;
+                const float dv = wAfter[i] - wBefore[i];
+                if (!(dv == dv) || fabsf(dv) > 1.0e7f) continue;
+                if (ghost) {
+                    volatile float* p = WorldPtr(g, i);
+                    if (p) *p = wBefore[i];
+                } else {
+                    g_WorldAcc[i] += dv;
+                }
+            }
+        }
     }
     return r;
 }
@@ -8475,6 +8680,7 @@ void my_GameUpdateStateBase(void* thiz, float param_1, uint32_t param_2, uint32_
         MiscSyncPost(g_EngineInstance);                    // host: fiyat listesi + gorev yayini | client: gorev tamamlama bildirimi
         ApplyRemoteVehicleStates(g_EngineInstance);
         TrafficFrame(g_EngineInstance);                    // NPC trafik: kendi araclarini yayinla, gelenleri ayna olarak surdur
+        WorldSyncFrame(g_EngineInstance);                  // silo stogu / biyogaz / satis fiyatlari: delta + host'un periyodik tablosu
         BaleFrame(g_EngineInstance);                    // CaptureAndQueueLocalVehicleState'ten ONCE (g_EntityResendAll orada silinir)
         CaptureAndQueueLocalVehicleState(g_EngineInstance);
         ActiveVehicleFrame(g_EngineInstance);
@@ -8714,7 +8920,7 @@ void* my_renderStartMenuMain(void* thiz, void* p1, void* p2, void* p3) {
 // ========================================================================
 __attribute__((constructor))
 void ModMain() {
-    LOGI(">>> MULTIPLAYER MOD STARTING <<< build=shopfix-25+loose-tool-oneway+traffic-follower+kb-done-fix");
+    LOGI(">>> MULTIPLAYER MOD STARTING <<< build=shopfix-26+loose-tool-oneway+traffic-follower+world-delta-silo-price");
 
     ResetVehicleSyncState();
     std::thread(StartPONGResponderThread).detach();
