@@ -4123,7 +4123,9 @@ static std::vector<TrafficPending> g_PendingTraffic;           // g_VehicleEvent
 
 static const uintptr_t kTrCountOff = 0x600;                    // Game+0x600: trafik arac sayisi
 static const uintptr_t kTrArrOff = 0x604;                      // Game+0x604 + i*4: TrafficVehicle* havuzu
-static const int kTrMirrorMax = 4;                             // ayni anda en fazla 4 ayna (yerel trafik dogsun diye)
+static const int kTrPoolSize = 5;                              // Game constructor'i SADECE 5 TrafficVehicle olusturur (0x604..0x617); sonrasi baska veri
+static const int kTrMirrorMax = 3;                             // ayni anda en fazla 3 ayna (yerel trafik de dogabilsin)
+static const float kTrClusterR2 = 220.0f * 220.0f;             // iki oyuncunun aktif araci bu kadar yakinsa ayni "bolge" sayilir
 static const float kTrSpawnR2 = 120.0f * 120.0f;               // ayna sadece yerel aktif aracin 120 m yakininda dogar
 static const float kTrKeepR2 = 150.0f * 150.0f;                // 150 m'den uzaklasinca kaldirilir
 struct TrafficMirror { bool used; uintptr_t ptr; uint8_t owner; uint16_t id; float x, y, a, vx, vy; long long rxMs; };
@@ -4201,16 +4203,44 @@ static void TrafficFrame(uintptr_t game) {
     }
     const long long now = NowMs();
     const int cnt0 = *(int*)(game + kTrCountOff);
-    if (cnt0 < 0 || cnt0 > (int)kTrafficMax) return;
+    if (cnt0 < 0 || cnt0 > kTrPoolSize) return;
 
-    // ---- yayin: bu cihazin GERCEK (ayna olmayan) trafik araclari, 8 Hz ----
+    // ---- yayin: SADECE gerekliyse ----
+    // Baska bir oyuncunun aktif araci bu cihazin aktif aracina yakin (ya da ayni arac) degilse kimsenin bu cihazin trafigini
+    // gormesi gerekmez: hic yayin yok. Yakin oyuncular varsa bolgenin trafigini yalnizca EN DUSUK numarali oyuncunun cihazi
+    // yayinlar (karsilikli / ikili yayin ve ayni aractaki iki kisinin cift yayini olmaz).
+    bool publish = false;
     if (now - g_TrLastSendMs >= 120) {
         g_TrLastSendMs = now;
+        float mx, my;
+        if (LocalActiveBodyPos(game, &mx, &my)) {
+            const uint8_t me = g_LocalPlayerId.load();
+            bool inCluster = false, lowerInCluster = false;
+            for (uint8_t pl = 0; pl < MAX_PLAYERS; ++pl) {
+                if (pl == me) continue;
+                int nid = -1;
+                {
+                    std::lock_guard<std::mutex> lock(g_ActiveMutex);
+                    if ((now - g_RemoteActive[pl].ms) < 6000) nid = g_RemoteActive[pl].netId;
+                }
+                if (nid < 0) continue;
+                const uintptr_t rv = GetVehicleFromIndex(game, (uint16_t)nid);
+                const uintptr_t rb = rv ? *(uintptr_t*)(rv + 0x528) : 0;
+                if (!rb) continue;
+                const float dx = *(float*)(rb + 0x0C) - mx, dy = *(float*)(rb + 0x10) - my;
+                if (!(dx == dx) || !(dy == dy) || dx * dx + dy * dy > kTrClusterR2) continue;
+                inCluster = true;
+                if (pl < me) lowerInCluster = true;
+            }
+            publish = inCluster && !lowerInCluster;
+        }
+    }
+    if (publish) {
         uint8_t buf[sizeof(TrafficHeader) + kTrafficMax * sizeof(TrafficEntry)];
         TrafficHeader h; h.type = PACKET_TRAFFIC; h.ownerId = g_LocalPlayerId.load(); h.count = 0;
         size_t off = sizeof(h);
         bool seen[12] = { false };
-        for (int i = 0; i < cnt0 && h.count < kTrafficMax; ++i) {
+        for (int i = 0; i < cnt0 && h.count < (uint8_t)kTrPoolSize; ++i) {
             const uintptr_t p = *(uintptr_t*)(game + kTrArrOff + (uintptr_t)i * 4u);
             if (!p || TrafficMirrorOfPtr(p)) continue;
             const uintptr_t body = *(uintptr_t*)(p + 0x6C);
@@ -4277,7 +4307,7 @@ static void TrafficFrame(uintptr_t game) {
         const float dx = e.x - lx, dy = e.y - ly;
         if (dx * dx + dy * dy > kTrSpawnR2) continue;              // bu cihazdaki oyuncu goremeyecegi kadar uzak
         const int cnt = *(int*)(game + kTrCountOff);
-        if (cnt < 0 || cnt >= (int)kTrafficMax - 1) continue;      // havuzda yer birak
+        if (cnt < 0 || cnt >= kTrPoolSize) continue;               // havuz (5 nesne) dolu: tasma = bellek bozulmasi
         TrafficMirror* slot = nullptr;
         for (int i = 0; i < kTrMirrorMax; ++i) if (!g_TrMir[i].used) { slot = &g_TrMir[i]; break; }
         if (!slot) continue;
@@ -4287,7 +4317,7 @@ static void TrafficFrame(uintptr_t game) {
         memcpy(&tBits, &tF, sizeof(tBits)); memcpy(&aBits, &aF, sizeof(aBits));
         const int idx = g_GameAddTrafficFn((void*)game, (uint32_t)(e.type & 1), (uint32_t)e.road, tBits,
                                            e.dir ? 1u : 0u, pos3, aBits, 0);
-        if (idx < 0 || idx >= (int)kTrafficMax) continue;
+        if (idx < 0 || idx >= kTrPoolSize) continue;
         const uintptr_t p = *(uintptr_t*)(game + kTrArrOff + (uintptr_t)idx * 4u);
         if (!p) continue;
         slot->used = true; slot->ptr = p; slot->owner = pe.owner; slot->id = e.id;
@@ -8672,7 +8702,7 @@ void* my_renderStartMenuMain(void* thiz, void* p1, void* p2, void* p3) {
 // ========================================================================
 __attribute__((constructor))
 void ModMain() {
-    LOGI(">>> MULTIPLAYER MOD STARTING <<< build=shopfix-23+loose-tool-oneway+traffic-mirror+kb-done-fix");
+    LOGI(">>> MULTIPLAYER MOD STARTING <<< build=shopfix-24+loose-tool-oneway+traffic-mirror-pool5+kb-done-fix");
 
     ResetVehicleSyncState();
     std::thread(StartPONGResponderThread).detach();
