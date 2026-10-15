@@ -613,6 +613,10 @@ static const uint8_t PACKET_RESUME = 36;          // client -> host: oyun arka p
 static const uint8_t PACKET_HOST_RESUME = 37;     // host -> client'lar: host oyuna dondu: son tarla durumu + arac konumlarini gonderin
 static const uint8_t PACKET_REST_POSE = 38;       // duran (sahipsiz) araclarin son konumlari (degisken uzunluk, iletilmez)
 static const uint8_t PACKET_FIELD_SNAP = 35;      // tek bir tarlanin tam durumu (ekili/bicilmis/surulmus/gubreli...), host iletir
+static const uint8_t PACKET_TRAFFIC = 39;         // NPC trafik araclari (yolcu/kamyon): her cihaz kendi civarindakileri yayinlar, host iletir
+struct __attribute__((packed)) TrafficHeader { uint8_t type; uint8_t ownerId; uint8_t count; };
+struct __attribute__((packed)) TrafficEntry { uint16_t id; uint8_t type; uint8_t dir; uint16_t road; float t, x, y, a, vx, vy; };
+static const uint32_t kTrafficMax = 10;           // oyunun trafik havuzu en fazla 10 arac
 
 // Baglanti sagligi: bu sureden uzun sessizlik = karsi taraf gitti (donmus / zorla kapatilmis).
 static const long long HOST_SILENCE_TIMEOUT_MS = 10000;  // client: host'tan hicbir sey gelmedi
@@ -1877,7 +1881,7 @@ static uint8_t g_RemoteTrailerType[256];       // uzaktan gelen son tip (dogrula
 // Balya sistemindeki mantigin aynisi: hareketi yalnizca TEK cihaz (arac otoritesi yakinda olan, yoksa host) yayinlar;
 // diger cihazlar gelen konumu "sensor" modunda (carpisma tepkisi yok) uygular, uzaktan hareket bitince yerel fizik geri gelir.
 // Boylece ust uste duran 10 pulluk her cihazda farkli yone kaymaz.
-static const float kLooseNearVehicleR2 = 10.0f * 10.0f;       // otorite sahibi arac bu mesafedeyse nesneyi o iter
+static const float kLooseNearVehicleR2 = 20.0f * 20.0f;      // otorite sahibi arac bu mesafedeyse nesneyi o iter
 static const uint64_t kLooseRemoteFreshMs = 1500;             // uzaktan akis bu kadar tazeyse bu cihaz yayin yapmaz
 static const uint64_t kLooseSensorIdleMs = 800;               // uzaktan hareket bitince fizik bu sure sonra geri gelir
 static uintptr_t g_AttSensorBody[2][256];                     // [alet?1:0][sira]: sensor yapilan govde (0 = degil)
@@ -3141,9 +3145,9 @@ static void BaleApplyOp(uintptr_t game, const BaleOpPacket& op, uint8_t localOwn
 // Baska cihazin suruculugu bu cihazda "hayalet" arac olarak balyanin icinden gecer ya da fizigi bozup balyayi koseye firlatir;
 // bu yuzden bir balyanin hareketi SADECE yerel gercek bir aracin yakininda olusmussa yayinlanir (yoksa host/sahip cihazin
 // akisi gecerlidir ve gelen konum yerel fizigin ustune yazilir).
-static const float kBaleNearVehicleR2 = 12.0f * 12.0f;
+static const float kBaleNearVehicleR2 = 20.0f * 20.0f;
 static const long long kBaleOwnHoldMs = 2500;                 // araci biraktiktan sonra balyanin kayip durmasi icin
-static const long long kBaleSendIntervalMs = 33;              // 30 Hz: balya hareketi daha dusuk gecikmeyle gitsin
+static const long long kBaleSendIntervalMs = 20;              // 50 Hz: balya hareketi daha dusuk gecikmeyle gitsin
 struct BaleLocalVehiclePoint {
     float x;
     float y;
@@ -3202,7 +3206,7 @@ static bool BaleSourceVehicleStillLocal(uintptr_t game, uint16_t vehicleId, uint
 static void BaleCapture(uintptr_t game, long long now) {
     static std::vector<BaleLocalVehiclePoint> vpts;                        // sadece otorite sahibi araclar (yeniden kullanilir)
     bool vptsDone = false;                                                 // arac noktalari sadece bir balya oynadiginda hesaplanir
-    int moveBudget = 12;                                                   // kare basina en fazla 12 tasima olayi (kuyrugu bogmaz)
+    int moveBudget = 16;                                              // kare basina en fazla 12 tasima olayi (kuyrugu bogmaz)
     struct Cur { uintptr_t p; float x, y, a; };
     Cur cur[kBaleMax];
     uint32_t cn = 0;
@@ -3265,7 +3269,7 @@ static void BaleCapture(uintptr_t game, long long now) {
         // Uzak cihaz balyayi yonetiyorsa, o cihazdan gelen fizik hareketini yerel surucuya
         // mal etme. Aksi halde her iki cihaz da ayni balyanin konum paketini uretmeye baslayabilir.
         const float dx = c.x - t.sx, dy = c.y - t.sy;
-        const bool moved = (dx * dx + dy * dy > 0.0004f) || GetAngleDelta(c.a, t.sa) > 0.03f;     // 2 cm / ~1.7 derece
+        const bool moved = (dx * dx + dy * dy > 0.00015f) || GetAngleDelta(c.a, t.sa) > 0.02f;    // ~1.2 cm / ~1.1 derece
         if (moved && !t.sensor && !t.hasTarget && !vptsDone) {
             BaleLocalVehiclePoints(game, &vpts);
             vptsDone = true;
@@ -4098,6 +4102,203 @@ static void ApplyRestPoses(uintptr_t game) {
     if (applied) LOGI("[RESUME] %d aracin son konumu uygulandi", applied);
 }
 
+// ========================================================================
+// NPC TRAFIK SENKRONU
+// Trafik araclari (yollardaki yolcu/kamyon) Game+0x600 sayaci + Game+0x604 havuzunda (en fazla 10) durur ve YALNIZCA
+// o cihazin aktif aracinin ~91 m civarinda dogar/yasar. Bu yuzden her cihazin trafigi farklidir.
+// Cozum: her cihaz kendi gercek trafik araclarini (konum/hiz/yol/tip) 8 Hz yayinlar; diger cihazlar bunlari "ayna" arac olarak
+// dogurur (Game::addTrafficVehicle), konumunu gelen akisa gore yumusakca surer ve carpismasiz (sensor) birakir.
+// Aynalar TrafficVehicle::update kancasinda yonetilir: yakin/taze oldukca yasar, akis kesilince ya da uzaklasinca oyunun kendi
+// dongusu tarafindan kaldirilir (update false doner).
+// ========================================================================
+static const bool kSyncTraffic = true;
+typedef int (*Game_addTraffic_t)(void* game, uint32_t type, uint32_t road, uint32_t tBits, uint32_t dir,
+                                 const float* pos3, uint32_t angBits, uint32_t zero);
+typedef uint32_t (*TrafficUpdate_t)(void* self, uint32_t dtBits, uint32_t gamePtr);
+static Game_addTraffic_t g_GameAddTrafficFn = nullptr;
+static TrafficUpdate_t orig_TrafficUpdate = nullptr;
+static bool g_TrafficHookOk = false;
+struct TrafficPending { uint8_t owner; TrafficEntry e; };
+static std::vector<TrafficPending> g_PendingTraffic;           // g_VehicleEventMutex ile korunur
+
+static const uintptr_t kTrCountOff = 0x600;                    // Game+0x600: trafik arac sayisi
+static const uintptr_t kTrArrOff = 0x604;                      // Game+0x604 + i*4: TrafficVehicle* havuzu
+static const int kTrMirrorMax = 4;                             // ayni anda en fazla 4 ayna (yerel trafik dogsun diye)
+static const float kTrSpawnR2 = 120.0f * 120.0f;               // ayna sadece yerel aktif aracin 120 m yakininda dogar
+static const float kTrKeepR2 = 150.0f * 150.0f;                // 150 m'den uzaklasinca kaldirilir
+struct TrafficMirror { bool used; uintptr_t ptr; uint8_t owner; uint16_t id; float x, y, a, vx, vy; long long rxMs; };
+static TrafficMirror g_TrMir[kTrMirrorMax];
+struct TrafficSendId { uintptr_t p; uint16_t id; float x, y; };
+static TrafficSendId g_TrSendIds[12];
+static uint16_t g_TrNextId = 1;
+static long long g_TrLastSendMs = 0;
+static int g_TrLogs = 0;
+
+static TrafficMirror* TrafficMirrorOfPtr(uintptr_t p) {
+    if (!p) return nullptr;
+    for (int i = 0; i < kTrMirrorMax; ++i) if (g_TrMir[i].used && g_TrMir[i].ptr == p) return &g_TrMir[i];
+    return nullptr;
+}
+
+static bool LocalActiveBodyPos(uintptr_t game, float* x, float* y) {
+    const uint32_t ai = *(uint32_t*)(game + 0xA8);
+    if (ai >= VehicleCount(game)) return false;
+    const uintptr_t v = RawVehicleSlot(game, ai);
+    if (!v) return false;
+    const uintptr_t b = *(uintptr_t*)(v + 0x528);
+    if (!b) return false;
+    *x = *(float*)(b + 0x0C); *y = *(float*)(b + 0x10);
+    return true;
+}
+
+static uint32_t my_TrafficVehicle_update(void* t, uint32_t dtBits, uint32_t gamePtr) {
+    if (!orig_TrafficUpdate) return 1;
+    TrafficMirror* m = t ? TrafficMirrorOfPtr((uintptr_t)t) : nullptr;
+    if (!m) return orig_TrafficUpdate(t, dtBits, gamePtr);
+
+    const long long now = NowMs();
+    bool keep = g_IsConnected.load() && (now - m->rxMs) < 2000;
+    float lx, ly;
+    if (keep && gamePtr && LocalActiveBodyPos((uintptr_t)gamePtr, &lx, &ly)) {
+        const float dx = m->x - lx, dy = m->y - ly;
+        if (dx * dx + dy * dy > kTrKeepR2) keep = false;
+    }
+    if (!keep) {                                                   // oyunun kendi dongusu removeTrafficVehicle + destroy yapar
+        m->used = false; m->ptr = 0;
+        return 0;
+    }
+    const uintptr_t body = *(uintptr_t*)((uintptr_t)t + 0x6C);
+    if (body && g_b2BodySetTransform) {
+        float dt; memcpy(&dt, &dtBits, sizeof(dt));
+        if (!(dt > 0.001f)) dt = 0.016f;
+        if (dt > 0.1f) dt = 0.1f;
+        float age = (float)(now - m->rxMs) * 0.001f;
+        if (age > 0.4f) age = 0.4f;
+        const float gx = m->x + m->vx * age, gy = m->y + m->vy * age;
+        const float cx = *(float*)(body + 0x0C), cy = *(float*)(body + 0x10), ca = *(float*)(body + 0x40);
+        const float ddx = gx - cx, ddy = gy - cy;
+        float nx, ny, na;
+        if (!(cx == cx) || !(cy == cy) || ddx * ddx + ddy * ddy > 25.0f) {
+            nx = gx; ny = gy; na = m->a;
+        } else {
+            const float alpha = 1.0f - expf(-dt / 0.06f);
+            nx = cx + ddx * alpha; ny = cy + ddy * alpha; na = ca + BaleWrapAngle(m->a - ca) * alpha;
+        }
+        TestB2Vec2 pos; pos.x = nx; pos.y = ny;
+        g_b2BodySetTransform((void*)body, &pos, na);
+        SetRemoteBodyVelocity(body, m->vx, m->vy, 0.0f);
+    }
+    orig_TrafficUpdate(t, dtBits, gamePtr);                        // gorunum matrisi/tekerlekler; kaldirma karari bizde
+    return 1;
+}
+
+static void TrafficFrame(uintptr_t game) {
+    if (!kSyncTraffic || game == 0) return;
+    if (!g_IsConnected.load() || !g_VehNetArmed.load()) {
+        std::lock_guard<std::mutex> lock(g_VehicleEventMutex);
+        g_PendingTraffic.clear();
+        return;
+    }
+    const long long now = NowMs();
+    const int cnt0 = *(int*)(game + kTrCountOff);
+    if (cnt0 < 0 || cnt0 > (int)kTrafficMax) return;
+
+    // ---- yayin: bu cihazin GERCEK (ayna olmayan) trafik araclari, 8 Hz ----
+    if (now - g_TrLastSendMs >= 120) {
+        g_TrLastSendMs = now;
+        uint8_t buf[sizeof(TrafficHeader) + kTrafficMax * sizeof(TrafficEntry)];
+        TrafficHeader h; h.type = PACKET_TRAFFIC; h.ownerId = g_LocalPlayerId.load(); h.count = 0;
+        size_t off = sizeof(h);
+        bool seen[12] = { false };
+        for (int i = 0; i < cnt0 && h.count < kTrafficMax; ++i) {
+            const uintptr_t p = *(uintptr_t*)(game + kTrArrOff + (uintptr_t)i * 4u);
+            if (!p || TrafficMirrorOfPtr(p)) continue;
+            const uintptr_t body = *(uintptr_t*)(p + 0x6C);
+            if (!body) continue;
+            const float x = *(float*)(body + 0x0C), y = *(float*)(body + 0x10), a = *(float*)(body + 0x40);
+            const float vx = *(float*)(body + 0x44), vy = *(float*)(body + 0x48);
+            if (!(x == x) || !(y == y) || !(a == a) || !(vx == vx) || !(vy == vy)) continue;
+            int s = -1;
+            for (int k = 0; k < 12; ++k) if (g_TrSendIds[k].p == p) { s = k; break; }
+            if (s >= 0) {
+                const float dx = x - g_TrSendIds[s].x, dy = y - g_TrSendIds[s].y;
+                if (dx * dx + dy * dy > 225.0f) { g_TrSendIds[s].id = g_TrNextId++; if (g_TrNextId == 0) g_TrNextId = 1; }   // havuz nesnesi baska araca yeniden verildi
+            } else {
+                for (int k = 0; k < 12; ++k) if (g_TrSendIds[k].p == 0) { s = k; break; }
+                if (s < 0) continue;
+                g_TrSendIds[s].p = p; g_TrSendIds[s].id = g_TrNextId++;
+                if (g_TrNextId == 0) g_TrNextId = 1;
+            }
+            g_TrSendIds[s].x = x; g_TrSendIds[s].y = y; seen[s] = true;
+
+            uint8_t type = 0;                                      // tip: mesh isaretcisi EntityManager tablosundakiyle eslesen
+            const uintptr_t mesh = *(uintptr_t*)(p + 0x50);
+            for (uint32_t k = 0; k < 2; ++k) {
+                if (*(uintptr_t*)(game + 0x708 + (uintptr_t)k * 0xA8 + 0x1C64 + 8) == mesh) { type = (uint8_t)k; break; }
+            }
+            TrafficEntry e;
+            memset(&e, 0, sizeof(e));
+            e.id = g_TrSendIds[s].id; e.type = type; e.dir = *(uint8_t*)(p + 0x248) ? 1 : 0;
+            e.road = (uint16_t)(*(uint32_t*)(p + 0x244) & 0xFFFF);
+            e.t = *(float*)(p + 0x240); e.x = x; e.y = y; e.a = a; e.vx = vx; e.vy = vy;
+            memcpy(buf + off, &e, sizeof(e)); off += sizeof(e); ++h.count;
+        }
+        for (int k = 0; k < 12; ++k) if (!seen[k]) g_TrSendIds[k].p = 0;
+        if (h.count > 0) {
+            memcpy(buf, &h, sizeof(h));
+            std::lock_guard<std::mutex> lock(g_VehicleEventMutex);
+            if (g_VehicleEventOut.size() < 2048) g_VehicleEventOut.insert(g_VehicleEventOut.end(), buf, buf + off);   // kuyruk doluysa bu tur atlanir (diger olaylar silinmesin)
+        }
+    }
+
+    // ---- alim: gelen trafik araclarini aynalara isle ----
+    std::vector<TrafficPending> pend;
+    {
+        std::lock_guard<std::mutex> lock(g_VehicleEventMutex);
+        pend.swap(g_PendingTraffic);
+    }
+    if (pend.empty()) return;
+    float lx = 0.0f, ly = 0.0f;
+    const bool haveLocal = LocalActiveBodyPos(game, &lx, &ly);
+    const uintptr_t map = *(uintptr_t*)(game + 0x704);
+    const uint32_t roadCount = map ? *(uint32_t*)(map + 0x720) : 0;
+    for (size_t k = 0; k < pend.size(); ++k) {
+        const TrafficPending& pe = pend[k];
+        const TrafficEntry& e = pe.e;
+        if (!(e.x == e.x) || !(e.y == e.y) || !(e.a == e.a) || !(e.vx == e.vx) || !(e.vy == e.vy) || !(e.t == e.t)) continue;
+        if (fabsf(e.x) > 1.0e5f || fabsf(e.y) > 1.0e5f || fabsf(e.vx) > 60.0f || fabsf(e.vy) > 60.0f) continue;
+        TrafficMirror* m = nullptr;
+        for (int i = 0; i < kTrMirrorMax; ++i) if (g_TrMir[i].used && g_TrMir[i].owner == pe.owner && g_TrMir[i].id == e.id) { m = &g_TrMir[i]; break; }
+        if (m) {
+            m->x = e.x; m->y = e.y; m->a = e.a; m->vx = e.vx; m->vy = e.vy; m->rxMs = now;
+            continue;
+        }
+        if (!g_TrafficHookOk || !g_GameAddTrafficFn || !haveLocal || e.road >= roadCount) continue;
+        const float dx = e.x - lx, dy = e.y - ly;
+        if (dx * dx + dy * dy > kTrSpawnR2) continue;              // bu cihazdaki oyuncu goremeyecegi kadar uzak
+        const int cnt = *(int*)(game + kTrCountOff);
+        if (cnt < 0 || cnt >= (int)kTrafficMax - 1) continue;      // havuzda yer birak
+        TrafficMirror* slot = nullptr;
+        for (int i = 0; i < kTrMirrorMax; ++i) if (!g_TrMir[i].used) { slot = &g_TrMir[i]; break; }
+        if (!slot) continue;
+        const float pos3[3] = { e.x, 0.0f, e.y };                  // Vector3: x, (kullanilmaz), y
+        uint32_t tBits, aBits;
+        const float tF = e.t, aF = e.a;
+        memcpy(&tBits, &tF, sizeof(tBits)); memcpy(&aBits, &aF, sizeof(aBits));
+        const int idx = g_GameAddTrafficFn((void*)game, (uint32_t)(e.type & 1), (uint32_t)e.road, tBits,
+                                           e.dir ? 1u : 0u, pos3, aBits, 0);
+        if (idx < 0 || idx >= (int)kTrafficMax) continue;
+        const uintptr_t p = *(uintptr_t*)(game + kTrArrOff + (uintptr_t)idx * 4u);
+        if (!p) continue;
+        slot->used = true; slot->ptr = p; slot->owner = pe.owner; slot->id = e.id;
+        slot->x = e.x; slot->y = e.y; slot->a = e.a; slot->vx = e.vx; slot->vy = e.vy; slot->rxMs = now;
+        const uintptr_t body = *(uintptr_t*)(p + 0x6C);
+        if (body) B2BodyMakeSensor(body);                          // ayna arac carpismasiz: asil arac sahibinin cihazinda carpisir
+        if (g_TrLogs < 20) { ++g_TrLogs; LOGI("[TRAFFIC] ayna dogdu oyuncu=%u id=%u tip=%u yol=%u (%.0f,%.0f)",
+                                               (unsigned)pe.owner, (unsigned)e.id, (unsigned)e.type, (unsigned)e.road, e.x, e.y); }
+    }
+}
+
 // Oyun thread'i, durum 6, her karede.
 static void ResumeSyncFrame(uintptr_t game) {
     if (g_RestResendAll.exchange(false)) SendRestPoses(game);
@@ -4388,6 +4589,17 @@ static void CaptureAndQueueLocalTrailerStates(uintptr_t game, uint8_t localOwner
             //  1) Yerel otorite sahibi arac yakindaysa ve nesne oynuyorsa: bu cihaz yayinlar (araci iten cihaz).
             //  2) Yakinda otorite araci yoksa, oynayan nesneyi host yayinlar (ust uste duran aletlerin kaymasi tek kaynaktan gelir).
             //  3) Baska cihazdan taze akis varsa ve yakinda yerel otorite araci yoksa bu cihaz yayini birakir.
+            // Yavas kayma (kare basina mm) kare-kare karsilastirmada "hareket" sayilmaz: ~1.2 cm'lik referans konumdan sapma da hareket say.
+            static float s_ref[2][256][3];
+            static bool s_refOk[2][256];
+            const int ti = tool ? 1 : 0;
+            if (i < 256) {
+                if (!s_refOk[ti][i] || fabsf(x - s_ref[ti][i][0]) > 0.012f || fabsf(y - s_ref[ti][i][1]) > 0.012f ||
+                    GetAngleDelta(angle, s_ref[ti][i][2]) > 0.01f) {
+                    if (s_refOk[ti][i]) moving = true;
+                    s_ref[ti][i][0] = x; s_ref[ti][i][1] = y; s_ref[ti][i][2] = angle; s_refOk[ti][i] = true;
+                }
+            }
             const bool wasMine = mineArr[i];
             bool nearAuth = false;
             if (moving || wasMine) {
@@ -5448,6 +5660,12 @@ static bool ProcessPackets(uint8_t* buf, size_t& buffered, int peerId, std::vect
             if (buf[1] > kRestPoseMax) return false;
             size = sizeof(RestPoseHeader) + (size_t)buf[1] * sizeof(RestPoseEntry);
         }
+        else if (type == PACKET_TRAFFIC) {
+            if (buffered < sizeof(TrafficHeader)) break;
+            if (buf[2] > kTrafficMax) return false;
+            size = sizeof(TrafficHeader) + (size_t)buf[2] * sizeof(TrafficEntry);
+            relayIt = true;
+        }
         else if (type == PACKET_PING) size = 1;
         else if (type == PACKET_AUTH_TABLE) {
             if (buffered < 3) break;
@@ -5740,6 +5958,16 @@ static bool ProcessPackets(uint8_t* buf, size_t& buffered, int peerId, std::vect
                 g_RestResendAll.store(true);
                 g_ForceResendAll.store(true);
                 g_EntityResendAll.store(true);
+            }
+        } else if (type == PACKET_TRAFFIC) {
+            if (buf[1] != g_LocalPlayerId.load() && buf[2] > 0 && buf[2] <= kTrafficMax) {
+                std::lock_guard<std::mutex> lock(g_VehicleEventMutex);
+                for (uint8_t k = 0; k < buf[2] && g_PendingTraffic.size() < 64; ++k) {
+                    TrafficPending e;
+                    e.owner = buf[1];
+                    memcpy(&e.e, buf + sizeof(TrafficHeader) + (size_t)k * sizeof(TrafficEntry), sizeof(TrafficEntry));
+                    g_PendingTraffic.push_back(e);
+                }
             }
         } else if (type == PACKET_REST_POSE) {
             if (buf[1] > 0 && buf[1] <= kRestPoseMax) {
@@ -7071,10 +7299,12 @@ static void DrawHeaderDarkening(const ImVec2& screen) {
 // ========================================================================
 static void DrawTypingBar(const ImVec2& screen) {
     static bool s_barFocused = false;
+    static bool s_btnHeld = false;       // parmak TAMAM'in uzerinde: bu sirada yazi kutusu odagi geri istenmez (tiklamayi iptal ederdi)
 
     const int mode = g_KeyboardFieldMode.load();
     if (!g_AndroidKeyboardOpen.load() || (mode != 1 && mode != 2) || g_GameUIFont == nullptr) {
         s_barFocused = false;
+        s_btnHeld = false;
         return;
     }
 
@@ -7110,7 +7340,7 @@ static void DrawTypingBar(const ImVec2& screen) {
     // Text field (kept focused so the key events always land here).
     ImGui::SetCursorPos(ImVec2(24.0f, (barH - fh) * 0.5f));
     ImGui::SetNextItemWidth(std::max(120.0f, screen.x - btnW - 56.0f));
-    if (!s_barFocused) ImGui::SetKeyboardFocusHere();
+    if (!s_barFocused && !s_btnHeld) ImGui::SetKeyboardFocusHere();
     const bool enterPressed = ImGui::InputTextWithHint("##TypingBarInput", hint, buf, bufSize,
                                                        ImGuiInputTextFlags_EnterReturnsTrue);
     s_barFocused = ImGui::IsItemActive();
@@ -7127,6 +7357,7 @@ static void DrawTypingBar(const ImVec2& screen) {
     const ImVec2 btnPos = ImGui::GetCursorScreenPos();
     const bool btnClicked = ImGui::InvisibleButton("##TypingBarDone", btnSize);
     const bool btnPressed = ImGui::IsItemActive() && ImGui::IsMouseDown(ImGuiMouseButton_Left);
+    s_btnHeld = btnPressed;
     const float btnScale = btnPressed ? 0.96f : 1.0f;
     const ImVec2 btnVisualSize(btnSize.x * btnScale, btnSize.y * btnScale);
     const ImVec2 btnVisualPos(btnPos.x + (btnSize.x - btnVisualSize.x) * 0.5f,
@@ -7153,6 +7384,7 @@ static void DrawTypingBar(const ImVec2& screen) {
     if (enterPressed || btnClicked) {
         if (mode == 2) SubmitChatInput();
         s_barFocused = false;
+        s_btnHeld = false;
         CloseAndroidKeyboard();
     }
 }
@@ -8200,7 +8432,8 @@ void my_GameUpdateStateBase(void* thiz, float param_1, uint32_t param_2, uint32_
         ResumeSyncFrame(g_EngineInstance);                 // geri donus: duran araclarin son konumlari
         MiscSyncPost(g_EngineInstance);                    // host: fiyat listesi + gorev yayini | client: gorev tamamlama bildirimi
         ApplyRemoteVehicleStates(g_EngineInstance);
-        BaleFrame(g_EngineInstance);                     // CaptureAndQueueLocalVehicleState'ten ONCE (g_EntityResendAll orada silinir)
+        TrafficFrame(g_EngineInstance);                    // NPC trafik: kendi araclarini yayinla, gelenleri ayna olarak surdur
+        BaleFrame(g_EngineInstance);                    // CaptureAndQueueLocalVehicleState'ten ONCE (g_EntityResendAll orada silinir)
         CaptureAndQueueLocalVehicleState(g_EngineInstance);
         ActiveVehicleFrame(g_EngineInstance);
         HornFrame(g_EngineInstance, GetMonotonicMilliseconds());
@@ -8439,7 +8672,7 @@ void* my_renderStartMenuMain(void* thiz, void* p1, void* p2, void* p3) {
 // ========================================================================
 __attribute__((constructor))
 void ModMain() {
-    LOGI(">>> MULTIPLAYER MOD STARTING <<< build=shopfix-22+loose-tool-oneway+bale-local-owner");
+    LOGI(">>> MULTIPLAYER MOD STARTING <<< build=shopfix-23+loose-tool-oneway+traffic-mirror+kb-done-fix");
 
     ResetVehicleSyncState();
     std::thread(StartPONGResponderThread).detach();
@@ -8569,6 +8802,16 @@ void ModMain() {
             g_FieldDeserFn = (Field_deserialize_t)dlsym(appLib, "_ZN5Field11deserializeEPhb");
             if (!g_FieldDeserFn) g_FieldDeserFn = (Field_deserialize_t)FindElfSymbolByPrefix("libapp.so", "_ZN5Field11deserialize");
             LOGI("[FIELDSNAP] symbols: Field::deserialize=%p", (void*)g_FieldDeserFn);
+        }
+        if (kSyncTraffic) {   // NPC trafik: addTrafficVehicle (sadece cagrilir) + TrafficVehicle::update kancasi
+            g_GameAddTrafficFn = (Game_addTraffic_t)dlsym(appLib, "_ZN4Game17addTrafficVehicleEN13EntityManager16TRAFFIC_VEHICLESEjfbRK7Vector3fj");
+            if (!g_GameAddTrafficFn) g_GameAddTrafficFn = (Game_addTraffic_t)FindElfSymbolByPrefix("libapp.so", "_ZN4Game17addTrafficVehicleE");
+            void* tuf = dlsym(appLib, "_ZN14TrafficVehicle6updateEfP4Game");
+            if (!tuf) tuf = FindElfSymbolByPrefix("libapp.so", "_ZN14TrafficVehicle6update");
+            const bool ht = tuf && HookChecked("TrafficVehicle::update", tuf, (void*)my_TrafficVehicle_update,
+                                               (void**)&orig_TrafficUpdate, true);
+            g_TrafficHookOk = ht && g_GameAddTrafficFn != nullptr;
+            LOGI("[TRAFFIC] symbols: addTrafficVehicle=%p update=%p hook=%d ok=%d", (void*)g_GameAddTrafficFn, tuf, (int)ht, (int)g_TrafficHookOk);
         }
         if (saveTask) {
             g_SaveStartTaskFn = saveTask;
