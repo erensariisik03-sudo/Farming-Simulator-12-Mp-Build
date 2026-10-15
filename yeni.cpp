@@ -615,7 +615,7 @@ static const uint8_t PACKET_REST_POSE = 38;       // duran (sahipsiz) araclarin 
 static const uint8_t PACKET_FIELD_SNAP = 35;      // tek bir tarlanin tam durumu (ekili/bicilmis/surulmus/gubreli...), host iletir
 static const uint8_t PACKET_TRAFFIC = 39;         // NPC trafik araclari (yolcu/kamyon): her cihaz kendi civarindakileri yayinlar, host iletir
 struct __attribute__((packed)) TrafficHeader { uint8_t type; uint8_t ownerId; uint8_t count; };
-struct __attribute__((packed)) TrafficEntry { uint16_t id; uint8_t type; uint8_t dir; uint16_t road; float t, x, y, a, vx, vy; };
+struct __attribute__((packed)) TrafficEntry { uint16_t id; uint8_t type; uint8_t dir; uint16_t road; uint8_t color; uint8_t pad; float t, x, y, a, vx, vy; };
 static const uint32_t kTrafficMax = 10;           // oyunun trafik havuzu en fazla 10 arac
 
 // Baglanti sagligi: bu sureden uzun sessizlik = karsi taraf gitti (donmus / zorla kapatilmis).
@@ -4124,7 +4124,9 @@ static std::vector<TrafficPending> g_PendingTraffic;           // g_VehicleEvent
 static const uintptr_t kTrCountOff = 0x600;                    // Game+0x600: trafik arac sayisi
 static const uintptr_t kTrArrOff = 0x604;                      // Game+0x604 + i*4: TrafficVehicle* havuzu
 static const int kTrPoolSize = 5;                              // Game constructor'i SADECE 5 TrafficVehicle olusturur (0x604..0x617); sonrasi baska veri
-static const int kTrMirrorMax = 3;                             // ayni anda en fazla 3 ayna (yerel trafik de dogabilsin)
+static const int kTrMirrorMax = 5;                             // takipci cihazda yerel trafik kapatildigi icin havuzun tamami ayna olabilir
+static std::atomic<long long> g_TrLastRxMs(0);                 // baska bir cihazdan son trafik paketi (bos "kalp atisi" dahil)
+static bool g_TrFollower = false;                              // bu cihaz baska birinin trafigini izliyor: yerel trafik kapali
 static const float kTrClusterR2 = 220.0f * 220.0f;             // iki oyuncunun aktif araci bu kadar yakinsa ayni "bolge" sayilir
 static const float kTrSpawnR2 = 120.0f * 120.0f;               // ayna sadece yerel aktif aracin 120 m yakininda dogar
 static const float kTrKeepR2 = 150.0f * 150.0f;                // 150 m'den uzaklasinca kaldirilir
@@ -4156,7 +4158,10 @@ static bool LocalActiveBodyPos(uintptr_t game, float* x, float* y) {
 static uint32_t my_TrafficVehicle_update(void* t, uint32_t dtBits, uint32_t gamePtr) {
     if (!orig_TrafficUpdate) return 1;
     TrafficMirror* m = t ? TrafficMirrorOfPtr((uintptr_t)t) : nullptr;
-    if (!m) return orig_TrafficUpdate(t, dtBits, gamePtr);
+    if (!m) {
+        if (g_TrFollower && g_TrafficHookOk && t) return 0;        // takipci: yerel trafik araci kaldirilir (yayinlayanin araclari gosterilir)
+        return orig_TrafficUpdate(t, dtBits, gamePtr);
+    }
 
     const long long now = NowMs();
     bool keep = g_IsConnected.load() && (now - m->rxMs) < 2000;
@@ -4197,6 +4202,7 @@ static uint32_t my_TrafficVehicle_update(void* t, uint32_t dtBits, uint32_t game
 static void TrafficFrame(uintptr_t game) {
     if (!kSyncTraffic || game == 0) return;
     if (!g_IsConnected.load() || !g_VehNetArmed.load()) {
+        g_TrFollower = false;
         std::lock_guard<std::mutex> lock(g_VehicleEventMutex);
         g_PendingTraffic.clear();
         return;
@@ -4204,6 +4210,8 @@ static void TrafficFrame(uintptr_t game) {
     const long long now = NowMs();
     const int cnt0 = *(int*)(game + kTrCountOff);
     if (cnt0 < 0 || cnt0 > kTrPoolSize) return;
+    g_TrFollower = g_TrafficHookOk && (now - g_TrLastRxMs.load()) < 3000;
+    if (g_TrFollower) *(float*)(game + 0x62C) = 5.0f;              // oyunun kendi trafik dogurma sayaci: yerel arac dogmasin
 
     // ---- yayin: SADECE gerekliyse ----
     // Baska bir oyuncunun aktif araci bu cihazin aktif aracina yakin (ya da ayni arac) degilse kimsenin bu cihazin trafigini
@@ -4269,12 +4277,13 @@ static void TrafficFrame(uintptr_t game) {
             TrafficEntry e;
             memset(&e, 0, sizeof(e));
             e.id = g_TrSendIds[s].id; e.type = type; e.dir = *(uint8_t*)(p + 0x248) ? 1 : 0;
+            e.color = (uint8_t)(*(uint32_t*)(p + 0x2F4) % 10u);    // renk indeksi (TrafficVehicle::COLORS), load'da rastgele secilir
             e.road = (uint16_t)(*(uint32_t*)(p + 0x244) & 0xFFFF);
             e.t = *(float*)(p + 0x240); e.x = x; e.y = y; e.a = a; e.vx = vx; e.vy = vy;
             memcpy(buf + off, &e, sizeof(e)); off += sizeof(e); ++h.count;
         }
         for (int k = 0; k < 12; ++k) if (!seen[k]) g_TrSendIds[k].p = 0;
-        if (h.count > 0) {
+        {   // arac olmasa da bos paket gider: takipci cihazlar yerel trafigi kapali tutsun
             memcpy(buf, &h, sizeof(h));
             std::lock_guard<std::mutex> lock(g_VehicleEventMutex);
             if (g_VehicleEventOut.size() < 2048) g_VehicleEventOut.insert(g_VehicleEventOut.end(), buf, buf + off);   // kuyruk doluysa bu tur atlanir (diger olaylar silinmesin)
@@ -4301,6 +4310,7 @@ static void TrafficFrame(uintptr_t game) {
         for (int i = 0; i < kTrMirrorMax; ++i) if (g_TrMir[i].used && g_TrMir[i].owner == pe.owner && g_TrMir[i].id == e.id) { m = &g_TrMir[i]; break; }
         if (m) {
             m->x = e.x; m->y = e.y; m->a = e.a; m->vx = e.vx; m->vy = e.vy; m->rxMs = now;
+            if (m->ptr) *(uint32_t*)(m->ptr + 0x2F4) = (uint32_t)(e.color % 10u);
             continue;
         }
         if (!g_TrafficHookOk || !g_GameAddTrafficFn || !haveLocal || e.road >= roadCount) continue;
@@ -4322,6 +4332,7 @@ static void TrafficFrame(uintptr_t game) {
         if (!p) continue;
         slot->used = true; slot->ptr = p; slot->owner = pe.owner; slot->id = e.id;
         slot->x = e.x; slot->y = e.y; slot->a = e.a; slot->vx = e.vx; slot->vy = e.vy; slot->rxMs = now;
+        *(uint32_t*)(p + 0x2F4) = (uint32_t)(e.color % 10u);       // ayni renk
         const uintptr_t body = *(uintptr_t*)(p + 0x6C);
         if (body) B2BodyMakeSensor(body);                          // ayna arac carpismasiz: asil arac sahibinin cihazinda carpisir
         if (g_TrLogs < 20) { ++g_TrLogs; LOGI("[TRAFFIC] ayna dogdu oyuncu=%u id=%u tip=%u yol=%u (%.0f,%.0f)",
@@ -5990,6 +6001,7 @@ static bool ProcessPackets(uint8_t* buf, size_t& buffered, int peerId, std::vect
                 g_EntityResendAll.store(true);
             }
         } else if (type == PACKET_TRAFFIC) {
+            if (buf[1] != g_LocalPlayerId.load()) g_TrLastRxMs.store(NowMs());
             if (buf[1] != g_LocalPlayerId.load() && buf[2] > 0 && buf[2] <= kTrafficMax) {
                 std::lock_guard<std::mutex> lock(g_VehicleEventMutex);
                 for (uint8_t k = 0; k < buf[2] && g_PendingTraffic.size() < 64; ++k) {
@@ -8702,7 +8714,7 @@ void* my_renderStartMenuMain(void* thiz, void* p1, void* p2, void* p3) {
 // ========================================================================
 __attribute__((constructor))
 void ModMain() {
-    LOGI(">>> MULTIPLAYER MOD STARTING <<< build=shopfix-24+loose-tool-oneway+traffic-mirror-pool5+kb-done-fix");
+    LOGI(">>> MULTIPLAYER MOD STARTING <<< build=shopfix-25+loose-tool-oneway+traffic-follower+kb-done-fix");
 
     ResetVehicleSyncState();
     std::thread(StartPONGResponderThread).detach();
