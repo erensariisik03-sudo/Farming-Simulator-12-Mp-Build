@@ -4355,11 +4355,17 @@ static const uint8_t PACKET_WORLD_DELTA = 40;     // [type][ownerId][count] + co
 static const uint8_t PACKET_PRICE_TABLE = 41;     // host -> client: [type][sites] + 5 stok + sites*4 fiyat (mutlak)
 static const int kWorldSites = 16;
 static const int kWorldStocks = 5;                // idx 0..3: Game+0x6a8+4*i, idx 4: Game+0x6b8 (biyogaz)
-static const int kWorldN = kWorldStocks + kWorldSites * 4;
+// idx 5.. : satis noktasi fiyatlari (site*4+mahsul); idx kWorldExtraBase.. : biyogaz tesisi (TipSite) zamanlayici +0x6c ve doluluk +0x70 (site*2 + {0,1})
+static const int kWorldExtraBase = kWorldStocks + kWorldSites * 4;
+static const int kWorldN = kWorldExtraBase + kWorldSites * 2;
 struct __attribute__((packed)) WorldDeltaHeader { uint8_t type; uint8_t ownerId; uint8_t count; };
 struct __attribute__((packed)) WorldDeltaEntry { uint16_t idx; float d; };
 struct __attribute__((packed)) PriceTableHeader { uint8_t type; uint8_t sites; };
-static const size_t kPriceTableMaxBytes = sizeof(PriceTableHeader) + (size_t)(kWorldStocks + kWorldSites * 4) * 4;
+// Tablo duzeni: [5 stok][sites*4 fiyat][sites*2 (zamanlayici, doluluk)]
+static inline size_t PriceTableFloats(int sites) { return (size_t)kWorldStocks + (size_t)sites * 6; }
+static const size_t kPriceTableMaxBytes = sizeof(PriceTableHeader) + (size_t)(kWorldStocks + kWorldSites * 6) * 4;
+typedef void (*TipSite_updateBga_t)(void* site);
+static TipSite_updateBga_t g_TipSiteUpdateBgaFn = nullptr;       // TipSite::updateBgaPlanes() (this = r0)
 static float g_WorldAcc[kWorldN];                              // sadece oyun thread'i
 static long long g_WorldLocalMs = 0;
 static long long g_WorldFlushMs = 0, g_PriceTblMs = 0;
@@ -4372,15 +4378,30 @@ static volatile float* WorldPtr(uintptr_t game, int idx) {
     if (!game || idx < 0) return nullptr;
     if (idx < 4) return (volatile float*)(game + 0x6A8 + (uintptr_t)idx * 4u);
     if (idx == 4) return (volatile float*)(game + 0x6B8);
-    const int k = idx - kWorldStocks;
-    const int s = k >> 2, f = k & 3;
+    int s, f;
+    bool extra = false;
+    if (idx < kWorldExtraBase) { const int k = idx - kWorldStocks; s = k >> 2; f = k & 3; }
+    else if (idx < kWorldN) { const int e = idx - kWorldExtraBase; s = e >> 1; f = e & 1; extra = true; }
+    else return nullptr;
     if (s >= kWorldSites) return nullptr;
     const uintptr_t map = *(volatile uintptr_t*)(game + 0x704);
     if (!map) return nullptr;
     const uintptr_t tbl = *(volatile uintptr_t*)(map + 0x724);
     const int32_t cnt = *(volatile int32_t*)(map + 0x728);
     if (!tbl || cnt <= 0 || cnt > 64 || s >= cnt) return nullptr;
+    if (extra) return (volatile float*)(tbl + (uintptr_t)s * 0x80u + (f == 0 ? 0x6Cu : 0x70u));
     return (volatile float*)(tbl + (uintptr_t)s * 0x80u + 0x10u + (uintptr_t)f * 4u);
+}
+
+// Bu idx bir satis noktasinin (TipSite) alani mi? Ise nesne adresini ve alan turunu verir: 0 fiyat, 1 zamanlayici (+0x6c), 2 doluluk (+0x70).
+static int WorldSiteField(uintptr_t game, int idx, uintptr_t* siteOut) {
+    if (idx < kWorldStocks || idx >= kWorldN) return -1;
+    volatile float* p = WorldPtr(game, idx);
+    if (!p) return -1;
+    if (idx < kWorldExtraBase) { *siteOut = (uintptr_t)p - 0x10u - (uintptr_t)((idx - kWorldStocks) & 3) * 4u; return 0; }
+    const int f = (idx - kWorldExtraBase) & 1;
+    *siteOut = (uintptr_t)p - (f == 0 ? 0x6Cu : 0x70u);
+    return f == 0 ? 1 : 2;
 }
 
 static int WorldSiteCount(uintptr_t game) {
@@ -4393,7 +4414,7 @@ static int WorldSiteCount(uintptr_t game) {
 
 // Tum izlenen degerleri okur; dondurdugu sayi = gecerli idx sayisi (idx 0..n-1).
 static int WorldRead(uintptr_t game, float* out) {
-    const int n = kWorldStocks + WorldSiteCount(game) * 4;
+    const int n = kWorldN;                                         // olmayan alanlar 0 okunur (degismez)
     for (int i = 0; i < n; ++i) {
         volatile float* p = WorldPtr(game, i);
         out[i] = p ? *p : 0.0f;
@@ -4451,29 +4472,46 @@ static void WorldSyncFrame(uintptr_t game) {
         float v = *p + d;
         if (!(v == v) || v < 0.0f) v = 0.0f;
         if (idx == 4 && v > 100000.0f) v = 100000.0f;
-        if (idx >= kWorldStocks) {                                 // fiyat: satis noktasinin azami fiyatini (+0x30) gecmesin
+        uintptr_t site = 0;
+        const int fk = WorldSiteField(game, idx, &site);
+        if (fk == 0) {                                             // fiyat: satis noktasinin azami fiyatini (+0x30) gecmesin
             const float mx = *(volatile float*)((uintptr_t)p + 0x20);
             if (mx > 0.0f && v > mx) v = mx;
+        } else if (fk == 2) {                                      // biyogaz doluluk: kapasiteyi (+0x74) gecmesin
+            const float cap = *(volatile float*)((uintptr_t)p + 4);
+            if (cap > 0.0f && v > cap) v = cap;
         }
         *p = v;
+        if ((fk == 1 || fk == 2) && g_TipSiteUpdateBgaFn) g_TipSiteUpdateBgaFn((void*)site);   // gorunum (doluluk cubugu / isik)
     }
     if (tblLen >= sizeof(PriceTableHeader) && !g_IsHost.load() && now - g_WorldLocalMs >= 2000) {
         PriceTableHeader th; memcpy(&th, tbl, sizeof(th));
-        const size_t need = sizeof(th) + (size_t)(kWorldStocks + (size_t)th.sites * 4) * 4;
+        const size_t need = sizeof(th) + PriceTableFloats(th.sites) * 4;
         if (th.sites <= kWorldSites && need <= tblLen) {
-            const int mySites = WorldSiteCount(game);
-            const int n = kWorldStocks + (th.sites < mySites ? th.sites : mySites) * 4;
-            for (int i = 0; i < n; ++i) {
+            const int nT = (int)PriceTableFloats(th.sites);
+            const int priceEnd = kWorldStocks + th.sites * 4;
+            for (int i = 0; i < nT; ++i) {
                 float v; memcpy(&v, tbl + sizeof(th) + (size_t)i * 4, sizeof(v));
                 if (!(v == v) || v < 0.0f || v > 1.0e8f) continue;
-                volatile float* p = WorldPtr(game, i);
-                if (p) *p = v;
+                const int idx = (i < priceEnd) ? i : (kWorldExtraBase + (i - priceEnd));
+                volatile float* p = WorldPtr(game, idx);
+                if (!p) continue;
+                uintptr_t site = 0;
+                const int fk = WorldSiteField(game, idx, &site);
+                if (fk == 1) { if (v >= *p) continue; }            // zamanlayici: iki cihazdan KUCUK olan gecerli (durmus cihaz geri kalmaz, akan cihaz one gecmez)
+                else if (fk == 2) {
+                    const float cap = *(volatile float*)((uintptr_t)p + 4);
+                    if (cap > 0.0f && v > cap) v = cap;
+                }
+                if (*p == v) continue;
+                *p = v;
+                if ((fk == 1 || fk == 2) && g_TipSiteUpdateBgaFn) g_TipSiteUpdateBgaFn((void*)site);
             }
-            if (g_WorldLogs < 5) { ++g_WorldLogs; LOGI("[WORLD] client: host stok+fiyat tablosu uygulandi (satis noktasi=%u)", (unsigned)th.sites); }
+            if (g_WorldLogs < 5) { ++g_WorldLogs; LOGI("[WORLD] client: host stok+fiyat+biyogaz tablosu uygulandi (satis noktasi=%u)", (unsigned)th.sites); }
         }
     }
 
-    // 3) host: mutlak durumu (stoklar + fiyatlar) periyodik yayinla
+    // 3) host: mutlak durumu (stoklar + fiyatlar + biyogaz zamanlayici/doluluk) periyodik yayinla
     if (g_IsHost.load() && now - g_PriceTblMs >= 4000) {
         g_PriceTblMs = now;
         const int sites = WorldSiteCount(game);
@@ -4481,11 +4519,14 @@ static void WorldSyncFrame(uintptr_t game) {
         PriceTableHeader th; th.type = PACKET_PRICE_TABLE; th.sites = (uint8_t)sites;
         memcpy(buf, &th, sizeof(th));
         float vals[kWorldN];
-        const int n = WorldRead(game, vals);
-        if (n == kWorldStocks + sites * 4) {
-            memcpy(buf + sizeof(th), vals, (size_t)n * 4);
-            QueueVehicleEvent(buf, sizeof(th) + (size_t)n * 4);
+        WorldRead(game, vals);
+        const int priceEnd = kWorldStocks + sites * 4;
+        const int nT = (int)PriceTableFloats(sites);
+        for (int i = 0; i < nT; ++i) {
+            const int idx = (i < priceEnd) ? i : (kWorldExtraBase + (i - priceEnd));
+            memcpy(buf + sizeof(th) + (size_t)i * 4, &vals[idx], 4);
         }
+        QueueVehicleEvent(buf, sizeof(th) + (size_t)nT * 4);
     }
 }
 
@@ -5859,7 +5900,7 @@ static bool ProcessPackets(uint8_t* buf, size_t& buffered, int peerId, std::vect
         else if (type == PACKET_PRICE_TABLE) {
             if (buffered < sizeof(PriceTableHeader)) break;
             if (buf[1] > kWorldSites) return false;
-            size = sizeof(PriceTableHeader) + (size_t)(kWorldStocks + (size_t)buf[1] * 4) * 4;
+            size = sizeof(PriceTableHeader) + PriceTableFloats(buf[1]) * 4;
         }
         else if (type == PACKET_TRAFFIC) {
             if (buffered < sizeof(TrafficHeader)) break;
@@ -7360,8 +7401,10 @@ static bool DrawGameStyleButton(const char* id, const char* label, ImVec2 size,
     // inside it (the same click-release behavior as a normal ImGui button).
     ImGui::SetCursorScreenPos(pos);
     const bool clicked = ImGui::InvisibleButton(id, size);
+    const bool activated = ImGui::IsItemActivated();                 // parmak butona DEGDIGI an (birakmayi beklemez)
     const bool pressed = ImGui::IsItemActive() && ImGui::IsMouseDown(ImGuiMouseButton_Left);
-    if (clicked && playSound) PlayGameClickSound();
+    if (activated && playSound) PlayGameClickSound();                // ses basista calar (orijinal butonlar gibi), birakista degil
+    const ImU32 tint = pressed ? IM_COL32(190, 190, 190, 255) : IM_COL32(255, 255, 255, 255);   // basili: boyut kuculmesi + hafif karartma
 
     // Press animation affects the artwork, never the hitbox or layout.
     const float visualScale = pressed ? 0.96f : 1.0f;
@@ -7375,12 +7418,12 @@ static bool DrawGameStyleButton(const char* id, const char* label, ImVec2 size,
             draw->AddImage(ToImGuiTexture(g_MultiplayerButtonTexture),
                            visualPos,
                            ImVec2(visualPos.x + visualSize.x, visualPos.y + visualSize.y),
-                           ImVec2(0.0f, 0.0f), ImVec2(1.0f, 1.0f));
+                           ImVec2(0.0f, 0.0f), ImVec2(1.0f, 1.0f), tint);
         } else {
             draw->AddImage(ToImGuiTexture(g_MultiplayerButtonTexture),
                            visualPos,
                            ImVec2(visualPos.x + visualSize.x, visualPos.y + visualSize.y),
-                           ImVec2(1.0f, 0.0f), ImVec2(0.0f, 1.0f));
+                           ImVec2(1.0f, 0.0f), ImVec2(0.0f, 1.0f), tint);
         }
         // No rectangular hover overlay: the original button texture stays clean.
     } else {
@@ -7397,7 +7440,7 @@ static bool DrawGameStyleButton(const char* id, const char* label, ImVec2 size,
         visualPos.x + (visualSize.x - measured.x) * 0.5f,
         visualPos.y + (visualSize.y - measured.y) * 0.5f - 1.0f
     );
-    draw->AddText(font, textSizePx, textPos, IM_COL32(245, 245, 245, 255), label);
+    draw->AddText(font, textSizePx, textPos, pressed ? IM_COL32(205, 205, 205, 255) : IM_COL32(245, 245, 245, 255), label);
     return clicked;
 }
 
@@ -7408,8 +7451,10 @@ static bool DrawCenteredMirroredGameButton(const char* id, const char* label,
 
     ImGui::SetCursorScreenPos(start);
     const bool clicked = ImGui::InvisibleButton(id, ImVec2(totalW, h));
+    const bool activated = ImGui::IsItemActivated();
     const bool pressed = ImGui::IsItemActive() && ImGui::IsMouseDown(ImGuiMouseButton_Left);
-    if (clicked) PlayGameClickSound();
+    if (activated) PlayGameClickSound();                             // ses basista calar
+    const ImU32 tint = pressed ? IM_COL32(190, 190, 190, 255) : IM_COL32(255, 255, 255, 255);
 
     const float visualScale = pressed ? 0.96f : 1.0f;
     const ImVec2 visualSize(totalW * visualScale, h * visualScale);
@@ -7432,14 +7477,14 @@ static bool DrawCenteredMirroredGameButton(const char* id, const char* label,
 
         // Right half (flat middle + right cap).
         draw->AddImage(tex, ImVec2(xc, y0), ImVec2(x1 - capPx, y1),
-                       ImVec2(midU, 0.0f), ImVec2(capU0, 1.0f));
+                       ImVec2(midU, 0.0f), ImVec2(capU0, 1.0f), tint);
         draw->AddImage(tex, ImVec2(x1 - capPx, y0), ImVec2(x1, y1),
-                       ImVec2(capU0, 0.0f), ImVec2(1.0f, 1.0f));
+                       ImVec2(capU0, 0.0f), ImVec2(1.0f, 1.0f), tint);
         // Mirrored left half.
         draw->AddImage(tex, ImVec2(x0 + capPx, y0), ImVec2(xc, y1),
-                       ImVec2(capU0, 0.0f), ImVec2(midU, 1.0f));
+                       ImVec2(capU0, 0.0f), ImVec2(midU, 1.0f), tint);
         draw->AddImage(tex, ImVec2(x0, y0), ImVec2(x0 + capPx, y1),
-                       ImVec2(1.0f, 0.0f), ImVec2(capU0, 1.0f));
+                       ImVec2(1.0f, 0.0f), ImVec2(capU0, 1.0f), tint);
     }
 
     ImFont* font = g_GameUIFont ? g_GameUIFont : ImGui::GetFont();
@@ -7573,6 +7618,7 @@ static void DrawTypingBar(const ImVec2& screen) {
     const ImVec2 btnSize(btnW, fh * 1.3f);
     const ImVec2 btnPos = ImGui::GetCursorScreenPos();
     const bool btnClicked = ImGui::InvisibleButton("##TypingBarDone", btnSize);
+    const bool btnActivated = ImGui::IsItemActivated();
     const bool btnPressed = ImGui::IsItemActive() && ImGui::IsMouseDown(ImGuiMouseButton_Left);
     s_btnHeld = btnPressed;
     const float btnScale = btnPressed ? 0.96f : 1.0f;
@@ -7582,7 +7628,7 @@ static void DrawTypingBar(const ImVec2& screen) {
     ImDrawList* btnDraw = ImGui::GetWindowDrawList();
     btnDraw->AddRectFilled(btnVisualPos,
                            ImVec2(btnVisualPos.x + btnVisualSize.x, btnVisualPos.y + btnVisualSize.y),
-                           btnPressed ? IM_COL32(224, 224, 224, 255) : IM_COL32(245, 245, 245, 255), 4.0f);
+                           btnPressed ? IM_COL32(186, 186, 186, 255) : IM_COL32(245, 245, 245, 255), 4.0f);
     btnDraw->AddRect(btnVisualPos,
                      ImVec2(btnVisualPos.x + btnVisualSize.x, btnVisualPos.y + btnVisualSize.y),
                      IM_COL32(115, 125, 130, 255), 4.0f, 0, 1.0f);
@@ -7597,7 +7643,7 @@ static void DrawTypingBar(const ImVec2& screen) {
     ImGui::PopStyleVar(2);
     ImGui::PopStyleColor(8);
 
-    if (btnClicked) PlayGameClickSound();
+    if (btnActivated) PlayGameClickSound();                          // ses basista calar
     if (enterPressed || btnClicked) {
         if (mode == 2) SubmitChatInput();
         s_barFocused = false;
@@ -7950,7 +7996,8 @@ void DrawImGui() {
         const float vr = r * visualScale;
         ImDrawList* d = ImGui::GetForegroundDrawList();
         const ImVec2 c(cx, cy);
-        d->AddCircleFilled(c, vr, pressed ? IM_COL32(60, 60, 60, 240) : IM_COL32(18, 18, 18, 235), 48);
+        d->AddCircleFilled(c, vr, pressed ? IM_COL32(8, 8, 8, 245) : IM_COL32(18, 18, 18, 235), 48);
+        if (pressed) d->AddCircleFilled(c, vr, IM_COL32(0, 0, 0, 70), 48);   // basili: hafif karartma
         d->AddCircle(c, vr - vr * 0.04f, IM_COL32(120, 120, 120, 255), 48, vr * 0.07f);
         // Chat bubble scales with the pressed button, while its hitbox remains unchanged.
         const ImU32 white = IM_COL32(245, 245, 245, 255), dark = IM_COL32(18, 18, 18, 255);
@@ -7967,12 +8014,12 @@ void DrawImGui() {
             const float px = g_PendingTouchX.load() - cx, py = g_PendingTouchY.load() - cy;
             g_PendingTouchDown.store(false);
             s_HudChatPressArmed = (px * px + py * py <= r * r * 1.44f);
+            if (s_HudChatPressArmed) PlayGameClickSound();           // ses basista calar
         }
         if (s_HudChatPressArmed && !g_TouchDown.load()) {
             s_HudChatPressArmed = false;
             const float rx = g_TouchX.load() - cx, ry = g_TouchY.load() - cy;
             if (rx * rx + ry * ry <= r * r * 1.44f) {
-                PlayGameClickSound();
                 g_MpFromLan = false;
                 g_MpView = MPV_ROOM;
                 g_IsMultiplayerMenuActive = true;
@@ -8920,7 +8967,7 @@ void* my_renderStartMenuMain(void* thiz, void* p1, void* p2, void* p3) {
 // ========================================================================
 __attribute__((constructor))
 void ModMain() {
-    LOGI(">>> MULTIPLAYER MOD STARTING <<< build=shopfix-26+loose-tool-oneway+traffic-follower+world-delta-silo-price");
+    LOGI(">>> MULTIPLAYER MOD STARTING <<< build=shopfix-27+bga-timer-sync+btn-press-fx");
 
     ResetVehicleSyncState();
     std::thread(StartPONGResponderThread).detach();
@@ -9042,6 +9089,9 @@ void ModMain() {
             g_MapUpdateFn = (Map_update_t)dlsym(appLib, "_ZN3Map6updateEf");
             g_MapGrowNowFn = (Map_grow_t)dlsym(appLib, "_ZN3Map13growFieldsNowEv");
             LOGI("[MAPCLK] symbols: Map::update=%p growFieldsNow=%p", (void*)g_MapUpdateFn, (void*)g_MapGrowNowFn);
+            g_TipSiteUpdateBgaFn = (TipSite_updateBga_t)dlsym(appLib, "_ZN7TipSite15updateBgaPlanesEv");
+            if (!g_TipSiteUpdateBgaFn) g_TipSiteUpdateBgaFn = (TipSite_updateBga_t)FindElfSymbolByPrefix("libapp.so", "_ZN7TipSite15updateBgaPlanes");
+            LOGI("[WORLD] symbols: TipSite::updateBgaPlanes=%p", (void*)g_TipSiteUpdateBgaFn);
             g_MissionSetSpawnFn = (Mission_setSpawn_t)dlsym(appLib, "_ZN14MissionManager20setMissionSpawnPointEj");
             if (!g_MissionSetSpawnFn) g_MissionSetSpawnFn = (Mission_setSpawn_t)FindElfSymbolByPrefix("libapp.so", "_ZN14MissionManager20setMissionSpawnPoint");
             g_MissionCancelFn = (Mission_cancel_t)dlsym(appLib, "_ZN14MissionManager13cancelPendingEv");
