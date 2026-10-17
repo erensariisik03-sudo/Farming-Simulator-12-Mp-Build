@@ -7559,6 +7559,115 @@ static void DrawHeaderDarkening(const ImVec2& screen) {
 // ========================================================================
 // TYPING BAR (shows the text being typed, just above the soft keyboard)
 // ========================================================================
+// ========================================================================
+// OYUNCU ISIM ETIKETLERI: diger oyuncularin bulundugu araclarin ustunde isimleri gosterilir
+// (kendi icinde bulundugun arac haric). Kamera gorunum matrisi RenderArgs::update'ten (her karede) alinir,
+// izdusum matrisi Game+0xA2B0 (oyun ici) / +0xA270'tedir; ikisi de GL sutun-sirali. Oyuncu hangi aracin icinde
+// diye ActiveVehicle paketlerinden (g_RemoteActive) bakilir.
+// ========================================================================
+typedef void (*RenderArgsUpdate_t)(void* thiz, const float* view, const float* world);
+static RenderArgsUpdate_t orig_RenderArgs_update = nullptr;
+static float g_CamView[16];
+static std::atomic<long long> g_CamMs(0);
+
+static void my_RenderArgs_update(void* t, const float* view, const float* world) {
+    if (view) {
+        memcpy(g_CamView, view, sizeof(g_CamView));
+        g_CamMs.store(NowMs());
+    }
+    if (orig_RenderArgs_update) orig_RenderArgs_update(t, view, world);
+}
+
+static void DrawPlayerNameTags(const ImVec2& screen) {
+    if (!g_IsConnected.load() || !g_VehNetArmed.load() || g_EngineInstance == 0) return;
+    const uintptr_t game = g_EngineInstance;
+    if (*(volatile int*)(game + 0x64) != 6) return;
+    if (NowMs() - g_CamMs.load() > 600) return;                       // kamera verisi taze degil (kanca yok / duraklama)
+
+    const float* P = nullptr;
+    static const uintptr_t kProjOffs[2] = { 0xA2B0, 0xA270 };
+    for (int k = 0; k < 2 && !P; ++k) {
+        const float* c = (const float*)(game + kProjOffs[k]);
+        if (fabsf(c[0]) > 0.05f && fabsf(c[5]) > 0.1f && fabsf(fabsf(c[11]) - 1.0f) < 0.01f && fabsf(c[15]) < 0.01f) P = c;
+    }
+    if (!P) {
+        static bool s_logged = false;
+        if (!s_logged) { s_logged = true; LOGI("[NAMETAG] gecerli izdusum matrisi bulunamadi (0xA2B0/0xA270)"); }
+        return;
+    }
+    bool flipped = false;
+    {
+        const uintptr_t dev = *(uintptr_t*)(game + 0x78);
+        if (dev != 0) flipped = *(uint8_t*)(dev + 0x10) != 0;         // cihaz izdusumu pi kadar cevirir
+    }
+    const float* V = g_CamView;
+
+    int nids[MAX_PLAYERS];
+    std::string names[MAX_PLAYERS];
+    int cnt = 0;
+    const uint8_t me = g_LocalPlayerId.load();
+    const long long now = NowMs();
+    int snapNid[MAX_PLAYERS];
+    long long snapMs[MAX_PLAYERS];
+    {
+        std::lock_guard<std::mutex> lock(g_ActiveMutex);
+        for (uint8_t p = 0; p < MAX_PLAYERS; ++p) { snapNid[p] = g_RemoteActive[p].netId; snapMs[p] = g_RemoteActive[p].ms; }
+    }
+    for (uint8_t p = 0; p < MAX_PLAYERS; ++p) {
+        if (p == me) continue;
+        if (snapNid[p] < 0 || snapNid[p] == g_LocalActiveNetId || (now - snapMs[p]) >= 6000) continue;
+        std::string nm = GetPlayerName(p);
+        if (nm.empty()) continue;
+        int slot = -1;
+        for (int k = 0; k < cnt; ++k) if (nids[k] == snapNid[p]) { slot = k; break; }
+        if (slot < 0) { slot = cnt++; nids[slot] = snapNid[p]; names[slot].clear(); }
+        if (!names[slot].empty()) names[slot] += ", ";
+        names[slot] += nm;
+    }
+    if (cnt == 0) return;
+
+    ImDrawList* d = ImGui::GetForegroundDrawList();
+    ImFont* font = ImGui::GetFont();
+    static bool s_firstLog = false;
+    for (int k = 0; k < cnt; ++k) {
+        const uintptr_t v = GetVehicleFromIndex(game, (uint16_t)nids[k]);
+        if (v == 0) continue;
+        const float wx = *(float*)(v + 0x18 + 0x30);
+        const float wy = *(float*)(v + 0x18 + 0x34) + 4.2f;           // arac govdesinin ustu
+        const float wz = *(float*)(v + 0x18 + 0x38);
+        if (!(wx == wx) || !(wy == wy) || !(wz == wz)) continue;
+        const float vx = V[0] * wx + V[4] * wy + V[8] * wz + V[12];
+        const float vy = V[1] * wx + V[5] * wy + V[9] * wz + V[13];
+        const float vz = V[2] * wx + V[6] * wy + V[10] * wz + V[14];
+        const float cx = P[0] * vx + P[4] * vy + P[8] * vz + P[12];
+        const float cy = P[1] * vx + P[5] * vy + P[9] * vz + P[13];
+        const float cw = P[3] * vx + P[7] * vy + P[11] * vz + P[15];
+        if (cw < 1.0f || cw > 300.0f) continue;                       // arkada ya da cok uzak
+        float nx = cx / cw, ny = cy / cw;
+        if (flipped) { nx = -nx; ny = -ny; }
+        if (nx < -1.15f || nx > 1.15f || ny < -1.15f || ny > 1.15f) continue;
+        const float sx = (nx * 0.5f + 0.5f) * screen.x;
+        const float sy = (1.0f - (ny * 0.5f + 0.5f)) * screen.y;
+        if (!s_firstLog) {
+            s_firstLog = true;
+            LOGI("[NAMETAG] ilk etiket: arac=%d mesafe=%.1f ekran=(%.0f,%.0f) P0=%.3f P5=%.3f P11=%.1f flip=%d", nids[k], cw, sx, sy,
+                 P[0], P[5], P[11], (int)flipped);
+        }
+        float sc = 55.0f / cw;
+        if (sc < 0.60f) sc = 0.60f;
+        if (sc > 1.15f) sc = 1.15f;
+        const float fs = screen.y * 0.030f * sc;
+        const ImVec2 ts = font->CalcTextSizeA(fs, FLT_MAX, 0.0f, names[k].c_str());
+        const float padX = fs * 0.55f, padY = fs * 0.28f;
+        const ImVec2 a(sx - ts.x * 0.5f - padX, sy - ts.y - padY * 2.0f - fs * 0.35f);
+        const ImVec2 b(sx + ts.x * 0.5f + padX, sy - fs * 0.35f);
+        d->AddRectFilled(a, b, IM_COL32(0, 0, 0, 150), fs * 0.40f);
+        d->AddTriangleFilled(ImVec2(sx - fs * 0.30f, b.y - 1.0f), ImVec2(sx + fs * 0.30f, b.y - 1.0f),
+                             ImVec2(sx, b.y + fs * 0.32f), IM_COL32(0, 0, 0, 150));
+        d->AddText(font, fs, ImVec2(a.x + padX, a.y + padY), IM_COL32(255, 255, 255, 240), names[k].c_str());
+    }
+}
+
 static void DrawTypingBar(const ImVec2& screen) {
     static bool s_barFocused = false;
     static bool s_btnHeld = false;       // parmak TAMAM'in uzerinde: bu sirada yazi kutusu odagi geri istenmez (tiklamayi iptal ederdi)
@@ -8030,6 +8139,9 @@ void DrawImGui() {
         s_HudChatPressArmed = false;
     }
 
+    // Diger oyuncularin araclari uzerinde isim etiketleri (kendi aracin haric)
+    if (g_OnlineMode && !g_IsMultiplayerMenuActive) DrawPlayerNameTags(screen);
+
     if (g_IsMultiplayerMenuActive) {
         ImDrawList* bg = ImGui::GetBackgroundDrawList();
         if (g_GameMenuBackgroundTexture != 0 &&
@@ -8475,6 +8587,53 @@ static void* my_Tool_update(void* t, uint32_t a, uint32_t b, uint32_t c, uint32_
     return GuardedEntityUpdate(orig_Tool_update, veh, "Tool", t, a, b, c, d, e);
 }
 
+// ---- BICER BORU BOSALTMA: hayalet bicer icerik URETMESIN ----
+// Bicerin tanki sahibi cihazda gercek, diger cihazlarda "hayalet"tir (tank mutlak deger olarak her ~250 ms'de
+// sahibinden gelir). Hayalet bicerin borusu da yerel romorku doldurup yerel tanki bosaltiyordu; sonraki paket tanki
+// tekrar DOLU hale getirdigi icin ayni mahsul tekrar tekrar romorka aktiyordu (offline %66 dolan tarla multiplayerda
+// %100'u asiyordu). Artik hayalet bicerin boru bosaltmasinin tank/romork etkisi geri alinir (boru animasyonu kalir);
+// icerik sadece borunun GERCEK sahibi cihazda romorka akar, romork doluluğu zaten mutlak olarak herkese yayilir.
+typedef void (*Vehicle_updatePipeState_t)(void* thiz, uint32_t dtBits, void* game, void* outTrailer);
+static Vehicle_updatePipeState_t orig_Vehicle_updatePipeState = nullptr;
+static std::atomic<int> g_PipeGuardLogs(0);
+
+static void my_Vehicle_updatePipeState(void* t, uint32_t dtBits, void* gm, void* outTr) {
+    if (!orig_Vehicle_updatePipeState) return;
+    const uintptr_t g = g_EngineInstance;
+    if (t == nullptr || g == 0 || !g_IsConnected.load() || !g_VehNetArmed.load() || !IsGhostVehiclePtr((uintptr_t)t)) {
+        orig_Vehicle_updatePipeState(t, dtBits, gm, outTr);
+        return;
+    }
+    const uintptr_t v = (uintptr_t)t;
+    const uint32_t tankBefore = *(uint32_t*)(v + 0x440);
+    struct PipeSnap { uintptr_t tp; uint32_t lvl, typ; };
+    PipeSnap snaps[TRAILER_MAX];
+    uint32_t ns = 0;
+    const uint32_t tn = TrailerCount(g);
+    for (uint32_t i = 0; i < tn && ns < TRAILER_MAX; ++i) {
+        const uintptr_t tp = RawTrailerSlot(g, i);
+        if (tp == 0) continue;
+        snaps[ns].tp = tp;
+        snaps[ns].lvl = *(uint32_t*)(tp + 0x388);
+        snaps[ns].typ = *(uint32_t*)(tp + 0x390);
+        ++ns;
+    }
+    orig_Vehicle_updatePipeState(t, dtBits, gm, outTr);
+    bool undone = false;
+    if (*(uint32_t*)(v + 0x440) != tankBefore) { *(uint32_t*)(v + 0x440) = tankBefore; undone = true; }
+    for (uint32_t i = 0; i < ns; ++i) {
+        const uintptr_t tp = snaps[i].tp;
+        if (*(uint32_t*)(tp + 0x388) != snaps[i].lvl || *(uint32_t*)(tp + 0x390) != snaps[i].typ) {
+            *(uint32_t*)(tp + 0x388) = snaps[i].lvl;
+            *(uint32_t*)(tp + 0x390) = snaps[i].typ;
+            *(uint32_t*)(tp + 0x3A4) |= 4;                    // Trailer::setFillLevel ile ayni: gorunum yenilensin
+            undone = true;
+        }
+    }
+    if (undone && g_PipeGuardLogs.fetch_add(1) < 6)
+        LOGI("[PIPE] hayalet bicer bosaltmasi geri alindi (cift dolum engellendi)");
+}
+
 // ---- Tarla islemi kancasi: Map::updateFields(8 kose float, FieldWork&) ----
 // Hasat / pulluk / mibzer gibi tum tarla degisiklikleri bu fonksiyondan gecer. Bu cihazin surdugu (ya da
 // isciye verdigi) aracin islemi diger cihazlara gonderilir; onlar ayni cagriyi kendi tarlalarinda yapar.
@@ -8503,6 +8662,19 @@ static void my_Map_updateFields(void* map, uint32_t f1, uint32_t f2, uint32_t f3
                          g_VehNetArmed.load() && g_EngineInstance != 0;
     uint32_t wt = 0, wf = 0;
     if (capture) { wt = ((uint32_t*)fw)[0]; wf = ((uint32_t*)fw)[1]; }
+    // Hayalet bicerin (baska oyuncunun bicerinin) yerel hasadi yapilmaz: tarla degisimi sahibinden zaten tarla islemi
+    // olarak gelir, tank sahibinden mutlak gelir. Aksi halde hayalet kendi tankina ek mahsul yazar (cift sayim).
+    // Oyun sonuc alanlarini (+8 alan, +12 ikinci alan) cagridan once zaten sifirlar; burada da sifir birakilir.
+    if (capture) {
+        uintptr_t sv = 0;
+        if (FieldSourceKind(g_EngineInstance, (uintptr_t)fw, &sv) == 1 && sv != 0) {
+            const int snid = NetIdOfVehicle(sv);
+            if (snid >= 0 && !g_AiMirrored[snid] && IsGhostVehiclePtr(sv)) {
+                ((uint32_t*)fw)[2] = 0; ((uint32_t*)fw)[3] = 0;
+                return;
+            }
+        }
+    }
     // Tarla isi HER cihazda yerel olarak calisir: uzaktan surulen (hayalet) arac ve aynalanan isci de bu cihazda
     // tarlayi isler (herkes ayni isi kendi kopyasinda yapar). Sadece YAYIN sofor/isciyi baslatan cihazdan gider;
     // hayalet ve aynali aracin islemi yollanmaz (yanki olmasin).
@@ -8967,7 +9139,7 @@ void* my_renderStartMenuMain(void* thiz, void* p1, void* p2, void* p3) {
 // ========================================================================
 __attribute__((constructor))
 void ModMain() {
-    LOGI(">>> MULTIPLAYER MOD STARTING <<< build=shopfix-27+bga-timer-sync+btn-press-fx");
+    LOGI(">>> MULTIPLAYER MOD STARTING <<< build=shopfix-28+pipe-ghost-guard+nametags");
 
     ResetVehicleSyncState();
     std::thread(StartPONGResponderThread).detach();
@@ -9050,6 +9222,18 @@ void ModMain() {
             const bool h2 = HookChecked("Trailer::update", tru, (void*)my_Trailer_update, (void**)&orig_Trailer_update, true);
             const bool h3 = HookChecked("Tool::update", tou, (void*)my_Tool_update, (void**)&orig_Tool_update, true);
             LOGI("[MONEY] guard hooks installed: Vehicle=%d Trailer=%d Tool=%d", (int)h1, (int)h2, (int)h3);
+            void* ups = dlsym(appLib, "_ZN7Vehicle15updatePipeStateEfP4GameRP7Trailer");
+            if (!ups) ups = FindElfSymbolByPrefix("libapp.so", "_ZN7Vehicle15updatePipeState");
+            const bool h4 = HookChecked("Vehicle::updatePipeState", ups, (void*)my_Vehicle_updatePipeState,
+                                        (void**)&orig_Vehicle_updatePipeState, true);
+            LOGI("[PIPE] updatePipeState=%p hook=%d", ups, (int)h4);
+        }
+        {   // Oyuncu isim etiketleri: kameranin gorunum matrisi RenderArgs::update'ten alinir
+            void* rau = dlsym(appLib, "_ZN10RenderArgs6updateERK9Matrix4x4S2_");
+            if (!rau) rau = FindElfSymbolByPrefix("libapp.so", "_ZN10RenderArgs6update");
+            const bool hr = HookChecked("RenderArgs::update", rau, (void*)my_RenderArgs_update,
+                                        (void**)&orig_RenderArgs_update, true);
+            LOGI("[NAMETAG] RenderArgs::update=%p hook=%d", rau, (int)hr);
         }
         {   // isci dugmesi gorunumu (karsi cihaz isciyi calistirirken "isciden cik" gorunsun)
             void* ubm = dlsym(appLib, "_ZN17GenericGUIManager14updateBaseMenuEP16GUIInterfaceDescP26AndroidHandheldInputDevicef");
