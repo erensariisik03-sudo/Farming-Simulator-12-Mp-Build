@@ -3301,7 +3301,6 @@ static void BaleCapture(uintptr_t game, long long now) {
 // Host: tum balya listesini yayinla. Client: gelen listeyle yerel balyalari uzlastir.
 static void BaleHostBroadcast(uintptr_t game, long long now, bool force) {
     if (!force && now - g_BaleListSendMs < 5000) return;
-    g_BaleListSendMs = now;
     uint8_t buf[sizeof(BaleListHeader) + kBaleMax * 12];
     BaleListHeader h; h.type = PACKET_BALE_LIST; h.count = 0;
     size_t off = sizeof(h);
@@ -3313,6 +3312,18 @@ static void BaleHostBroadcast(uintptr_t game, long long now, bool force) {
         off += 12; ++h.count;
     }
     memcpy(buf, &h, sizeof(h));
+    // Konumlar 0.1 birime yuvarlanip karmalanir: liste degismediyse 10 sn'de bir kalp atisi yeter.
+    static uint32_t s_baleHash = 0;
+    uint32_t hh = 2166136261u;
+    for (size_t k = sizeof(h); k < off; k += 4) {
+        float f; memcpy(&f, buf + k, 4);
+        const int32_t q = (int32_t)lroundf(f * 10.0f);
+        hh ^= (uint32_t)q; hh *= 16777619u;
+    }
+    hh ^= h.count;
+    if (!force && hh == s_baleHash && now - g_BaleListSendMs < 10000) return;
+    s_baleHash = hh;
+    g_BaleListSendMs = now;
     QueueVehicleEvent(buf, off);
 }
 
@@ -3659,7 +3670,7 @@ static void DemandApply(uintptr_t game, const DemandPacket& p) {
     }
     *(volatile uint32_t*)(gd + 4) = n;
     if (isNew) *(volatile uint8_t*)(gd + 0x28) = 1;       // oyunun "yeni talep" bildirimi
-    LOGI("[DEMAND] client: host fiyat listesi uygulandi (talep=%u yeni=%d)", (unsigned)n, (int)isNew);
+    if (isNew || n != oldN) LOGI("[DEMAND] client: host fiyat listesi uygulandi (talep=%u yeni=%d)", (unsigned)n, (int)isNew);   // sadece degisimde
 }
 
 // Oyun thread'i, Game::updateStateBase orijinalinden ONCE (durum 6). Sadece client icin is yapar.
@@ -3732,9 +3743,9 @@ static void MiscSyncPost(uintptr_t game) {
                 p.e[i].timerBits = *(volatile uint32_t*)(gd + 0x18 + 4 * i);
                 key[1 + i * 2] = p.e[i].a; key[2 + i * 2] = p.e[i].b;
             }
-            uint32_t h = 2166136261u;                         // FNV-1a (Fnv1a() bu noktadan sonra tanimli)
+            uint32_t h = 2166136261u;                         // FNV-1a
             for (size_t k = 0; k < sizeof(key); ++k) { h ^= ((const uint8_t*)key)[k]; h *= 16777619u; }
-            if (h != g_DemandHash || now - g_DemandSendMs >= 5000) {
+            if (h != g_DemandHash || now - g_DemandSendMs >= 10000) {   // degisimde hemen, aksi halde 10 sn'de bir kalp atisi
                 g_DemandHash = h; g_DemandSendMs = now;
                 QueueVehicleEvent(&p, sizeof(p));
             }
@@ -4369,6 +4380,7 @@ static TipSite_updateBga_t g_TipSiteUpdateBgaFn = nullptr;       // TipSite::upd
 static float g_WorldAcc[kWorldN];                              // sadece oyun thread'i
 static long long g_WorldLocalMs = 0;
 static long long g_WorldFlushMs = 0, g_PriceTblMs = 0;
+static uint32_t g_PriceTblHash = 0;
 static std::vector<WorldDeltaEntry> g_PendingWorld;            // g_VehicleEventMutex ile korunur
 static uint8_t g_PendingPriceBuf[kPriceTableMaxBytes];         // g_VehicleEventMutex ile korunur
 static size_t g_PendingPriceLen = 0;
@@ -4512,8 +4524,8 @@ static void WorldSyncFrame(uintptr_t game) {
     }
 
     // 3) host: mutlak durumu (stoklar + fiyatlar + biyogaz zamanlayici/doluluk) periyodik yayinla
+    // Degisim yoksa 12 sn'de bir kalp atisi (yeni baglanan / paket kacirmis cihaz toparlansin); degisim varsa en sik 4 sn'de bir.
     if (g_IsHost.load() && now - g_PriceTblMs >= 4000) {
-        g_PriceTblMs = now;
         const int sites = WorldSiteCount(game);
         uint8_t buf[kPriceTableMaxBytes];
         PriceTableHeader th; th.type = PACKET_PRICE_TABLE; th.sites = (uint8_t)sites;
@@ -4526,7 +4538,13 @@ static void WorldSyncFrame(uintptr_t game) {
             const int idx = (i < priceEnd) ? i : (kWorldExtraBase + (i - priceEnd));
             memcpy(buf + sizeof(th) + (size_t)i * 4, &vals[idx], 4);
         }
-        QueueVehicleEvent(buf, sizeof(th) + (size_t)nT * 4);
+        const size_t tlen = sizeof(th) + (size_t)nT * 4;
+        uint32_t hh = 2166136261u;                                 // FNV-1a
+        for (size_t k = 0; k < tlen; ++k) { hh ^= buf[k]; hh *= 16777619u; }
+        if (hh != g_PriceTblHash || now - g_PriceTblMs >= 12000) {
+            g_PriceTblHash = hh; g_PriceTblMs = now;
+            QueueVehicleEvent(buf, tlen);
+        }
     }
 }
 
@@ -5574,7 +5592,7 @@ static void ResetVehicleSyncState() {
     }
     g_FsValid.store(false); g_FsMap.store(0); g_FsScanMs = 0;
     g_MsPrevValid = false; g_MsIgnoreUntil = 0; g_MissionDoneFlag.store(false);
-    g_DemandHash = 0; g_DemandSendMs = 0; g_MissionSendMs = 0;
+    g_DemandHash = 0; g_DemandSendMs = 0; g_MissionSendMs = 0; g_PriceTblHash = 0; g_PriceTblMs = 0;
     g_MsSentState = -1; g_MsSentItem = -1; g_MsSentSpawn = -1;
     g_OwnSnapValid = false; g_OwnMapPtr = 0;
     g_BaleTrk.clear();
@@ -6100,7 +6118,7 @@ static bool ProcessPackets(uint8_t* buf, size_t& buffered, int peerId, std::vect
             if (fromPeer) { fp.ownerId = (uint8_t)peerId; memcpy(buf, &fp, sizeof(fp)); }
             if (kSyncFieldWork && fp.ownerId != g_LocalPlayerId.load() && fp.wtype < 16) {
                 std::lock_guard<std::mutex> lock(g_VehicleEventMutex);
-                if (g_PendingFieldOps.size() >= 256) g_PendingFieldOps.erase(g_PendingFieldOps.begin());
+                if (g_PendingFieldOps.size() >= 1024) g_PendingFieldOps.erase(g_PendingFieldOps.begin());
                 g_PendingFieldOps.push_back(fp);
             }
         } else if (type == PACKET_POOL_OP) {
@@ -7615,7 +7633,7 @@ static void DrawPlayerNameTags(const ImVec2& screen) {
     }
     for (uint8_t p = 0; p < MAX_PLAYERS; ++p) {
         if (p == me) continue;
-        if (snapNid[p] < 0 || snapNid[p] == g_LocalActiveNetId || (now - snapMs[p]) >= 6000) continue;
+        if (snapNid[p] < 0 || (now - snapMs[p]) >= 6000) continue;      // kendi aracindaki diger oyuncularin adi da gosterilir
         std::string nm = GetPlayerName(p);
         if (nm.empty()) continue;
         int slot = -1;
@@ -8488,7 +8506,6 @@ static const bool kGuardGhostMoney = true;
 typedef void* (*EntityUpdate_t)(void*, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t);
 static EntityUpdate_t orig_Vehicle_update = nullptr;
 static EntityUpdate_t orig_Trailer_update = nullptr;
-static EntityUpdate_t orig_Tool_update = nullptr;
 static std::atomic<int> g_MoneyGuardLogs(0);
 
 static bool IsGhostVehiclePtr(uintptr_t veh) {
@@ -8582,10 +8599,6 @@ static void* my_Trailer_update(void* t, uint32_t a, uint32_t b, uint32_t c, uint
     const uintptr_t veh = t ? *(uintptr_t*)((uintptr_t)t + 0x184) : 0;     // Trailer+0x184 = bagli oldugu arac
     return GuardedEntityUpdate(orig_Trailer_update, veh, "Trailer", t, a, b, c, d, e);
 }
-static void* my_Tool_update(void* t, uint32_t a, uint32_t b, uint32_t c, uint32_t d, uint32_t e) {
-    const uintptr_t veh = t ? *(uintptr_t*)((uintptr_t)t + 0x23C) : 0;     // Tool+0x23C = bagli oldugu arac
-    return GuardedEntityUpdate(orig_Tool_update, veh, "Tool", t, a, b, c, d, e);
-}
 
 // ---- BICER BORU BOSALTMA: hayalet bicer icerik URETMESIN ----
 // Bicerin tanki sahibi cihazda gercek, diger cihazlarda "hayalet"tir (tank mutlak deger olarak her ~250 ms'de
@@ -8662,19 +8675,9 @@ static void my_Map_updateFields(void* map, uint32_t f1, uint32_t f2, uint32_t f3
                          g_VehNetArmed.load() && g_EngineInstance != 0;
     uint32_t wt = 0, wf = 0;
     if (capture) { wt = ((uint32_t*)fw)[0]; wf = ((uint32_t*)fw)[1]; }
-    // Hayalet bicerin (baska oyuncunun bicerinin) yerel hasadi yapilmaz: tarla degisimi sahibinden zaten tarla islemi
-    // olarak gelir, tank sahibinden mutlak gelir. Aksi halde hayalet kendi tankina ek mahsul yazar (cift sayim).
-    // Oyun sonuc alanlarini (+8 alan, +12 ikinci alan) cagridan once zaten sifirlar; burada da sifir birakilir.
-    if (capture) {
-        uintptr_t sv = 0;
-        if (FieldSourceKind(g_EngineInstance, (uintptr_t)fw, &sv) == 1 && sv != 0) {
-            const int snid = NetIdOfVehicle(sv);
-            if (snid >= 0 && !g_AiMirrored[snid] && IsGhostVehiclePtr(sv)) {
-                ((uint32_t*)fw)[2] = 0; ((uint32_t*)fw)[3] = 0;
-                return;
-            }
-        }
-    }
+    // NOT: hayalet bicerin yerel hasadi ATLANMAZ (shopfix-28'de atlanmisti, clientte tarladaki mahsul belli bir yerden
+    // sonra gitmiyordu): hayalet de kendi kopyasinda tarlayi biçer, gelen tarla islemleri ek guvence olur. Tank sahibinden
+    // mutlak gelir ve hayalet boru bosaltmasi geri alindigi icin ek mahsul romorka gecmez.
     // Tarla isi HER cihazda yerel olarak calisir: uzaktan surulen (hayalet) arac ve aynalanan isci de bu cihazda
     // tarlayi isler (herkes ayni isi kendi kopyasinda yapar). Sadece YAYIN sofor/isciyi baslatan cihazdan gider;
     // hayalet ve aynali aracin islemi yollanmaz (yanki olmasin).
@@ -8694,109 +8697,6 @@ static void my_Map_updateFields(void* map, uint32_t f1, uint32_t f2, uint32_t f3
     QueueFieldOp(wt, wf, pts);
 }
 
-// ---- Aynalanmayan isci icin HUD dugmesi ----
-// Karsi cihaz isciyi calistirirken bu cihazin HUD'u "isciden cik" dugmesini gostersin. HUD, dugmeyi
-// GUIInterfaceDesc+0x59B (= Game+0x8EAB = aktif aracin +0x730 != 0) bayragindan secer; bayrak
-// GenericGUIManager::updateBaseMenu icinde okunur. Okunmadan hemen once 1'e cekilir.
-typedef void* (*UpdateBaseMenu_t)(void*, void*, void*, uint32_t, uint32_t, uint32_t);
-static UpdateBaseMenu_t orig_updateBaseMenu = nullptr;
-static void* my_updateBaseMenu(void* thiz, void* desc, void* in, uint32_t a, uint32_t b, uint32_t c) {
-    const uintptr_t g = g_EngineInstance;
-    if (desc && g && g_IsConnected.load() && g_VehNetArmed.load()) {
-        const uint32_t ai = *(volatile uint32_t*)(g + 0xA8);
-        if (ai < VehicleCount(g)) {
-            const uintptr_t v = RawVehicleSlot(g, ai);
-            const int id = NetIdOfVehicle(v);
-            if (id >= 0 && *(volatile uint32_t*)(v + 0x730) == 0) {
-                const CombineTrack& ct = g_CbTrack[id];
-                if (ct.rvalid && (ct.rflags & 8) && ((long long)NowMs() - (long long)ct.lastMs) < 10000)
-                    *(volatile uint8_t*)((uintptr_t)desc + 0x59B) = 1;
-            }
-        }
-    }
-    return orig_updateBaseMenu ? orig_updateBaseMenu(thiz, desc, in, a, b, c) : nullptr;
-}
-
-// ---- Kayma TANI logu (tarla / balya / sayilar) ----
-// Her cihaz 15 sn'de bir ayni bicimde bir [SYNC] satiri yazar; iki cihazin logunu yan yana koyunca hangi
-// verinin (arac/alet sayisi, para, saat, tarla haritasi karmasi, balyalar) kaydigi gorulur. Harita karmasi
-// Map::serialize'in cikti baytlarinin FNV-1a'sidir (okuma amacli, oyunun kaydi degil).
-static const bool kSyncDiag = true;
-typedef uint8_t* (*MapSerialize_t)(void* map, uint8_t* buf);
-static MapSerialize_t g_MapSerializeFn = nullptr;
-static uint64_t g_DiagLastMs = 0;
-static uint8_t* g_DiagBuf = nullptr;
-static const size_t kDiagBufSize = 16u * 1024u * 1024u;
-
-static uint32_t Fnv1a(const uint8_t* p, size_t n) {
-    uint32_t h = 2166136261u;
-    for (size_t i = 0; i < n; ++i) { h ^= p[i]; h *= 16777619u; }
-    return h;
-}
-
-static void SyncDiagFrame(uintptr_t game, uint32_t st) {
-    if (!kSyncDiag || game == 0 || st != 6 || !g_IsConnected.load()) return;
-    // Ornekleme oyun saatinin (realTime) 15 sn'lik dilimlerine hizali: saat host'a cekildigi icin iki cihaz
-    // ayni anda ornekler ve harita/balya karmalari yan yana karsilastirilabilir.
-    const uint64_t now = (uint64_t)NowMs();
-    {
-        const double rt = ReadEnvD(game, 8);
-        static long long s_slot = -2;
-        if (rt == rt && rt > 0.0 && rt < 1.0e9) {
-            const long long slot = (long long)(rt / 15.0);
-            if (slot == s_slot) return;
-            if (now - g_DiagLastMs < 5000) return;
-            s_slot = slot;
-        } else if (now - g_DiagLastMs < 15000) {
-            return;
-        }
-    }
-    g_DiagLastMs = now;
-
-    uint32_t mapHash = 0; size_t mapSize = 0;
-    void* map = (void*)(*(uintptr_t*)(game + 0x704));
-    if (g_MapSerializeFn && map) {
-        if (!g_DiagBuf) {
-            void* m = mmap(nullptr, kDiagBufSize, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-            g_DiagBuf = (m == MAP_FAILED) ? nullptr : (uint8_t*)m;
-        }
-        if (g_DiagBuf) {
-            uint8_t* end = g_MapSerializeFn(map, g_DiagBuf);
-            const size_t n = (size_t)(end - g_DiagBuf);
-            if (end >= g_DiagBuf && n > 0 && n < kDiagBufSize) { mapHash = Fnv1a(g_DiagBuf, n); mapSize = n; }
-        }
-    }
-    char bales[160]; bales[0] = '\0';
-    const uint32_t bn = *(uint32_t*)(game + 900);
-    for (uint32_t i = 0; i < bn && i < 5; ++i) {
-        const uintptr_t b = *(uintptr_t*)(game + 0x388 + (uintptr_t)i * 4u);
-        const uintptr_t body = b ? *(uintptr_t*)(b + 0x50) : 0;
-        if (!body) continue;
-        char t[32];
-        snprintf(t, sizeof(t), "(%.0f,%.0f)", *(float*)(body + 0x0C), *(float*)(body + 0x10));
-        strncat(bales, t, sizeof(bales) - strlen(bales) - 1);
-    }
-    // Balya karmasi: konumlar 0.1 birime yuvarlanip siralanir (havuz sirasi cihazlar arasinda farkli olabilir).
-    uint32_t baleHash = 0;
-    {
-        std::vector<int32_t> q;
-        const uint32_t cnt = BaleCountOf(game);
-        for (uint32_t i = 0; i < cnt; ++i) {
-            float bx, by, ba;
-            if (!ReadBalePose(BalePtrAt(game, i), &bx, &by, &ba)) continue;
-            q.push_back((int32_t)lroundf(bx * 10.0f) * 100003 + (int32_t)lroundf(by * 10.0f));
-        }
-        std::sort(q.begin(), q.end());
-        if (!q.empty()) baleHash = Fnv1a((const uint8_t*)q.data(), q.size() * sizeof(int32_t));
-    }
-    int mcIdx = -9; float mcTimer = 0.0f;
-    if (map) { mcIdx = *(int32_t*)((uintptr_t)map + 0xc90); mcTimer = *(float*)((uintptr_t)map + 0xc88); }
-    LOGI("[SYNC] veh=%u trl=%u tool=%u bale=%u money=%.0f env=%.1f/%.1f maphash=%08x mapsize=%u balehash=%08x mclk=%u/%d/%.1f %s",
-         (unsigned)VehicleCount(game), (unsigned)TrailerCount(game), (unsigned)ToolCount(game), (unsigned)bn,
-         ReadMoney(game), ReadEnvD(game, 0), ReadEnvD(game, 8), (unsigned)mapHash, (unsigned)mapSize,
-         (unsigned)baleHash, (unsigned)g_McCycles, mcIdx, (double)mcTimer, bales);
-}
-
 void my_GameUpdate(void* thiz, float param_1) {
     if (g_HUDInstance != 0) RepairShopClick((void*)g_HUDInstance, "gameUpdate");   // tiklama bu karede islenmeden once
     g_LastGameUpdateMs.store(NowMs());   // host canlilik sinyali icin (oyun dongusu donarsa ping kesilir)
@@ -8814,7 +8714,6 @@ void my_GameUpdate(void* thiz, float param_1) {
         TimeSyncFrame((uintptr_t)thiz, st0);
         MapClockFrame((uintptr_t)thiz, st0);
         FieldOwnFrame((uintptr_t)thiz, st0);
-        SyncDiagFrame((uintptr_t)thiz, st0);
     }
 
     // Oturum guvenligi: host oyundan cikarsa oda kapanir, client baglantisi kopunca oyundan atilir.
@@ -9139,7 +9038,7 @@ void* my_renderStartMenuMain(void* thiz, void* p1, void* p2, void* p3) {
 // ========================================================================
 __attribute__((constructor))
 void ModMain() {
-    LOGI(">>> MULTIPLAYER MOD STARTING <<< build=shopfix-28+pipe-ghost-guard+nametags");
+    LOGI(">>> MULTIPLAYER MOD STARTING <<< build=shopfix-30+cleanup+change-only-packets");
 
     ResetVehicleSyncState();
     std::thread(StartPONGResponderThread).detach();
@@ -9215,13 +9114,11 @@ void ModMain() {
             if (!vu) vu = FindElfSymbolByPrefix("libapp.so", "_ZN7Vehicle6update");
             void* tru = dlsym(appLib, "_ZN7Trailer6updateEfP4Game");
             if (!tru) tru = FindElfSymbolByPrefix("libapp.so", "_ZN7Trailer6update");
-            void* tou = dlsym(appLib, "_ZN4Tool6updateEfP4Game");
-            if (!tou) tou = FindElfSymbolByPrefix("libapp.so", "_ZN4Tool6update");
-            LOGI("[MONEY] guard symbols: Vehicle::update=%p Trailer::update=%p Tool::update=%p", vu, tru, tou);
+            // Tool::update bu oyun surumunde guvenle kancalanamiyor (prologue pc-gorece yukleme): hic denenmez.
+            LOGI("[MONEY] guard symbols: Vehicle::update=%p Trailer::update=%p", vu, tru);
             const bool h1 = HookChecked("Vehicle::update", vu, (void*)my_Vehicle_update, (void**)&orig_Vehicle_update, true);
             const bool h2 = HookChecked("Trailer::update", tru, (void*)my_Trailer_update, (void**)&orig_Trailer_update, true);
-            const bool h3 = HookChecked("Tool::update", tou, (void*)my_Tool_update, (void**)&orig_Tool_update, true);
-            LOGI("[MONEY] guard hooks installed: Vehicle=%d Trailer=%d Tool=%d", (int)h1, (int)h2, (int)h3);
+            LOGI("[MONEY] guard hooks installed: Vehicle=%d Trailer=%d", (int)h1, (int)h2);
             void* ups = dlsym(appLib, "_ZN7Vehicle15updatePipeStateEfP4GameRP7Trailer");
             if (!ups) ups = FindElfSymbolByPrefix("libapp.so", "_ZN7Vehicle15updatePipeState");
             const bool h4 = HookChecked("Vehicle::updatePipeState", ups, (void*)my_Vehicle_updatePipeState,
@@ -9234,15 +9131,6 @@ void ModMain() {
             const bool hr = HookChecked("RenderArgs::update", rau, (void*)my_RenderArgs_update,
                                         (void**)&orig_RenderArgs_update, true);
             LOGI("[NAMETAG] RenderArgs::update=%p hook=%d", rau, (int)hr);
-        }
-        {   // isci dugmesi gorunumu (karsi cihaz isciyi calistirirken "isciden cik" gorunsun)
-            void* ubm = dlsym(appLib, "_ZN17GenericGUIManager14updateBaseMenuEP16GUIInterfaceDescP26AndroidHandheldInputDevicef");
-            if (!ubm) ubm = FindElfSymbolByPrefix("libapp.so", "_ZN17GenericGUIManager14updateBaseMenu");
-            const bool hu = HookChecked("GenericGUIManager::updateBaseMenu", ubm, (void*)my_updateBaseMenu, (void**)&orig_updateBaseMenu, true);
-            LOGI("[AIBTN] updateBaseMenu=%p hooked=%d", ubm, (int)hu);
-            g_MapSerializeFn = (MapSerialize_t)dlsym(appLib, "_ZN3Map9serializeEPh");
-            if (!g_MapSerializeFn) g_MapSerializeFn = (MapSerialize_t)FindElfSymbolByPrefix("libapp.so", "_ZN3Map9serialize");
-            LOGI("[SYNC] Map::serialize=%p", (void*)g_MapSerializeFn);
         }
         {   // romork/alet alim-satim fonksiyonlari (sadece cagrilir) + tarla islemi kancasi
             g_GameAddTrailerFn = (Game_addItem_t)dlsym(appLib, "_ZN4Game10addTrailerEN13EntityManager8TRAILERSERK7Vector3fj");
