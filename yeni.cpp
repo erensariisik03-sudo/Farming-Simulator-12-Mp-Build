@@ -2168,7 +2168,10 @@ static void TrackTrailerAttachAndFill(uintptr_t game, uint64_t nowMs) {
             if (av != t->av && t->av != 0) {                                // eski araca bagliydi: once cikar
                 const int oldId = NetIdOfVehicle(t->av);
                 if (oldId >= 0) {
-                    pk.attach = 0; pk.vehNetId = (uint16_t)oldId;
+                    pk.attach = 4; pk.vehNetId = (uint16_t)oldId;      // bit2: cikarma anindaki konumlar pakette (karsi cihaz romorku dogru yere koysun)
+                    const uintptr_t ovb = *(uintptr_t*)(t->av + 0x528);
+                    if (ovb != 0) { pk.vx = *(float*)(ovb + 0x0C); pk.vy = *(float*)(ovb + 0x10); pk.va = *(float*)(ovb + 0x40); }
+                    else pk.attach = 0;
                     QueueVehicleEvent(&pk, sizeof(pk));
                     LOGI("[TRAILER] cikarildi: romork=%u arac=%d", (unsigned)i, oldId);
                 }
@@ -2256,7 +2259,10 @@ static void TrackToolAttachAndFill(uintptr_t game, uint8_t localOwner, uint64_t 
             if (av != t->av && t->av != 0) {
                 const int oldId = NetIdOfVehicle(t->av);
                 if (oldId >= 0) {
-                    pk.attach = 2; pk.vehNetId = (uint16_t)oldId;
+                    pk.attach = 6; pk.vehNetId = (uint16_t)oldId;      // 2 = alet, 4 = konumlar pakette
+                    const uintptr_t ovb = *(uintptr_t*)(t->av + 0x528);
+                    if (ovb != 0) { pk.vx = *(float*)(ovb + 0x0C); pk.vy = *(float*)(ovb + 0x10); pk.va = *(float*)(ovb + 0x40); }
+                    else pk.attach = 2;
                     QueueVehicleEvent(&pk, sizeof(pk));
                     LOGI("[TOOL] cikarildi: alet=%u arac=%d", (unsigned)i, oldId);
                 }
@@ -2296,6 +2302,48 @@ static void TrackToolAttachAndFill(uintptr_t game, uint8_t localOwner, uint64_t 
     }
 }
 
+// Uzaktan CIKARMA uygulandiktan sonra:
+//  1) Oyunun kendi "yeniden takma bekleme" sayaci (Game+0xA420 = -10): oyun, kullanici cikardiktan sonra ~10 sn otomatik
+//     takmayi kapatir (handleIngameGuiEvent). Uzaktan cikarmada bu sayac kurulmadigi icin, ayni araca bakan cihaz hemen
+//     "yakindaki romork/alet" diye tekrar takip karsi cihaza geri yayiyordu (cikarilmayan romork/pulluk).
+//  2) Gonderenin cikarma anindaki konumu (araca gore) bu cihazdaki araca gore uygulanir: alet, takma olayi hic uygulanmamis
+//     bile olsa ilk konumunda kalmaz (pulluk isinlanmasi).
+//  3) Bu nesnenin eski uzak akis kaydi / yayin sahipligi / sensor durumu sifirlanir (eski konuma geri cekme olmasin).
+static void AfterRemoteDetach(uintptr_t game, const TrailerAttachPacket& pk, uintptr_t tbody, uintptr_t vbody, bool tool) {
+    if (game != 0) *(float*)(game + 0xA420) = -10.0f;
+    const uint32_t idx = pk.trIdx;
+    const bool pv = (pk.attach & 4) != 0 && tbody != 0 && vbody != 0 && g_b2BodySetTransform &&
+                    pk.tx == pk.tx && pk.ty == pk.ty && pk.ta == pk.ta && pk.vx == pk.vx && pk.vy == pk.vy && pk.va == pk.va &&
+                    fabsf(pk.tx) < 1.0e5f && fabsf(pk.ty) < 1.0e5f && fabsf(pk.vx) < 1.0e5f && fabsf(pk.vy) < 1.0e5f;
+    if (pv) {
+        const float c0 = cosf(pk.va), s0 = sinf(pk.va);
+        const float dx = pk.tx - pk.vx, dy = pk.ty - pk.vy;
+        const float lx = c0 * dx + s0 * dy, ly = -s0 * dx + c0 * dy;
+        const float va2 = *(float*)(vbody + 0x40);
+        const float c1 = cosf(va2), s1 = sinf(va2);
+        TestB2Vec2 pos;
+        pos.x = *(float*)(vbody + 0x0C) + c1 * lx - s1 * ly;
+        pos.y = *(float*)(vbody + 0x10) + s1 * lx + c1 * ly;
+        g_b2BodySetTransform((void*)tbody, &pos, va2 + (pk.ta - pk.va));
+        SetRemoteBodyVelocity(tbody, 0.0f, 0.0f, 0.0f);
+    }
+    if (idx < (tool ? 64u : 256u)) {
+        const int ti = tool ? 1 : 0;
+        if (tool) g_ToolMine[idx] = false; else g_TrailerMine[idx] = false;
+        if (g_AttSensorBody[ti][idx] != 0) {
+            if (g_AttSensorBody[ti][idx] == tbody) B2BodyRestoreSensor(tbody, g_AttSensorMask[ti][idx]);
+            g_AttSensorBody[ti][idx] = 0; g_AttSensorMask[ti][idx] = 0;
+        }
+        const uint16_t sid = (uint16_t)((tool ? TOOL_ID_BASE : TRAILER_ID_BASE) + idx);
+        std::lock_guard<std::mutex> lock(g_VehicleStateMutex);
+        memset(&g_RemoteVehicles[sid], 0, sizeof(g_RemoteVehicles[sid]));
+        memset(&g_LocalSamples[sid], 0, sizeof(g_LocalSamples[sid]));
+        memset(&g_LastSentLocalVehicles[sid], 0, sizeof(g_LastSentLocalVehicles[sid]));
+        g_LocalStationarySince[sid] = 0;
+        g_RemoteStationarySince[sid] = 0;
+    }
+}
+
 // Uzaktan gelen alet takma/cikarma (Vehicle::attachTool / detachTool sadece CAGRILIR).
 static void ApplyToolAttach(uintptr_t game, const TrailerAttachPacket& pk, void* world) {
     const uint32_t tn = ToolCount(game);
@@ -2312,7 +2360,8 @@ static void ApplyToolAttach(uintptr_t game, const TrailerAttachPacket& pk, void*
     const uintptr_t cur = *(uintptr_t*)(tp + 0x23C);
     if ((pk.attach & 1) == 0) {
         if (cur == veh) g_VehicleDetachToolFn((void*)veh, world);
-        LOGI("[TOOL] uzaktan cikarma uygulandi: alet=%u", (unsigned)pk.trIdx);
+        AfterRemoteDetach(game, pk, tbody, vbody, true);
+        LOGI("[TOOL] uzaktan cikarma uygulandi: alet=%u (bagliydi=%d)", (unsigned)pk.trIdx, (int)(cur == veh));
         return;
     }
     if (cur == veh) return;
@@ -4597,9 +4646,10 @@ static void ApplyPendingTrailerEvents(uintptr_t game, uint8_t localOwner, uint64
         if (tbody == 0 || vbody == 0 || !g_VehicleDetachTrailerFn) continue;
         const uintptr_t cur = *(uintptr_t*)(tp + 0x184);
         g_ApplyingRemoteTrailerOp = true;
-        if (pk.attach == 0) {
+        if ((pk.attach & 1) == 0) {
             if (cur == veh) g_VehicleDetachTrailerFn((void*)veh, world);
-            LOGI("[TRAILER] uzaktan cikarma uygulandi: romork=%u", (unsigned)pk.trIdx);
+            AfterRemoteDetach(game, pk, tbody, vbody, false);
+            LOGI("[TRAILER] uzaktan cikarma uygulandi: romork=%u (bagliydi=%d)", (unsigned)pk.trIdx, (int)(cur == veh));
         } else if (cur != veh) {
             if (!g_VehicleAttachTrailerFn || *(uintptr_t*)(veh + 0x560) != 0 || *(uint32_t*)(veh + 0x730) != 0) {
                 LOGI("[TRAILER] takma atlandi: alet bagli / isci acik / fonksiyon yok");
@@ -4849,6 +4899,10 @@ static void CaptureAndQueueLocalTrailerStates(uintptr_t game, uint8_t localOwner
                     s_ref[ti][i][0] = x; s_ref[ti][i][1] = y; s_ref[ti][i][2] = angle; s_refOk[ti][i] = true;
                 }
             }
+            // Bu nesneyi uzaktan gelen akis oynatiyorsa (sensor modu) gorulen hareket YEREL itme DEGILDIR (balyadaki
+            // "moved && !sensor && !hasTarget" kurali). Aksi halde alici cihaz, kendi yakinindaki araci sebep gosterip nesneyi
+            // sahiplenir; iki cihaz birbirinin akisini ezer, sensor surekli acilip kapanir ve fizik patlar (itince cokme).
+            if (g_AttSensorBody[ti][i] != 0 || nowMs - g_AttSensorMs[ti][i] < 400) moving = false;
             const bool wasMine = mineArr[i];
             bool nearAuth = false;
             if (moving || wasMine) {
@@ -5126,6 +5180,8 @@ static void ApplyRemoteAttachablePoses(uintptr_t game, uint8_t localOwner, uint6
 
         float poseX, poseY, poseAngle;
         PredictRemotePose(state, nowMs, &poseX, &poseY, &poseAngle);
+        if (!(poseX == poseX) || !(poseY == poseY) || !(poseAngle == poseAngle) ||
+            fabsf(poseX) > 1.0e5f || fabsf(poseY) > 1.0e5f) continue;          // bozuk konum: fizik govdesine yazma
         TestB2Vec2 position;
         position.x = poseX + state.errX;
         position.y = poseY + state.errY;
@@ -5139,11 +5195,12 @@ static void ApplyRemoteAttachablePoses(uintptr_t game, uint8_t localOwner, uint6
         }
         g_AttSensorMs[ti][i] = nowMs;
         g_b2BodySetTransform((void*)body, &position, poseAngle + state.errA);
+        // Sensor modunda govdeye hiz VERILMEZ (balyadaki SetBalePose gibi): hiz, sensor geri kapaninca nesneyi firlatirdi.
+        // Govde sadece uyanik tutulur ki oyun gorunumu / fizigi yenilesin.
+        SetRemoteBodyVelocity(body, 0.0f, 0.0f, 0.0f);
+        if (*(int*)body != 0) { *(uint16_t*)(body + 4) |= 2; *(float*)(body + 0x90) = 0.0f; }
 
-        if (state.moving) {
-            SetRemoteBodyVelocity(body, state.vx, state.vy, state.angularVelocity);
-        } else {
-            SetRemoteBodyVelocity(body, 0.0f, 0.0f, 0.0f);
+        if (!state.moving) {
             if (offsetGone) {
                 std::lock_guard<std::mutex> lock(g_VehicleStateMutex);
                 if (g_RemoteVehicles[sid].sequence == state.sequence) g_RemoteVehicles[sid].appliedSequence = state.sequence;
@@ -8609,11 +8666,34 @@ static void* my_Trailer_update(void* t, uint32_t a, uint32_t b, uint32_t c, uint
 typedef void (*Vehicle_updatePipeState_t)(void* thiz, uint32_t dtBits, void* game, void* outTrailer);
 static Vehicle_updatePipeState_t orig_Vehicle_updatePipeState = nullptr;
 static std::atomic<int> g_PipeGuardLogs(0);
+static std::atomic<int> g_FillLogs(0);
 
 static void my_Vehicle_updatePipeState(void* t, uint32_t dtBits, void* gm, void* outTr) {
     if (!orig_Vehicle_updatePipeState) return;
     const uintptr_t g = g_EngineInstance;
     if (t == nullptr || g == 0 || !g_IsConnected.load() || !g_VehNetArmed.load() || !IsGhostVehiclePtr((uintptr_t)t)) {
+        if (t != nullptr && g != 0 && g_IsConnected.load() && g_FillLogs.load() < 40) {
+            // TANI: GERCEK borunun tank/romork degisimi (bosaltma korunumu: tank -X, romork +X olmali). Yalnizca baglantiliyken, sinirli log.
+            const uintptr_t v0 = (uintptr_t)t;
+            const float tankB = WordToFloat(*(uint32_t*)(v0 + 0x440));
+            float sumB = 0.0f;
+            const uint32_t tn0 = TrailerCount(g);
+            for (uint32_t i = 0; i < tn0; ++i) { const uintptr_t tp = RawTrailerSlot(g, i); if (tp) sumB += WordToFloat(*(uint32_t*)(tp + 0x388)); }
+            orig_Vehicle_updatePipeState(t, dtBits, gm, outTr);
+            const float tankA = WordToFloat(*(uint32_t*)(v0 + 0x440));
+            float sumA = 0.0f;
+            for (uint32_t i = 0; i < tn0; ++i) { const uintptr_t tp = RawTrailerSlot(g, i); if (tp) sumA += WordToFloat(*(uint32_t*)(tp + 0x388)); }
+            static float s_accTank = 0.0f, s_accTr = 0.0f; static long long s_lastLog = 0;
+            if (tankA == tankA && tankB == tankB && sumA == sumA && sumB == sumB) { s_accTank += tankB - tankA; s_accTr += sumA - sumB; }
+            const long long nowL = NowMs();
+            if ((s_accTank > 1.0f || s_accTr > 1.0f) && nowL - s_lastLog >= 1000) {
+                s_lastLog = nowL;
+                LOGI("[FILL] gercek boru: tank dustu=%.1f romork artti=%.1f (rol=%s)", s_accTank, s_accTr, g_IsHost.load() ? "host" : "client");
+                s_accTank = s_accTr = 0.0f;
+                g_FillLogs.fetch_add(1);
+            }
+            return;
+        }
         orig_Vehicle_updatePipeState(t, dtBits, gm, outTr);
         return;
     }
@@ -9038,7 +9118,7 @@ void* my_renderStartMenuMain(void* thiz, void* p1, void* p2, void* p3) {
 // ========================================================================
 __attribute__((constructor))
 void ModMain() {
-    LOGI(">>> MULTIPLAYER MOD STARTING <<< build=shopfix-30+cleanup+change-only-packets");
+    LOGI(">>> MULTIPLAYER MOD STARTING <<< build=shopfix-31+detach-cooldown+detach-pose+loose-claim-fix");
 
     ResetVehicleSyncState();
     std::thread(StartPONGResponderThread).detach();
