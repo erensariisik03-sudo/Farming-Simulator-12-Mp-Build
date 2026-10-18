@@ -4842,6 +4842,22 @@ static void ApplyPendingTrailerEvents(uintptr_t game, uint8_t localOwner, uint64
     }
 }
 
+// Bir araca bagli romork/aletin konumunu YAYINLAYAN cihaz tek olmali (hem gonderen hem alan ayni kurali kullanir):
+//  1) Aracin sahibi (authority) varsa o cihaz.
+//  2) Sahipsizse ve araci yerelde aktif kullaniyorsam: daha dusuk numarali baska oyuncu de ayni aractaysa o, degilse ben.
+//  3) Sahipsiz, ben aktif degilim, baska oyuncu aktifse: o.
+//  4) Kimse yoksa (park): host.
+// Eskiden "av == aktifArac" her iki cihazda da dogruydu (ayni traktore binince) ve iki cihaz da kendi fizigini
+// "gercek" sayip birbirinin konumunu uygulamiyordu: romork bir yanda sola, diger yanda saga yatiyordu.
+static bool IsTowPublisher(int nid, bool localActive, uint8_t localOwner) {
+    uint8_t ow = VEHICLE_OWNER_NONE;
+    if (nid >= 0) { std::lock_guard<std::mutex> lock(g_VehicleStateMutex); ow = g_VehicleAuthority[nid].ownerId; }
+    if (ow != VEHICLE_OWNER_NONE) return ow == localOwner;
+    if (localActive) return !HasLowerIdRemoteActive(nid, localOwner);
+    if (IsRemoteActiveVehicle(nid)) return false;
+    return g_IsHost.load();
+}
+
 static void CaptureAndQueueLocalTrailerStates(uintptr_t game, uint8_t localOwner, uint64_t nowMs, bool tool = false) {
     const uint32_t n = tool ? ToolCount(game) : TrailerCount(game);
     const uint16_t idBase = tool ? TOOL_ID_BASE : TRAILER_ID_BASE;
@@ -4878,17 +4894,21 @@ static void CaptureAndQueueLocalTrailerStates(uintptr_t game, uint8_t localOwner
 
         const uintptr_t av = *(uintptr_t*)(tp + avOff);       // bagli oldugu arac (0 = bagli degil)
         if (av != 0) {
-            bool towedByMe = (av == activeVeh);
             const int nid = NetIdOfVehicle(av);
-            uint8_t towOwner = VEHICLE_OWNER_NONE;
-            if (nid >= 0) {
-                std::lock_guard<std::mutex> lock(g_VehicleStateMutex);
-                towOwner = g_VehicleAuthority[nid].ownerId;
+            const bool towedByMe = (nid >= 0) ? IsTowPublisher(nid, av == activeVeh, localOwner) : (av == activeVeh);
+            {   // rol degisimi tani logu (tek yayinci olmali: ikisi de "yayin" ya da ikisi de "alici" gorunuyorsa hata burada)
+                static uint8_t s_role[2][256];
+                static std::atomic<int> s_roleLogs(0);
+                const uint8_t role = towedByMe ? 1 : 2;
+                if (i < 256 && s_role[tool ? 1 : 0][i] != role && s_roleLogs.load() < 80) {
+                    s_role[tool ? 1 : 0][i] = role; s_roleLogs++;
+                    uint8_t ow = VEHICLE_OWNER_NONE;
+                    if (nid >= 0) { std::lock_guard<std::mutex> lock(g_VehicleStateMutex); ow = g_VehicleAuthority[nid].ownerId; }
+                    LOGI("[TOW] %s=%u arac=%d rol=%s sahip=%u yerelAktif=%d uzakAktif=%d host=%d", tool ? "alet" : "romork",
+                         (unsigned)i, nid, towedByMe ? "YAYIN" : "ALICI", (unsigned)ow, (int)(av == activeVeh),
+                         (int)IsRemoteActiveVehicle(nid), (int)g_IsHost.load());
+                }
             }
-            if (!towedByMe && nid >= 0) towedByMe = (towOwner == localOwner);
-            // Park halinde (arac sahipsiz) ve kimse icinde degilken bagli romork/aletin duruş konumunu host yayinlar:
-            // yoksa her cihazda fizik romorku kendi yanina yatirir (hostta sol, clientte sag) ve cikarinca isinlanir.
-            if (!towedByMe && nid >= 0 && g_IsHost.load() && towOwner == VEHICLE_OWNER_NONE && !IsRemoteActiveVehicle(nid)) towedByMe = true;
             if (towedByMe) mineArr[i] = true;
             else if (mineArr[i]) {                              // baska oyuncunun araci cekiyor: akisi o yayinlar
                 mineArr[i] = false;
@@ -5195,6 +5215,7 @@ static void ApplyRemoteAttachablePoses(uintptr_t game, uint8_t localOwner, uint6
         if (av != 0) {
             const int nid = NetIdOfVehicle(av);
             if (nid < 0) continue;
+            if (IsTowPublisher(nid, av == LocalActiveVehiclePtr(game), localOwner)) continue;   // yayinci bu cihaz: yerel fizik gecerli
             uint8_t ow = VEHICLE_OWNER_NONE;
             { std::lock_guard<std::mutex> lock(g_VehicleStateMutex); ow = g_VehicleAuthority[nid].ownerId; }
             if (ow == localOwner) continue;
@@ -5215,6 +5236,17 @@ static void ApplyRemoteAttachablePoses(uintptr_t game, uint8_t localOwner, uint6
         position.x = poseX + state.errX;
         position.y = poseY + state.errY;
         if (towedByRemote) {                                             // araba bagli: sensor YOK, arac gibi hizla yerlestir
+            {   // tani: yerel aci ile gelen aci farki (iki cihaz ayni aciya gelmeli); en cok 2 sn'de bir, 60 satir
+                static uint64_t s_lastLogMs = 0;
+                static std::atomic<int> s_applyLogs(0);
+                if (s_applyLogs.load() < 60 && nowMs - s_lastLogMs > 2000) {
+                    s_lastLogMs = nowMs; s_applyLogs++;
+                    LOGI("[TOW] uygula %s=%u yerelAci=%.2f gelenAci=%.2f fark=%.2f hareket=%d yas=%llu",
+                         tool ? "alet" : "romork", (unsigned)i, *(float*)(body + 0x40), poseAngle,
+                         GetSignedAngleDelta(*(float*)(body + 0x40), poseAngle), (int)state.moving,
+                         (unsigned long long)(nowMs - state.lastReceiveMs));
+                }
+            }
             g_b2BodySetTransform((void*)body, &position, poseAngle + state.errA);
             if (state.moving) {
                 SetRemoteBodyVelocity(body, state.vx, state.vy, state.angularVelocity);
@@ -9166,7 +9198,7 @@ void* my_renderStartMenuMain(void* thiz, void* p1, void* p2, void* p3) {
 // ========================================================================
 __attribute__((constructor))
 void ModMain() {
-    LOGI(">>> MULTIPLAYER MOD STARTING <<< build=shopfix-33+parked-trailer-pose-host-authority");
+    LOGI(">>> MULTIPLAYER MOD STARTING <<< build=shopfix-34+single-tow-publisher");
 
     ResetVehicleSyncState();
     std::thread(StartPONGResponderThread).detach();
