@@ -2547,13 +2547,17 @@ static void CaptureAndQueueCombineStates(uintptr_t game, uint8_t localOwner, uin
 
         uint8_t owner = VEHICLE_OWNER_NONE;
         { std::lock_guard<std::mutex> lock(g_VehicleStateMutex); owner = g_VehicleAuthority[id].ownerId; }
-        if (!(id == activeVehicleId || owner == localOwner || (ai && !g_AiMirrored[id]))) continue;
+        // Sahipsiz + kimsenin icinde olmadigi (bosaltma icin duran) bicerin GERCEK kopyasi host'tadir (IsGhostVehiclePtr);
+        // tankini host yayinlar ki diger cihazlarda tank/romork ayni bosalsin.
+        const bool hostIdleCombine = g_IsHost.load() && owner == VEHICLE_OWNER_NONE && *(uint8_t*)(v + 0x328) != 0 &&
+                                     !(ai && g_AiMirrored[id]) && !remoteAi && !IsRemoteActiveVehicle((int)id);
+        if (!(id == activeVehicleId || owner == localOwner || (ai && !g_AiMirrored[id]) || hostIdleCombine)) continue;
 
         const bool combine = *(uint8_t*)(v + 0x328) != 0;
         const uint8_t flags = LocalVehicleFlags(v);
         const uint32_t wa = combine ? *(uint32_t*)(v + 0x440) : 0;
         const uint32_t wb = combine ? *(uint32_t*)(v + 0x448) : 0;
-        const bool publisher = IsStatePublisherVeh(id, localOwner, activeVehicleId, ai, owner, remoteAi);
+        const bool publisher = hostIdleCombine || IsStatePublisherVeh(id, localOwner, activeVehicleId, ai, owner, remoteAi);
         const bool localEdge = c.valid && flags != c.flags;
 
         if (localEdge) {                                              // kullanici (ya da isci) bir sey degistirdi
@@ -4883,6 +4887,12 @@ static void CaptureAndQueueLocalTrailerStates(uintptr_t game, uint8_t localOwner
                 }
             }
             if (towedByMe) mineArr[i] = true;
+            else if (mineArr[i]) {                              // baska oyuncunun araci cekiyor: akisi o yayinlar
+                mineArr[i] = false;
+                g_LocalStationarySince[sid] = 0;
+                std::lock_guard<std::mutex> lock(g_VehicleStateMutex);
+                g_LastSentLocalVehicles[sid].valid = false;
+            }
         } else {
             // Serbest nesne (pulluk/romork araca bagli degil): tek yonlu yayin kurali (balya sistemiyle ayni).
             //  1) Yerel otorite sahibi arac yakindaysa ve nesne oynuyorsa: bu cihaz yayinlar (araci iten cihaz).
@@ -5174,7 +5184,19 @@ static void ApplyRemoteAttachablePoses(uintptr_t game, uint8_t localOwner, uint6
         const uint8_t wantType = tool ? g_RemoteToolType[i] : g_RemoteTrailerType[i];
         if (tp == 0 || *(uint32_t*)(tp + 0x10) != wantType) continue;
         const uintptr_t av = *(uintptr_t*)(tp + avOff);
-        if (av != 0) continue;                                           // bagli: eklem (joint) arkadan takip ettirir
+        // Bagli nesne: (a) bu cihazin surdugu / sahip oldugu araca bagliysa yerel fizik gecerli (zaten yukarida mine);
+        // (b) BASKA oyuncunun surdugu araca bagliysa nesnenin konumu/acisi surucunun cihazindan gelen akisla uygulanir.
+        // Eskiden sadece eklem (joint) takip ediyordu: geri geri giderken romork/alet her cihazda fizigin kendi
+        // dengesizligine gore farkli yone kivriliyordu (hostta sola, clientte saga). Artik gercek aci surucudeki gibidir.
+        bool towedByRemote = false;
+        if (av != 0) {
+            const int nid = NetIdOfVehicle(av);
+            if (nid < 0) continue;
+            uint8_t ow = VEHICLE_OWNER_NONE;
+            { std::lock_guard<std::mutex> lock(g_VehicleStateMutex); ow = g_VehicleAuthority[nid].ownerId; }
+            if (ow == VEHICLE_OWNER_NONE || ow == localOwner || ow != state.ownerId) continue;
+            towedByRemote = true;
+        }
         const uintptr_t body = *(uintptr_t*)(tp + bodyOff);
         if (body == 0) continue;
 
@@ -5185,6 +5207,19 @@ static void ApplyRemoteAttachablePoses(uintptr_t game, uint8_t localOwner, uint6
         TestB2Vec2 position;
         position.x = poseX + state.errX;
         position.y = poseY + state.errY;
+        if (towedByRemote) {                                             // araba bagli: sensor YOK, arac gibi hizla yerlestir
+            g_b2BodySetTransform((void*)body, &position, poseAngle + state.errA);
+            if (state.moving) {
+                SetRemoteBodyVelocity(body, state.vx, state.vy, state.angularVelocity);
+            } else {
+                SetRemoteBodyVelocity(body, 0.0f, 0.0f, 0.0f);
+                if (offsetGone) {
+                    std::lock_guard<std::mutex> lock(g_VehicleStateMutex);
+                    if (g_RemoteVehicles[sid].sequence == state.sequence) g_RemoteVehicles[sid].appliedSequence = state.sequence;
+                }
+            }
+            continue;
+        }
         // Uzaktan yonetilen serbest nesne: yerel carpisma tepkisi kapali (sensor) -> ust uste duran/itilen aletler
         // bu cihazda ayrica kaymaz, yalnizca gelen akisi izler.
         if (g_AttSensorBody[ti][i] != body) {
@@ -8572,6 +8607,8 @@ static bool IsGhostVehiclePtr(uintptr_t veh) {
     const uint8_t me = g_LocalPlayerId.load();
     uint8_t owner = VEHICLE_OWNER_NONE;
     GetVehicleOwner((uint16_t)id, &owner);
+    // Isci (AI) calisiyorsa: gercek simulasyon yalnizca iscyi baslatan cihazda; diger cihazlardaki aynali kopya hayalettir.
+    if (id < (int)VEHICLE_SLOT_LIMIT && *(uint32_t*)(veh + 0x730) != 0) return g_AiMirrored[id];
     if (id == g_LocalActiveNetId) {
         // Yerel oyuncu bu aracin icinde. Baska bir oyuncu da AYNI aractaysa sadece biri saymali:
         //  - sahip (suren) baskasiysa o sayar, sahip bensem ben sayarim,
@@ -8581,7 +8618,11 @@ static bool IsGhostVehiclePtr(uintptr_t veh) {
         return HasLowerIdRemoteActive(id, me);
     }
     if (owner != VEHICLE_OWNER_NONE && owner != me) return true;   // baskasi suruyor
-    return IsRemoteActiveVehicle(id);                              // baskasi icinde (arac duruyor olabilir)
+    if (IsRemoteActiveVehicle(id)) return true;                    // baskasi icinde (arac duruyor olabilir)
+    // Sahipsiz ve kimsenin icinde olmayan arac (ornegin bosaltma icin duran bicer): HER cihaz kendini gercek sanirsa tank/romork
+    // simulasyonu iki cihazda ayri calisir, romork mutlak degeri birbirini ezer ve mahsul KATLANIR. Tek gercek kopya host'ta.
+    if (owner == me) return false;
+    return !g_IsHost.load();
 }
 
 static void* GuardedEntityUpdate(EntityUpdate_t orig, uintptr_t ownerVeh, const char* name, void* thiz,
@@ -9118,7 +9159,7 @@ void* my_renderStartMenuMain(void* thiz, void* p1, void* p2, void* p3) {
 // ========================================================================
 __attribute__((constructor))
 void ModMain() {
-    LOGI(">>> MULTIPLAYER MOD STARTING <<< build=shopfix-31+detach-cooldown+detach-pose+loose-claim-fix");
+    LOGI(">>> MULTIPLAYER MOD STARTING <<< build=shopfix-32+single-pipe-authority+towed-pose-stream");
 
     ResetVehicleSyncState();
     std::thread(StartPONGResponderThread).detach();
