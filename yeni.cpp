@@ -4879,13 +4879,16 @@ static void CaptureAndQueueLocalTrailerStates(uintptr_t game, uint8_t localOwner
         const uintptr_t av = *(uintptr_t*)(tp + avOff);       // bagli oldugu arac (0 = bagli degil)
         if (av != 0) {
             bool towedByMe = (av == activeVeh);
-            if (!towedByMe) {
-                const int nid = NetIdOfVehicle(av);
-                if (nid >= 0) {
-                    std::lock_guard<std::mutex> lock(g_VehicleStateMutex);
-                    towedByMe = (g_VehicleAuthority[nid].ownerId == localOwner);
-                }
+            const int nid = NetIdOfVehicle(av);
+            uint8_t towOwner = VEHICLE_OWNER_NONE;
+            if (nid >= 0) {
+                std::lock_guard<std::mutex> lock(g_VehicleStateMutex);
+                towOwner = g_VehicleAuthority[nid].ownerId;
             }
+            if (!towedByMe && nid >= 0) towedByMe = (towOwner == localOwner);
+            // Park halinde (arac sahipsiz) ve kimse icinde degilken bagli romork/aletin duruş konumunu host yayinlar:
+            // yoksa her cihazda fizik romorku kendi yanina yatirir (hostta sol, clientte sag) ve cikarinca isinlanir.
+            if (!towedByMe && nid >= 0 && g_IsHost.load() && towOwner == VEHICLE_OWNER_NONE && !IsRemoteActiveVehicle(nid)) towedByMe = true;
             if (towedByMe) mineArr[i] = true;
             else if (mineArr[i]) {                              // baska oyuncunun araci cekiyor: akisi o yayinlar
                 mineArr[i] = false;
@@ -5194,7 +5197,11 @@ static void ApplyRemoteAttachablePoses(uintptr_t game, uint8_t localOwner, uint6
             if (nid < 0) continue;
             uint8_t ow = VEHICLE_OWNER_NONE;
             { std::lock_guard<std::mutex> lock(g_VehicleStateMutex); ow = g_VehicleAuthority[nid].ownerId; }
-            if (ow == VEHICLE_OWNER_NONE || ow == localOwner || ow != state.ownerId) continue;
+            if (ow == localOwner) continue;
+            // Sahipli arac: akis sahibinden gelmeli. Sahipsiz (park): taze bir akis (surucu icerde ya da host) yeter;
+            // aksi halde park halinde fizik romorku kendi yanina yatirir.
+            if (ow != VEHICLE_OWNER_NONE) { if (ow != state.ownerId) continue; }
+            else if (nowMs > state.lastReceiveMs && nowMs - state.lastReceiveMs > 3000) continue;
             towedByRemote = true;
         }
         const uintptr_t body = *(uintptr_t*)(tp + bodyOff);
@@ -9159,7 +9166,7 @@ void* my_renderStartMenuMain(void* thiz, void* p1, void* p2, void* p3) {
 // ========================================================================
 __attribute__((constructor))
 void ModMain() {
-    LOGI(">>> MULTIPLAYER MOD STARTING <<< build=shopfix-32+single-pipe-authority+towed-pose-stream");
+    LOGI(">>> MULTIPLAYER MOD STARTING <<< build=shopfix-33+parked-trailer-pose-host-authority");
 
     ResetVehicleSyncState();
     std::thread(StartPONGResponderThread).detach();
