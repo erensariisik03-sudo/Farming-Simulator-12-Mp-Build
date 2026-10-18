@@ -422,7 +422,11 @@ static void* FindElfSymbolByPrefix(const char* lib, const char* prefix) {
         std::vector<Elf32_Shdr> sh(eh.e_shnum);
         fseek(f, (long)eh.e_shoff, SEEK_SET);
         if (fread(sh.data(), sizeof(Elf32_Shdr), sh.size(), f) == sh.size()) {
-            const size_t plen = strlen(prefix);
+            size_t plen = strlen(prefix);
+            // Sonu '$' ile biten "onek" TAM ESLESME demektir (mangled adlarda '$' olmaz): ayni adli asiri yuklemeleri ayirmak icin
+            // (ornek: ...enqueueDrawColumnMajor44EPKfjj ile ...EPKfjjj).
+            const bool exactName = plen > 0 && prefix[plen - 1] == '$';
+            if (exactName) --plen;
             for (size_t i = 0; i < sh.size() && !result; ++i) {
                 if (sh[i].sh_type != SHT_SYMTAB && sh[i].sh_type != SHT_DYNSYM) continue;
                 if (sh[i].sh_link >= sh.size()) continue;
@@ -435,7 +439,7 @@ static void* FindElfSymbolByPrefix(const char* lib, const char* prefix) {
                 if (fread(syms.data(), sizeof(Elf32_Sym), syms.size(), f) != syms.size()) continue;
                 for (size_t k = 0; k < syms.size(); ++k) {
                     if (syms[k].st_value == 0 || syms[k].st_name >= str.sh_size) continue;
-                    if (strncmp(&strtab[syms[k].st_name], prefix, plen) == 0) {
+                    if (strncmp(&strtab[syms[k].st_name], prefix, plen) == 0 && (!exactName || strtab[syms[k].st_name + plen] == '\0')) {
                         result = (void*)(base + syms[k].st_value);   // Thumb biti st_value'da zaten var
                         break;
                     }
@@ -1283,6 +1287,13 @@ static void BuildHostNetMap(uintptr_t game) {
 // Game::addVehicle KANCALANMIYOR (orig_Game_addVehicle = oyunun kendi fonksiyonu, sadece cagrilir).
 // Satin alinan araci, oyunun arac dizisindeki degisiklikten (netId'si olmayan yeni adres) buluruz.
 // Boylece Substrate'in fonksiyon basini tasima hatasi riski tamamen ortadan kalkar.
+// ---- WALKER (aractan inme) ileri bildirimleri: modul (walker_module.inc) LocalActiveVehiclePtr'dan sonra include edilir ----
+static const uint16_t WK_NET_TYPE = 0x7001;   // MP'de yaya icin ayrilmis sahte arac tipi (VehicleSpawnPacket::vehicleType)
+namespace WK {
+static bool IsWalker(uintptr_t p);
+static uint32_t AddVehicleForNet(void* game, int type, const float* pos, uint32_t angleBits);
+static void OnVehicleRemoved(uintptr_t p);
+}
 static uint32_t g_PolledVehicleCount = 0;
 static bool g_VehRemovedSincePoll = false;                 // satis oldu: havuzdaki nesne yeniden kullanilmis olabilir
 static std::vector<uintptr_t> g_IgnoredVehiclePtrs;        // kurulumda esleme tablosuna giremeyen mevcut araclar
@@ -1295,7 +1306,7 @@ static bool VecHas(const std::vector<uintptr_t>& v, uintptr_t p) {
 static void AnnounceLocalVehicle(uintptr_t game, uintptr_t p) {
     const uintptr_t body = *(uintptr_t*)(p + 0x528);        // Vehicle::body
     if (body == 0) return;
-    const uint32_t type = *(uint32_t*)(p + 0x10);           // EntityManager::VEHICLES (satis kodunda da boyle okunuyor)
+    const uint32_t type = WK::IsWalker(p) ? (uint32_t)WK_NET_TYPE : *(uint32_t*)(p + 0x10);   // WALKER: yaya sahte tiple duyurulur (EntityManager::VEHICLES yerine)
     const float x = *(float*)(body + 0x0C);
     const float y = *(float*)(body + 0x10);
     const float a = *(float*)(body + 0x40);
@@ -1501,6 +1512,7 @@ static Vehicle_destroy_t g_VehicleDestroyFn = nullptr;
 
 static void my_Game_removeVehicle(void* game, uint32_t idx) {
     const uintptr_t g = (uintptr_t)game;
+    if (idx < VehicleCount(g)) WK::OnVehicleRemoved(RawVehicleSlot(g, idx));   // WALKER: yaya kaydini temizle
     int netId = -1;
     if (g_VehNetArmed.load() && g_IsConnected.load() && idx < VehicleCount(g)) {
         const uintptr_t p = RawVehicleSlot(g, idx);
@@ -1589,6 +1601,7 @@ static void ApplyPendingVehicleOps(uintptr_t game) {
                 ClearVehicleStateSlot(op.netId);
             }
             g_ApplyingRemoteVehicleOp = true;
+            WK::OnVehicleRemoved(p);                                                  // WALKER: havuz nesnesi yeniden kullanilmadan once yaya kaydini sil
             orig_Game_removeVehicle((void*)game, (uint32_t)idx);
             g_VehicleDestroyFn((void*)p);
             g_ApplyingRemoteVehicleOp = false;
@@ -1621,7 +1634,7 @@ static void ApplyPendingVehicleOps(uintptr_t game) {
         }
         const float pos[3] = { op.x, op.y, op.z };
         g_ApplyingRemoteVehicleOp = true;
-        const uint32_t idx = orig_Game_addVehicle((void*)game, (int)op.vehicleType, pos, op.angleBits, 0);
+        const uint32_t idx = WK::AddVehicleForNet((void*)game, (int)op.vehicleType, pos, op.angleBits);   // WALKER: NET_TYPE -> yaya, digerleri orig_Game_addVehicle
         g_ApplyingRemoteVehicleOp = false;
         if (idx >= VehicleCount(game)) continue;
         {
@@ -2058,6 +2071,385 @@ static uintptr_t LocalActiveVehiclePtr(uintptr_t game) {
     const uint32_t ai = *(uint32_t*)(game + 0xA8);
     return ai < VehicleCount(game) ? RawVehicleSlot(game, ai) : 0;
 }
+
+// ---- WALKER (aractan inme) modulu. Gerekenler yukarida tanimli: HookChecked, SetRemoteBodyVelocity (ileri bildirim), orig_Game_addVehicle, ...
+// ===== walker_module.inc (tek dosya olsun diye buraya gomuldu) =====
+// ============================================================================
+// walker_module.inc  (v2)  --  "ARACTAN IN" / "ARACA BIN"           FS12 Android / libapp.so
+// yeni_a1003e.cpp icin UYARLANDI. Entegrasyon: walker_integration.patch (9 kucuk ekleme).
+// ----------------------------------------------------------------------------
+// FIKIR: Yaya = oyunun kendi Vehicle'i (temel arac tipinin desc'i gecici yamali). Boylece
+//   kamera, aktif arac degistirme, netId, sahiplik, konum/hiz senkronu (MP kodunuz) HAZIR calisir.
+//   Cizim (eklemli iskelet) ve hareket (hiz yazma) bu modulde.
+//
+// ETIKETLER:  [D] decompile'dan dogrulandi   [K] sizin kodunuzdan dogrulandi
+//             [?] cikarim                    [!] bilinmiyor / cihazda test sart
+//
+// SIZIN KODUNUZDAN KULLANILANLAR (hepsi include noktasindan once tanimli olmali):
+//   LOGI, NowMs, FindElfSymbolByPrefix, HookChecked, VehicleCount, RawVehicleSlot, SlotIndexOfVehicle,
+//   LocalActiveVehiclePtr, SetRemoteBodyVelocity, orig_Game_addVehicle, my_Game_removeVehicle, g_VehicleDestroyFn,
+//   ImGui.   Vehicle::update'i SIZIN hook'unuz (my_Vehicle_update) tutar; modul onu kancalamaz,
+//   WK::AfterVehicleUpdate(...) ile cagrilir.
+// ============================================================================
+#include <math.h>
+#include <string.h>
+#include <vector>
+#include <mutex>
+
+namespace WK {
+
+// ------------------------------- AYARLAR -------------------------------
+// Dosyalar oyunun assets\objects klasorunde; oyunun kendi yukleyicisi "objects/..." goreli yolunu kullanir [D].
+static const char* const PART_FILE[6] = {"objects/walker_torso.p3d", "objects/walker_head.p3d", "objects/walker_armL.p3d",
+                                         "objects/walker_armR.p3d", "objects/walker_legL.p3d", "objects/walker_legR.p3d"};
+static const char* const TEX_FILE     = "objects/walker_diffuse.p2d";
+enum Part { P_TORSO, P_HEAD, P_ARM_L, P_ARM_R, P_LEG_L, P_LEG_R, P_COUNT };
+
+static const int      BASE_TYPE      = 0;      // [!] klonlanacak EntityManager::VEHICLES tipi (en kucuk / en sorunsuz arac)
+static const float    WALK_SPEED     = 2.2f;   // m/s
+static const float    TURN_RATE      = 3.0f;   // rad/s
+static const float    TURN_SIGN      = -1.0f;  // [!] donus yonu ters ise +1 yapin
+static const float    ENTER_RADIUS   = 5.0f;   // "Enter" icin maks. mesafe (m)
+static const float    EXIT_DIST      = 3.0f;   // inince aracin yanina koyma mesafesi (m)
+static const float    EXIT_SIDE      = 1.0f;   // [!] +1/-1: araci hangi yanindan inilir
+static const float    HITBOX_HX = 0.30f, HITBOX_HY = 0.25f;  // insan kutusu (yari kenar, m) [?: girdi duzeni]
+static const bool     KEEP_WHEELS    = false;  // [!] false: tekerlek sayisi 0. Update cokerse true yapip dene
+static const bool     DEBUG_INPUT    = true;   // Vehicle::update'in 3 float'ini logcat'e basar
+static const float    STRIDE         = 4.5f;   // yuruyus fazi (rad) = hiz(m/s) * STRIDE * dt
+// Insan iskeleti (tools/make_walker_assets.py olculeriyle BIREBIR; model degisirse ikisini birlikte guncelleyin)
+static const float RIG_NECK[3]  = {0.00f, 1.52f, 0.00f};
+static const float RIG_SH_L[3]  = {+0.28f, 1.42f, 0.00f}, RIG_SH_R[3] = {-0.28f, 1.42f, 0.00f};
+static const float RIG_HIP_L[3] = {+0.10f, 0.90f, 0.00f}, RIG_HIP_R[3] = {-0.10f, 0.90f, 0.00f};
+static const float EYE_HEIGHT   = 1.66f;
+
+// ------------------------------- OFFSETLER -------------------------------
+static const uintptr_t G_ACTIVE = 0xA8, G_STATE = 0x64, G_ENTITYMGR = 0x708;           // [D] aktif arac idx / oyun durumu (6=oyun) / EntityManager
+static const uintptr_t G_SYSDEV = 0x74, G_RENDERDEV = 0x78;                            // [D] Game::init'te EntityManager::init'e verilen aygitlar
+static const uintptr_t EM_DESC0 = 8, DESC_STRIDE = 0x22C;                              // [D] desc = em + 8 + tip*0x22C
+static const uintptr_t D_MESH_BODY = 0x1C, D_PART_COUNT = 0x44, D_WHEEL_COUNT = 0xC8;  // [D]
+static const uintptr_t D_FIX_COUNT = 0xE4, D_FIX_ARRAY = 0xE8;                         // [D] sayi/dizi; girdi = {cx,cy,hx,hy,angle,density} [?]
+static const uintptr_t V_BODY_MAT = 0x18, V_BODY_MESH = 0x58, V_PHYS_BODY = 0x528;     // [D][K]
+static const uintptr_t V_CAM_WORLD = 0x4E0;                                            // [D] Game::updateStateBase bunu okur
+static const uintptr_t B_X = 0x0C, B_Y = 0x10, B_ANGLE = 0x40, B_VX = 0x44, B_VY = 0x48; // [K] b2Body (sizin kodunuzdaki duzen)
+
+// ------------------------------- MATEMATIK (4x4 kolon-major) -------------------------------
+struct M4 { float m[16]; };
+static M4 Id() { M4 r; memset(&r, 0, sizeof r); r.m[0] = r.m[5] = r.m[10] = r.m[15] = 1.f; return r; }
+static M4 Mul(const M4& a, const M4& b) {
+    M4 r;
+    for (int c = 0; c < 4; ++c) for (int rw = 0; rw < 4; ++rw) {
+        float s = 0; for (int k = 0; k < 4; ++k) s += a.m[k * 4 + rw] * b.m[c * 4 + k];
+        r.m[c * 4 + rw] = s;
+    }
+    return r;
+}
+static M4 Tr(float x, float y, float z) { M4 r = Id(); r.m[12] = x; r.m[13] = y; r.m[14] = z; return r; }
+static M4 RX(float a) { M4 r = Id(); float c = cosf(a), s = sinf(a); r.m[5] = c; r.m[6] = s; r.m[9] = -s; r.m[10] = c; return r; }
+static M4 RY(float a) { M4 r = Id(); float c = cosf(a), s = sinf(a); r.m[0] = c; r.m[2] = -s; r.m[8] = s; r.m[10] = c; return r; }
+static M4 AroundPivot(const M4& body, const float p[3], const M4& rot) {
+    return Mul(Mul(Mul(body, Tr(p[0], p[1], p[2])), rot), Tr(-p[0], -p[1], -p[2]));
+}
+static inline float BitsToFloat(uint32_t u) { float f; memcpy(&f, &u, 4); return f; }
+
+// ------------------------------- DURUM -------------------------------
+struct Walker { uintptr_t p; float phase, amp; long long lastMs; };
+static std::mutex g_Mu;
+static std::vector<Walker> g_Walkers;          // TUM yayalar (yerel + uzak). Dizi KAYAR, bu yuzden pointer ile takip.
+static uintptr_t g_LocalWalker = 0;            // bizim yayamiz
+static uintptr_t g_LastVehicle = 0;            // indigimiz arac
+static float g_HeadYaw = 0, g_HeadPitch = 0;   // yerel kafa (rad). Uzaklara SENKRONLANMAZ (bkz. README "MP genisletme")
+static bool  g_FirstPerson = false;
+static bool  g_ReqExit = false, g_ReqEnter = false;
+static bool  g_AssetsReady = false; static long long g_AssetsRetryMs = 0;
+static uint32_t* g_Mesh[P_COUNT];              // oyunun IndexedTriangleMesh nesnesi: P[0]=vertexBuf, P[1]=indexBuf [D: enqueueRender]
+static uint32_t  g_TexObj[4] = {0, 0, 0, 0};   // Texture nesnesi = 4 bayt (GL handle) [D: EntityManager'da Texture dizisi 4'er bayt]
+
+// ------------------------------- SEMBOL TIPLERI -------------------------------
+// DUZELTME: IndexedTriangleMesh::load bir UYE fonksiyondur: ilk arguman 'this' = 8 baytlik {vertexBuf, indexBuf} nesnesi [D: libapp_so.c 5962, 23546].
+typedef void*    (*MeshLoad_t)(void* self, const char* path, void* sys, void* dev);                       // IndexedTriangleMesh::load(this, const char*, SysDev*, RenderDev*) [D]
+typedef uint32_t (*TexLoad_t)(void* tex, const char* path, void* sys, void* dev, uint32_t keep, uint32_t loc); // Texture::load [D]
+// DUZELTME: iki asiri yukleme var; oyunun Vehicle kodu 3 argumanli olani kullanir: (dev, matris, vb, ib). 4 argumanli olan (dev, m, indexSayisi, vb, ib) [D: 44836, 44898].
+typedef void     (*Draw44_t)(void* dev, const float* m, uint32_t vb, uint32_t ib);                        // GLESHandheldRenderDevice::enqueueDrawColumnMajor44(float const*, uint, uint) [D]
+// DUZELTME: bindTextureLayer(this, doku, KATMAN): Ghidra 3. argumani (r2) dusurmus; govde glActiveTexture(r2 + 0x84C0) kullaniyor [D: 44167].
+typedef void     (*BindTex_t)(void* dev, uint32_t handle, uint32_t layer);                                // bindTextureLayer [D]
+// DUZELTME: mesh yuklendikten sonra oyun her vertex buffer icin bindShaderAttributes cagirir [D: 40088, 23549].
+typedef void     (*BindAttrs_t)(void* dev, uint32_t vb, uint32_t prog, const void* bindings);             // GLESHandheldRenderDevice::bindShaderAttributes [D]
+typedef void     (*ActiveChanged_t)(void* game);                                                          // Game::activeVehicleChanged [D]
+typedef void     (*VehRender_t)(void* self, void* ra, void* dev, uint32_t p3);                            // Vehicle::enqueueRender [D]
+typedef void     (*VehRender3_t)(void* self, void* ra, void* dev);                                        // Transparent / UVScroll / EnvMap [D]
+
+static MeshLoad_t fnMeshLoad = nullptr; static TexLoad_t fnTexLoad = nullptr; static Draw44_t fnDraw = nullptr;
+static BindTex_t fnBind = nullptr; static BindAttrs_t fnBindAttrs = nullptr; static ActiveChanged_t fnActiveChanged = nullptr;
+static VehRender_t orig_VehRender = nullptr;
+// Vehicle::enqueueRenderEmissive(RenderArgs&, dev, bool, bool, bool, Texture*): 7 arguman (3'u yigitta), geri donus r0:r1 [D: 18003]
+typedef uint64_t (*VehEmis_t)(void* self, void* ra, void* dev, uint32_t a, uint32_t b, uint32_t c, void* tex);
+static VehEmis_t orig_VehEmis = nullptr;
+// VertexShaderAttributeBinding kumesi: 4 giris x 0xC bayt (isim*, tip, normalize bayti) + sayi @+0x30 [D: bindShaderAttributes govdesi]
+struct AttrBind { const char* name; uint32_t type; uint32_t flag; };
+struct AttrSet  { AttrBind b[4]; uint32_t count; };
+static uint32_t g_MeshObj[P_COUNT][2];         // her parca icin IndexedTriangleMesh nesnesi (8 bayt)
+static bool     g_MeshOk[P_COUNT];
+static const uintptr_t G_SHADER = 0xA340;      // [D] Game::init -> EntityManagerDesc+0x10 = *(Game+0xA340): arac mesh'lerinin shader numarasi
+
+// ------------------------------- YARDIMCILAR -------------------------------
+static bool IsWalker(uintptr_t p) {
+    if (!p) return false;
+    std::lock_guard<std::mutex> lk(g_Mu);
+    for (size_t i = 0; i < g_Walkers.size(); ++i) if (g_Walkers[i].p == p) return true;
+    return false;
+}
+static void OnVehicleRemoved(uintptr_t p) {
+    if (!p) return;
+    std::lock_guard<std::mutex> lk(g_Mu);
+    for (size_t i = g_Walkers.size(); i-- > 0;) if (g_Walkers[i].p == p) g_Walkers.erase(g_Walkers.begin() + i);
+    if (g_LocalWalker == p) g_LocalWalker = 0;
+    if (g_LastVehicle == p) g_LastVehicle = 0;
+}
+static bool BodyPose(uintptr_t veh, float* x, float* y, float* a) {
+    const uintptr_t b = *(uintptr_t*)(veh + V_PHYS_BODY); if (!b) return false;
+    *x = *(float*)(b + B_X); *y = *(float*)(b + B_Y); *a = *(float*)(b + B_ANGLE); return true;
+}
+static void SetActiveByPtr(uintptr_t game, uintptr_t veh) {
+    const int idx = SlotIndexOfVehicle(game, veh); if (idx < 0) return;
+    *(uint32_t*)(game + G_ACTIVE) = (uint32_t)idx;                    // [D] Game::buyItem de boyle yapiyor
+    if (fnActiveChanged) fnActiveChanged((void*)game);                // ses + kamera durumu [D]
+}
+
+// ------------------------------- VARLIKLAR (GL thread'inde) -------------------------------
+// Oyunun KENDI yukleyicileri kullanilir; dosyalar assets\objects'te. Aygit gostericileri Game+0x74/+0x78 [D].
+static void EnsureAssets(uintptr_t game) {
+    if (g_AssetsReady) return;
+    const long long now = NowMs(); if (now < g_AssetsRetryMs) return; g_AssetsRetryMs = now + 5000;
+    void* sys = *(void**)(game + G_SYSDEV); void* dev = *(void**)(game + G_RENDERDEV);
+    if (!sys || !dev || !fnMeshLoad || !fnTexLoad || !fnDraw || !fnBind) {
+        LOGI("[WALKER] varlik: sembol/aygit yok (sys=%p dev=%p mesh=%p tex=%p draw=%p bind=%p)", sys, dev, (void*)fnMeshLoad, (void*)fnTexLoad, (void*)fnDraw, (void*)fnBind);
+        return;
+    }
+    const uint32_t prog = *(volatile uint32_t*)(game + G_SHADER);
+    AttrSet as; memset(&as, 0, sizeof as);                                     // oyunun kendi arac mesh'leriyle AYNI vertex duzeni (pos, normal, uv)
+    as.b[0].name = "Position";  as.b[0].type = 0xB; as.b[0].flag = 0;
+    as.b[1].name = "Normal";    as.b[1].type = 0xC; as.b[1].flag = 1;
+    as.b[2].name = "TexCoord0"; as.b[2].type = 7;   as.b[2].flag = 0;
+    as.count = 3;
+    for (int i = 0; i < P_COUNT; ++i) {
+        if (g_MeshOk[i]) continue;                                             // yeniden denemede yuklenenleri tekrar yukleme
+        g_MeshObj[i][0] = g_MeshObj[i][1] = 0xFFFFFFFFu;
+        fnMeshLoad(g_MeshObj[i], PART_FILE[i], sys, dev);
+        if (g_MeshObj[i][0] == 0xFFFFFFFFu || g_MeshObj[i][1] == 0xFFFFFFFFu) { LOGI("[WALKER] mesh yuklenemedi: %s (assets\\objects'te mi?)", PART_FILE[i]); return; }
+        if (fnBindAttrs) fnBindAttrs(dev, g_MeshObj[i][0], prog, &as);
+        g_Mesh[i] = g_MeshObj[i]; g_MeshOk[i] = true;
+    }
+    if (g_TexObj[0] == 0) fnTexLoad(g_TexObj, TEX_FILE, sys, dev, 0, 0xFFFFFFFFu);
+    // [?] DOGRULAMA: oyunun kendi mesh gostericisiyle kiyasla; ikisi de kucuk GL handle sayilari olmali
+    const uintptr_t desc = game + G_ENTITYMGR + EM_DESC0 + (uintptr_t)BASE_TYPE * DESC_STRIDE;
+    const uint32_t* base = *(uint32_t**)(desc + D_MESH_BODY);
+    LOGI("[WALKER] varliklar yuklendi: tex=%u shader=%u bindAttrs=%d ourMesh0=(%u,%u) gameBaseMesh=(%u,%u)", g_TexObj[0], prog, (int)(fnBindAttrs != nullptr),
+         g_Mesh[0][0], g_Mesh[0][1], base ? base[0] : 0, base ? base[1] : 0);
+    g_AssetsReady = (g_TexObj[0] != 0);
+}
+
+// ------------------------------- OLUSTURMA (desc'i gecici yamala) -------------------------------
+// Vehicle::load desc gostericisini SAKLAMAZ, mesh/fixture/tekerlek bilgisini kopyalar [D] -> yedekle/yamala/ekle/geri yukle.
+// Hem yerel inis hem uzaktan SPAWN (NET_TYPE) buradan gecer. orig_Game_addVehicle sizin kodunuzda HOOK'suz ham fonksiyondur [K].
+static uint32_t SpawnWalker(uintptr_t game, const float* pos3, uint32_t angleBits, bool local) {
+    uint8_t* desc = (uint8_t*)(game + G_ENTITYMGR + EM_DESC0 + (uintptr_t)BASE_TYPE * DESC_STRIDE);
+    uint8_t backup[DESC_STRIDE]; memcpy(backup, desc, DESC_STRIDE);
+    *(uint32_t*)(desc + D_FIX_COUNT) = 1;                                      // hitbox: tek kucuk kutu
+    float* fx = (float*)(desc + D_FIX_ARRAY); fx[0] = 0; fx[1] = 0; fx[2] = HITBOX_HX; fx[3] = HITBOX_HY; fx[4] = 0; fx[5] = 1.0f;
+    if (!KEEP_WHEELS) *(uint32_t*)(desc + D_WHEEL_COUNT) = 0;                  // tekerlek fizigi yok
+    *(uint32_t*)(desc + D_PART_COUNT) = 0;                                     // alt parcalari biz cizeriz
+    const uint32_t idx = orig_Game_addVehicle((void*)game, BASE_TYPE, pos3, angleBits, 0);
+    memcpy(desc, backup, DESC_STRIDE);                                         // temel arac bozulmasin
+    if (idx >= VehicleCount(game)) return idx;
+    const uintptr_t veh = RawVehicleSlot(game, idx);
+    { std::lock_guard<std::mutex> lk(g_Mu); Walker w; w.p = veh; w.phase = 0; w.amp = 0; w.lastMs = 0; g_Walkers.push_back(w); if (local) g_LocalWalker = veh; }
+    LOGI("[WALKER] dogdu idx=%u veh=%p local=%d", idx, (void*)veh, (int)local);
+    return idx;
+}
+// MP: uzaktan SPAWN uygulayan yer (sizin kodunuzdaki orig_Game_addVehicle cagrisi yerine). type==NET_TYPE -> yaya.
+static uint32_t AddVehicleForNet(void* game, int type, const float* pos, uint32_t angleBits) {
+    if (type == (int)WK_NET_TYPE) return SpawnWalker((uintptr_t)game, pos, angleBits, false);
+    return orig_Game_addVehicle(game, type, pos, angleBits, 0);
+}
+
+// ------------------------------- IN / BIN (OYUN thread'i) -------------------------------
+static void DoExit(uintptr_t game) {
+    const uintptr_t cur = LocalActiveVehiclePtr(game);
+    if (!cur || IsWalker(cur) || g_LocalWalker || VehicleCount(game) >= 30) return;
+    float x, y, a; if (!BodyPose(cur, &x, &y, &a)) return;
+    // [!] yon sozlesmesi: yanal = (-sin a, cos a) varsayildi; EXIT_SIDE ile yan degistirilir
+    const float px = x - sinf(a) * EXIT_DIST * EXIT_SIDE, py = y + cosf(a) * EXIT_DIST * EXIT_SIDE;
+    // TODO: Game::buyItem'daki b2World::QueryAABB bos-alan taramasi ile cakisma kontrolu
+    const float pos[3] = {px, 0.0f, py};                                       // Vector3(x, yukseklik, fizik-y) [D][K]
+    uint32_t ab; memcpy(&ab, &a, 4);
+    const uint32_t idx = SpawnWalker(game, pos, ab, true);
+    if (idx >= VehicleCount(game)) return;
+    g_LastVehicle = cur; g_HeadYaw = g_HeadPitch = 0;
+    SetActiveByPtr(game, RawVehicleSlot(game, idx));                           // MP yayini: DetectNewLocalVehicles netId atar ve duyurur [K]
+}
+static void DoEnter(uintptr_t game, bool ignoreRadius) {
+    if (!g_LocalWalker || LocalActiveVehiclePtr(game) != g_LocalWalker) return;
+    float wx, wy, wa; if (!BodyPose(g_LocalWalker, &wx, &wy, &wa)) return;
+    uintptr_t best = 0; float bd = ignoreRadius ? 1e18f : ENTER_RADIUS * ENTER_RADIUS;
+    for (uint32_t i = 0; i < VehicleCount(game); ++i) {
+        const uintptr_t v = RawVehicleSlot(game, i); if (!v || IsWalker(v)) continue;
+        float x, y, a; if (!BodyPose(v, &x, &y, &a)) continue;
+        const float d = (x - wx) * (x - wx) + (y - wy) * (y - wy);
+        if (d < bd) { bd = d; best = v; }
+    }
+    if (ignoreRadius && g_LastVehicle && SlotIndexOfVehicle(game, g_LastVehicle) >= 0) best = g_LastVehicle;
+    if (!best) return;
+    SetActiveByPtr(game, best);                                                // once hedefe gec
+    const uintptr_t w = g_LocalWalker; const int wi = SlotIndexOfVehicle(game, w);
+    if (wi >= 0) {
+        my_Game_removeVehicle((void*)game, (uint32_t)wi);                      // sizin hook'unuz: REMOVE olayini yayinlar, sonra orijinali cagirir [K]
+        if (g_VehicleDestroyFn) g_VehicleDestroyFn((void*)w);                  // uzaktan silme yolundaki gibi [K]
+    }
+    OnVehicleRemoved(w);
+    SetActiveByPtr(game, best);                                                // dizi kaydi: indeksi yeniden hesapla
+}
+
+// ------------------------------- Vehicle::update ARDINDAN (sizin my_Vehicle_update'ten cagrilir) -------------------------------
+// a,b,c = Vehicle::update'in 3 float argumani (bit deseni). Anlamlari decompile'da KAYIP [!]. Tahmin: a=dt, b=direksiyon, c=gaz.
+// DEBUG_INPUT ile joystick oynatip logcat'ten teyit edin, sonra asagidaki 2 satiri duzeltin.
+static void AfterVehicleUpdate(uintptr_t self, uint32_t ua, uint32_t ub, uint32_t uc, uint32_t ud) {
+    if (self != g_LocalWalker || (ud & 0xFF) == 0) return;                     // sadece AKTIF yerel yaya
+    const float f1 = BitsToFloat(ua), f2 = BitsToFloat(ub), f3 = BitsToFloat(uc);
+    static long long s_log = 0; const long long now = NowMs();
+    if (DEBUG_INPUT && (fabsf(f2) + fabsf(f3) > 0.05f) && now - s_log > 500) { s_log = now; LOGI("[WALKER] update girdi f1=%.3f f2=%.3f f3=%.3f", f1, f2, f3); }
+    const float steer = f2, throttle = f3;                                     // [!] teyit edilecek
+    const uintptr_t body = *(uintptr_t*)(self + V_PHYS_BODY); if (!body) return;
+    // ileri yon = govde matrisinin model +z ekseni (fizik duzlemine (x,z) olarak izdusum) -> acisal sozlesmeden bagimsiz
+    const float* M = (const float*)(self + V_BODY_MAT);
+    float fx = M[8], fy = M[10]; const float fl = sqrtf(fx * fx + fy * fy);
+    if (fl > 1e-4f) { fx /= fl; fy /= fl; } else { fx = 1.f; fy = 0.f; }
+    SetRemoteBodyVelocity(body, fx * throttle * WALK_SPEED, fy * throttle * WALK_SPEED, TURN_SIGN * steer * TURN_RATE);   // [K] uyandirma dahil
+    if (g_FirstPerson) {                                                       // kafa bakisi: kamera matrisini biz yaziyoruz
+        M4 B; memcpy(B.m, M, 64);
+        M4 cam = Mul(Mul(Mul(B, Tr(0, EYE_HEIGHT, 0)), RY(g_HeadYaw)), RX(g_HeadPitch));   // [!] eksen/isaret testte netlesir
+        memcpy((void*)(self + V_CAM_WORLD), cam.m, 64);
+    }
+}
+
+// ------------------------------- CIZIM -------------------------------
+static void DrawWalker(uintptr_t self, void* dev) {
+    if (!g_AssetsReady || !fnDraw || !fnBind) return;                          // hazir degilse hicbir sey cizme (temel arac gorunmesin)
+    const uintptr_t body = *(uintptr_t*)(self + V_PHYS_BODY);
+    float speed = 0; if (body) { const float vx = *(float*)(body + B_VX), vy = *(float*)(body + B_VY); speed = sqrtf(vx * vx + vy * vy); }
+    float ph = 0, amp = 0;
+    {   // animasyon GERCEK hizdan (yerel + uzak ayni): uzak yaya icin ekstra paket gerekmez
+        std::lock_guard<std::mutex> lk(g_Mu);
+        for (size_t i = 0; i < g_Walkers.size(); ++i) if (g_Walkers[i].p == self) {
+            Walker& w = g_Walkers[i]; const long long now = NowMs();
+            float dt = w.lastMs ? (now - w.lastMs) * 0.001f : 0.016f; if (dt > 0.1f) dt = 0.1f; w.lastMs = now;
+            const float target = fminf(speed / WALK_SPEED, 1.f);
+            w.amp += (target - w.amp) * fminf(dt * 8.f, 1.f);
+            w.phase += speed * STRIDE * dt;
+            ph = w.phase; amp = w.amp; break;
+        }
+    }
+    M4 B; memcpy(B.m, (void*)(self + V_BODY_MAT), 64);
+    const float sw = sinf(ph) * amp;
+    M4 mats[P_COUNT];
+    mats[P_TORSO] = B;
+    mats[P_LEG_L] = AroundPivot(B, RIG_HIP_L, RX(+sw * 0.5f)); mats[P_LEG_R] = AroundPivot(B, RIG_HIP_R, RX(-sw * 0.5f));
+    mats[P_ARM_L] = AroundPivot(B, RIG_SH_L,  RX(-sw * 0.4f)); mats[P_ARM_R] = AroundPivot(B, RIG_SH_R, RX(+sw * 0.4f));
+    const bool mine = (self == g_LocalWalker);
+    mats[P_HEAD] = AroundPivot(B, RIG_NECK, mine ? Mul(RY(g_HeadYaw), RX(g_HeadPitch)) : Id());   // uzak yayada kafa duz bakar (senkron yok)
+    fnBind(dev, g_TexObj[0], 0);                                               // katman 0 = diffuse [D: bindTextureLayer 3. arguman]
+    for (int i = 0; i < P_COUNT; ++i) if (g_Mesh[i]) fnDraw(dev, mats[i].m, g_Mesh[i][0], g_Mesh[i][1]);
+}
+static void my_VehRender(void* self, void* ra, void* dev, uint32_t p3) {
+    if (IsWalker((uintptr_t)self)) { DrawWalker((uintptr_t)self, dev); return; }
+    orig_VehRender(self, ra, dev, p3);
+}
+// Emissive gecisi: temel aracin far/isik mesh'leri yayanin uzerinde cizilmesin. Donus 0 = "isik cizilmedi" [D: local_20 = 0].
+static uint64_t my_VehEmis(void* self, void* ra, void* dev, uint32_t a, uint32_t b, uint32_t c, void* tex) {
+    if (IsWalker((uintptr_t)self)) return 0;
+    return orig_VehEmis(self, ra, dev, a, b, c, tex);
+}
+// Diger cizim gecisleri temel aracin mesh'lerini yayanin uzerine cizmesin diye bastirilir.
+#define WK_SUPPRESS(NAME) \
+    static VehRender3_t orig_##NAME = nullptr; \
+    static void my_##NAME(void* self, void* ra, void* dev) { if (IsWalker((uintptr_t)self)) return; orig_##NAME(self, ra, dev); }
+WK_SUPPRESS(VehTransp) WK_SUPPRESS(VehUV) WK_SUPPRESS(VehEnv)
+// Emissive: imza decompile'dan (libapp_so.c 18003) okundu -> my_VehEmis (yukarida) bastirir.
+
+// ------------------------------- GENEL API -------------------------------
+static void* Sym(void* lib, const char* mangled, const char* prefix) {
+    void* p = (lib && mangled && *mangled) ? dlsym(lib, mangled) : nullptr;
+    if (!p && prefix) p = FindElfSymbolByPrefix("libapp.so", prefix);
+    if (!p) LOGI("[WALKER] SEMBOL YOK: %s", prefix ? prefix : mangled);
+    return p;
+}
+static void Init(void* appLib) {
+    fnMeshLoad = (MeshLoad_t)Sym(appLib, "_ZN19IndexedTriangleMesh4loadEPKcP27AndroidHandheldSystemDeviceP24GLESHandheldRenderDevice", "_ZN19IndexedTriangleMesh4loadEPKcP");
+    fnTexLoad  = (TexLoad_t)Sym(appLib, "_ZN7Texture4loadEPKcP27AndroidHandheldSystemDeviceP24GLESHandheldRenderDevicebj", "_ZN7Texture4loadEPKcP");
+    // DUZELTME: 3 argumanli asiri yukleme (EPKfjj); 4 argumanli olan (EPKfjjj) ile karismasin diye '$' = tam eslesme (FindElfSymbolByPrefix).
+    fnDraw = (Draw44_t)Sym(appLib, "_ZN24GLESHandheldRenderDevice24enqueueDrawColumnMajor44EPKfjj", "_ZN24GLESHandheldRenderDevice24enqueueDrawColumnMajor44EPKfjj$");
+    fnBind = (BindTex_t)Sym(appLib, "_ZN24GLESHandheldRenderDevice16bindTextureLayerEjj", "_ZN24GLESHandheldRenderDevice16bindTextureLayerE");
+    fnBindAttrs = (BindAttrs_t)Sym(appLib, "", "_ZN24GLESHandheldRenderDevice20bindShaderAttributesE");
+    fnActiveChanged = (ActiveChanged_t)Sym(appLib, "_ZN4Game20activeVehicleChangedEv", "_ZN4Game20activeVehicleChanged");
+    // Vehicle::update'i KANCALAMIYORUZ: sizin my_Vehicle_update tutuyor -> WK::AfterVehicleUpdate oradan cagrilir.
+    struct H { const char* n; const char* prefix; void* repl; void** orig; };
+    const H hooks[] = {
+        {"Vehicle::enqueueRender",            "_ZN7Vehicle13enqueueRenderE",            (void*)my_VehRender, (void**)&orig_VehRender},
+        // DUZELTME: Itanium isim uzunluklari: enqueueRenderTransparent=24, enqueueRenderUVScroll=21 (eskiden 22 ve 19 yazilmisti -> sembol bulunamiyor, kanca takilmiyordu)
+        {"Vehicle::enqueueRenderTransparent", "_ZN7Vehicle24enqueueRenderTransparentE", (void*)my_VehTransp, (void**)&orig_VehTransp},
+        {"Vehicle::enqueueRenderUVScroll",    "_ZN7Vehicle21enqueueRenderUVScrollE",    (void*)my_VehUV,     (void**)&orig_VehUV},
+        {"Vehicle::enqueueRenderEnvMap",      "_ZN7Vehicle19enqueueRenderEnvMapE",      (void*)my_VehEnv,    (void**)&orig_VehEnv},
+        {"Vehicle::enqueueRenderEmissive",    "_ZN7Vehicle21enqueueRenderEmissiveE",    (void*)my_VehEmis,   (void**)&orig_VehEmis},
+    };
+    for (size_t i = 0; i < sizeof(hooks) / sizeof(hooks[0]); ++i) {
+        void* fn = Sym(appLib, "", hooks[i].prefix);
+        const bool ok = fn && HookChecked(hooks[i].n, fn, hooks[i].repl, hooks[i].orig, true);   // riskli prologue'da TAKILMAZ [K]
+        LOGI("[WALKER] hook %s = %d", hooks[i].n, (int)ok);
+    }
+}
+// Oyun thread'i: her karede (my_GameUpdate'ten)
+static void OnGameFrame(uintptr_t game) {
+    {   // silinen/satilan yayalari temizle (uzak REMOVE orig'i dogrudan cagirir; havuz nesnesi yeniden kullanilabilir)
+        std::lock_guard<std::mutex> lk(g_Mu);
+        for (size_t i = g_Walkers.size(); i-- > 0;) if (SlotIndexOfVehicle(game, g_Walkers[i].p) < 0) {
+            if (g_LocalWalker == g_Walkers[i].p) g_LocalWalker = 0;
+            g_Walkers.erase(g_Walkers.begin() + i);
+        }
+    }
+    if (g_ReqExit)  { g_ReqExit = false;  DoExit(game); }
+    if (g_ReqEnter) { g_ReqEnter = false; DoEnter(game, false); }
+}
+// Kayit oncesi/oturum bitisinde cagirin: yayayi kaldirip aracina geri bindirir (yoksa Vehicle::serialize yayayi
+// "temel arac" olarak kayda yazar). Su an HICBIR YERDEN CAGRILMIYOR [!]: kayit kancasina baglamak sizin kararinizdir.
+static void ForceReturnToVehicle(uintptr_t game) { DoEnter(game, true); }
+// Dokunma surukleme (ornegin ekranin sag yarisi): kafayi cevirir. Sizin dokunma kodunuzdan cagrilir.
+static void AddLook(float dYaw, float dPitch) {
+    g_HeadYaw += dYaw; g_HeadPitch += dPitch;
+    if (g_HeadPitch > 1.4f)  g_HeadPitch = 1.4f;
+    if (g_HeadPitch < -1.4f) g_HeadPitch = -1.4f;
+}
+// GL thread'i (ImGui kare fonksiyonundan). Etiketler Ingilizce: oyunun yazi tipi Turkce karakter icermeyebilir.
+static void DrawImGui(uintptr_t game, const ImVec2& screen) {
+    if (game == 0) return;
+    if (*(volatile uint32_t*)(game + G_STATE) != 6) return;                    // sadece oyun icinde (magaza/ayarlar degil)
+    EnsureAssets(game);                                                        // oyun hazir olunca (Game+0xA340 shader no, EntityManager kurulu) yukle
+    const uintptr_t cur = LocalActiveVehiclePtr(game); if (!cur) return;
+    const bool onFoot = (cur == g_LocalWalker);
+    ImGui::SetNextWindowPos(ImVec2(screen.x * 0.985f, screen.y * 0.42f), ImGuiCond_Always, ImVec2(1.0f, 0.0f));
+    ImGui::Begin("##walker", nullptr, ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoScrollbar |
+                 ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoFocusOnAppearing);
+    const ImVec2 bs(screen.x * 0.15f, screen.y * 0.085f);
+    if (!onFoot) { if (!IsWalker(cur) && ImGui::Button("Exit Vehicle", bs)) g_ReqExit = true; }
+    else {
+        if (ImGui::Button("Enter Vehicle", bs)) g_ReqEnter = true;
+        if (ImGui::Button(g_FirstPerson ? "Third Person" : "First Person", bs)) g_FirstPerson = !g_FirstPerson;
+    }
+    ImGui::End();
+    // TODO: dokunusun alttaki oyun HUD'una da gecmesini engelleyin (sohbet HUD dugmenizdeki "press armed" mantigi gibi) [!]
+}
+
+} // namespace WK
+
+// ===== walker_module.inc sonu =====
 
 static void QueueTrailerPosition(uint32_t idx, uint32_t type, float x, float y, float angle, bool moving, bool tool = false) {
     if (!g_IsConnected.load() || idx >= (tool ? 64u : 256u) || type > 0x3F) return;
@@ -8290,6 +8682,7 @@ void DrawImGui() {
 
     // Diger oyuncularin araclari uzerinde isim etiketleri (kendi aracin haric)
     if (g_OnlineMode && !g_IsMultiplayerMenuActive) DrawPlayerNameTags(screen);
+    if (!g_IsMultiplayerMenuActive) WK::DrawImGui(g_EngineInstance, screen);   // WALKER: Exit/Enter Vehicle dugmeleri (+ varlik yukleme: GL thread)
 
     if (g_IsMultiplayerMenuActive) {
         ImDrawList* bg = ImGui::GetBackgroundDrawList();
@@ -8730,7 +9123,9 @@ static void* my_Vehicle_update(void* t, uint32_t a, uint32_t b, uint32_t c, uint
                 *(float*)((uintptr_t)t + 0x568) = DequantizeSteer(q);
         }
     }
-    return GuardedEntityUpdate(orig_Vehicle_update, (uintptr_t)t, "Vehicle", t, a, b, c, d, e);
+    void* wkRet = GuardedEntityUpdate(orig_Vehicle_update, (uintptr_t)t, "Vehicle", t, a, b, c, d, e);
+    WK::AfterVehicleUpdate((uintptr_t)t, a, b, c, d);     // WALKER: yerel yayanin hareketi + birinci sahis kamera (update'ten SONRA)
+    return wkRet;
 }
 static void* my_Trailer_update(void* t, uint32_t a, uint32_t b, uint32_t c, uint32_t d, uint32_t e) {
     const uintptr_t veh = t ? *(uintptr_t*)((uintptr_t)t + 0x184) : 0;     // Trailer+0x184 = bagli oldugu arac
@@ -8864,6 +9259,7 @@ void my_GameUpdate(void* thiz, float param_1) {
     GuestBlockDialogs((uintptr_t)thiz);   // client: satis / tarla satin alma onay pencerelerini kapat
     g_CurrentMenu = MENU_INGAME;
     MoneyFrame((uintptr_t)thiz);         // ortak para (her kare, tum oyun durumlarinda)
+    WK::OnGameFrame((uintptr_t)thiz);    // WALKER: in/bin istekleri (oyun fonksiyonlari sadece bu thread'den cagrilir)
     {
         // Game::updateStateBase SADECE durum 6'da calisir; magaza/ayarlar (durum 7) acikken hic cagrilmaz.
         // Alim/satim tespiti ve arac tablosu bu yuzden burada (her karede) calistirilir; boylece magaza
@@ -9198,7 +9594,7 @@ void* my_renderStartMenuMain(void* thiz, void* p1, void* p2, void* p3) {
 // ========================================================================
 __attribute__((constructor))
 void ModMain() {
-    LOGI(">>> MULTIPLAYER MOD STARTING <<< build=shopfix-34+single-tow-publisher");
+    LOGI(">>> MULTIPLAYER MOD STARTING <<< build=shopfix-35+walker");
 
     ResetVehicleSyncState();
     std::thread(StartPONGResponderThread).detach();
@@ -9267,6 +9663,7 @@ void ModMain() {
         orig_Game_addVehicle = (Game_addVehicle_t)addVeh;     // kanca YOK: sadece cagrilacak ham fonksiyon
         HookChecked("Game::removeVehicle", remVeh, (void*)my_Game_removeVehicle, (void**)&orig_Game_removeVehicle, false);
         g_VehicleHooksOk = addVeh && remVeh && g_VehicleDestroyFn;
+        WK::Init(appLib);                                      // WALKER: sembolleri bul + cizim kancalari (Vehicle::update'e DOKUNMAZ)
 
         // Ortak para: hayalet varliklarin gelir/giderini geri alan kancalar (riskli prologue'da TAKILMAZ).
         if (kSharedMoney && kGuardGhostMoney) {
