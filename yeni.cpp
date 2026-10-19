@@ -2402,7 +2402,7 @@ static uint32_t SpawnWalker(uintptr_t game, const float* pos3, uint32_t angleBit
         float* fx = (float*)(desc + D_FIX_ARRAY);
         { static bool s_dump = false; if (!s_dump) { s_dump = true; const uint32_t n0 = *(uint32_t*)(desc + D_FIX_COUNT);
             LOGI("[WALKER] desc fixture sayisi=%u tekerlek=%u", n0, *(uint32_t*)(desc + D_WHEEL_COUNT));
-            for (uint32_t k = 0; k < n0 && k < 4; ++k) { const float* q = (const float*)(desc + D_FIX_ARRAY + k * 0x18); LOGI("[WALKER] desc fix[%u] = %.3f %.3f %.3f %.3f %.3f %.3f", k, q[0], q[1], q[2], q[3], q[4], q[5]); } }
+            for (uint32_t k = 0; k < n0 && k < 4; ++k) { const float* q = (const float*)(desc + D_FIX_ARRAY + k * 0x18); LOGI("[WALKER] desc fix[%u] = %.3f %.3f %.3f %.3f %.3f %.3f", k, q[0], q[1], q[2], q[3], q[4], q[5]); } } }
         *(uint32_t*)(desc + D_FIX_COUNT) = 1;
         fx[0] = HITBOX_HX; fx[1] = HITBOX_HY; fx[2] = 0; fx[3] = 0; fx[4] = 0; fx[5] = 1.0f;   // {hx,hy,cx,cy,angle,density}: onceki yama hx/hy ile merkezi ters yazmisti -> alan 0 -> kutle 0 -> NaN
     }
