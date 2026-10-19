@@ -2118,10 +2118,10 @@ enum Part { P_TORSO, P_HEAD, P_ARM_L, P_ARM_R, P_LEG_L, P_LEG_R, P_COUNT };
 static const int      BASE_TYPE      = 0;      // [!] klonlanacak EntityManager::VEHICLES tipi (en kucuk / en sorunsuz arac)
 static const float    WALK_SPEED     = 2.2f;   // m/s
 static const float    TURN_RATE      = 3.0f;   // rad/s
-static const float    TURN_SIGN      = -1.0f;  // [!] donus yonu ters ise +1 yapin
-static const float    ENTER_RADIUS   = 5.0f;   // "Enter" icin maks. mesafe (m)
-static const float    EXIT_DIST      = 3.0f;   // inince aracin yanina koyma mesafesi (m)
-static const float    EXIT_SIDE      = 1.0f;   // [!] +1/-1: araci hangi yanindan inilir
+static const float    TURN_SIGN      = +1.0f;  // duzeltme: sol/sağ direksiyon işareti ters çevrildi
+static const float    ENTER_RADIUS   = 7.0f;   // uzak inis konumundan da araca tekrar binebilmek icin (m)
+static const float    EXIT_DIST      = 5.5f;   // inince aractan daha uzaga, yan tarafa koy (m)
+static const float    EXIT_SIDE      = 1.0f;   // +1/-1: araci hangi yanindan inilir
 static const float    HITBOX_HX = 0.30f, HITBOX_HY = 0.25f;  // insan kutusu (yari kenar, m) [?: girdi duzeni]
 // --- v4: KARARLILIK ONLEMLERI (log bulgusu: yaya dogunca oyun kare basi ~13 sn ile calisti; Vehicle::update f1 = dt) ---
 #ifndef WK_MAX_DT_S
@@ -2136,12 +2136,12 @@ static const float    HITBOX_HX = 0.30f, HITBOX_HY = 0.25f;  // insan kutusu (ya
 #ifndef WK_PROFILER
 #define WK_PROFILER 1          // oyun thread'i takilinca PC/LR ornekleyici ("[PROF]"), sadece ARM Android
 #endif
-// --- desc yamalari: ARTIK VARSAYILAN KAPALI (her biri ayri test edilmeli) ---
+// --- desc yamalari: yaya icin kucuk hitbox ve alt-parca iptali varsayilan acik ---
 #ifndef WK_PATCH_HITBOX
-#define WK_PATCH_HITBOX 0      // 1: tek kucuk kutu (fixture girdi duzeni [?] dogrulanmadi)
+#define WK_PATCH_HITBOX 1      // yaya aracın büyük varsayılan çarpışma kutusunu kullanmasın
 #endif
 #ifndef WK_PATCH_PARTS
-#define WK_PATCH_PARTS 0       // 1: alt parca sayisini 0 yap
+#define WK_PATCH_PARTS 1       // yaya nesnesinde temel aracın alt parça sayısını sıfırla
 #endif
 #ifndef WK_KEEP_WHEELS
 #define WK_KEEP_WHEELS 1       // 0: tekerlek sayisini 0 yap (Vehicle::updateAIState 0'a bolme riski)
@@ -2496,11 +2496,22 @@ static void AfterVehicleUpdate(uintptr_t self, uint32_t ua, uint32_t ub, uint32_
     float fx = M[8], fy = M[10]; const float fl = sqrtf(fx * fx + fy * fy);
     if (fl > 1e-4f) { fx /= fl; fy /= fl; } else { fx = 1.f; fy = 0.f; }
     SetRemoteBodyVelocity(body, fx * throttle * WALK_SPEED, fy * throttle * WALK_SPEED, TURN_SIGN * steer * TURN_RATE);   // [K] uyandirma dahil
-    if (g_FirstPerson) {                                                       // kafa bakisi: kamera matrisini biz yaziyoruz
+    if (g_FirstPerson) {                                                       // kamera dunya matrisi: oyun daha sonra bunun tersini view matrisi yapar
         M4 B; memcpy(B.m, M, 64);
-        M4 cam = Mul(Mul(Mul(B, Tr(0, EYE_HEIGHT, 0)), RY(g_HeadYaw)), RX(g_HeadPitch));   // [!] eksen/isaret testte netlesir
+        // Vehicle::update, araç model matrisini açı-PI ile kurar; kamera normalde -Z yönüne bakar.
+        // Yarım tur düzeltmesi kamerayı aracın arkasından önüne çevirir.
+        const float pi = 3.14159265358979323846f;
+        M4 cam = Mul(Mul(Mul(B, Tr(0, EYE_HEIGHT, 0)), RY(pi + g_HeadYaw)), RX(g_HeadPitch));
         memcpy((void*)(self + V_CAM_WORLD), cam.m, 64);
     }
+}
+
+// Sahte Vehicle olarak kullanılan yaya, HUD'da yakıtı olan gerçek araç gibi görünmesin.
+// Game::updateStateBase, Vehicle+0x444 (kapasite) pozitifse Vehicle+0x440 değerini HUD'a aktarır.
+static void StripWalkerVehicleHud(uintptr_t self) {
+    if (!IsWalker(self)) return;
+    *(float*)(self + 0x440) = 0.0f;  // mevcut yakıt
+    *(float*)(self + 0x444) = 0.0f;  // yakıt kapasitesi: HUD yakıt oranını kapat
 }
 
 // ------------------------------- CIZIM -------------------------------
@@ -2701,7 +2712,8 @@ static void DrawImGui(uintptr_t game, const ImVec2& screen) {
     EnsureAssets(game);                                                        // oyun hazir olunca (Game+0xA340 shader no, EntityManager kurulu) yukle
     const uintptr_t cur = LocalActiveVehiclePtr(game); if (!cur) return;
     const bool onFoot = (cur == g_LocalWalker);
-    ImGui::SetNextWindowPos(ImVec2(screen.x * 0.985f, screen.y * 0.42f), ImGuiCond_Always, ImVec2(1.0f, 0.0f));
+    // Yaya kontrollerini üst-sağ bölgede tut: sağdaki gaz/fren sürgüsünü ve alt HUD düğmelerini kapatmasın.
+    ImGui::SetNextWindowPos(ImVec2(screen.x * 0.985f, screen.y * 0.13f), ImGuiCond_Always, ImVec2(1.0f, 0.0f));
     ImGui::Begin("##walker", nullptr, ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoScrollbar |
                  ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoFocusOnAppearing);
     const ImVec2 bs(screen.x * 0.15f, screen.y * 0.085f);
@@ -2716,6 +2728,25 @@ static void DrawImGui(uintptr_t game, const ImVec2& screen) {
 }
 
 } // namespace WK
+
+// Gerçek oyun içi takma işlemlerini de engelle: yaya teknik olarak Vehicle sınıfından türetilmiş bir nesne.
+// Dönüş değerleri oyun kodunda kullanılmadığından attachTool koruması void imzasını korur.
+static Vehicle_attachTrailer_t g_OrigAttachToolHook = nullptr;
+static Vehicle_attachTrailer_t g_OrigAttachTrailerHook = nullptr;
+static void my_VehicleAttachToolGuard(void* vehicle, void* tool, void* world) {
+    if (WK::IsWalker((uintptr_t)vehicle)) {
+        LOGI("[WALKER] attachTool engellendi: yaya araci alet kabul etmez");
+        return;
+    }
+    if (g_OrigAttachToolHook) g_OrigAttachToolHook(vehicle, tool, world);
+}
+static void my_VehicleAttachTrailerGuard(void* vehicle, void* trailer, void* world) {
+    if (WK::IsWalker((uintptr_t)vehicle)) {
+        LOGI("[WALKER] attachTrailer engellendi: yaya araci romork kabul etmez");
+        return;
+    }
+    if (g_OrigAttachTrailerHook) g_OrigAttachTrailerHook(vehicle, trailer, world);
+}
 
 // TANI + CANLI LOG yardimcilari WK icinde tanimli; dis kodun (my_GameUpdate, my_Vehicle_update, DrawImGui, ModMain) kullanabilmesi icin disari aciliyor
 namespace LL = WK::LL;
@@ -3016,6 +3047,10 @@ static void ApplyToolAttach(uintptr_t game, const TrailerAttachPacket& pk, void*
     if (pk.trIdx >= tn || world == nullptr) return;
     const uintptr_t tp = RawToolSlot(game, pk.trIdx);
     const uintptr_t veh = GetVehicleFromIndex(game, pk.vehNetId);
+    if ((pk.attach & 1) != 0 && WK::IsWalker(veh)) {
+        LOGI("[WALKER] uzaktan alet takma engellendi: yaya aracina alet baglanamaz");
+        return;
+    }
     if (tp == 0 || veh == 0 || *(uint32_t*)(tp + 0x10) != pk.trType) {
         LOGI("[TOOL] olay atlandi: alet=%u arac=%u (esleme yok)", (unsigned)pk.trIdx, (unsigned)pk.vehNetId);
         return;
@@ -5307,6 +5342,10 @@ static void ApplyPendingTrailerEvents(uintptr_t game, uint8_t localOwner, uint64
         if (pk.ownerId == localOwner || pk.trIdx >= tn || world == nullptr) continue;
         const uintptr_t tp = RawTrailerSlot(game, pk.trIdx);
         const uintptr_t veh = GetVehicleFromIndex(game, pk.vehNetId);
+        if ((pk.attach & 1) != 0 && WK::IsWalker(veh)) {
+            LOGI("[WALKER] uzaktan romork takma engellendi: yaya aracina romork baglanamaz");
+            continue;
+        }
         if (tp == 0 || veh == 0 || *(uint32_t*)(tp + 0x10) != pk.trType) {
             LOGI("[TRAILER] olay atlandi: romork=%u arac=%u (esleme yok)", (unsigned)pk.trIdx, (unsigned)pk.vehNetId);
             continue;
@@ -9401,6 +9440,7 @@ static void* my_Vehicle_update(void* t, uint32_t a, uint32_t b, uint32_t c, uint
     }
     StageG("orig_Vehicle_update");
     void* wkRet = GuardedEntityUpdate(orig_Vehicle_update, (uintptr_t)t, "Vehicle", t, a, b, c, d, e);
+    WK::StripWalkerVehicleHud((uintptr_t)t);               // WALKER: sahte aracın yakıt HUD değerlerini temizle
     WK::AfterVehicleUpdate((uintptr_t)t, a, b, c, d);     // WALKER: yerel yayanin hareketi + birinci sahis kamera (update'ten SONRA)
     return wkRet;
 }
@@ -9882,7 +9922,7 @@ void* my_renderStartMenuMain(void* thiz, void* p1, void* p2, void* p3) {
 // ========================================================================
 __attribute__((constructor))
 void ModMain() {
-    LOGI(">>> MULTIPLAYER MOD STARTING <<< build=shopfix-37+walker-v4");
+    LOGI(">>> MULTIPLAYER MOD STARTING <<< build=shopfix-38+walker-v5");
 
     ResetVehicleSyncState();
     std::thread(StartPONGResponderThread).detach();
@@ -9945,6 +9985,13 @@ void ModMain() {
              (void*)g_VehiclePrepareAiFn, (void*)g_VehicleAiStartFn, (void*)g_VehicleAiStopFn);
         LOGI("[TRAILER] symbols: attachTrailer=%p combineToggle=%p toolToggleActive=%p",
              (void*)g_VehicleAttachTrailerFn, (void*)g_CombineToggleFn, (void*)g_ToolToggleActiveFn);
+        const bool hAttachTool = g_VehicleAttachToolFn && HookChecked(
+            "Vehicle::attachTool (walker guard)", (void*)g_VehicleAttachToolFn,
+            (void*)my_VehicleAttachToolGuard, (void**)&g_OrigAttachToolHook, true);
+        const bool hAttachTrailer = g_VehicleAttachTrailerFn && HookChecked(
+            "Vehicle::attachTrailer (walker guard)", (void*)g_VehicleAttachTrailerFn,
+            (void*)my_VehicleAttachTrailerGuard, (void**)&g_OrigAttachTrailerHook, true);
+        LOGI("[WALKER] attachment guards: tool=%d trailer=%d", (int)hAttachTool, (int)hAttachTrailer);
         LOGI("vehicle hooks: addVehicle=%p removeVehicle=%p Vehicle::destroy=%p detachTool=%p detachTrailer=%p",
              addVeh, remVeh, (void*)g_VehicleDestroyFn, (void*)g_VehicleDetachToolFn, (void*)g_VehicleDetachTrailerFn);
         // skipIfRisky=false: bu ikisi zaten calisiyor; sadece prologue riskini loga yaz.
