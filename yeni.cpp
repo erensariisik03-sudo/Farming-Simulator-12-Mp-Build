@@ -2095,6 +2095,16 @@ static uintptr_t LocalActiveVehiclePtr(uintptr_t game) {
 #include <string.h>
 #include <vector>
 #include <mutex>
+#include <atomic>
+#include <thread>
+#include <algorithm>
+#include <map>
+#include <string>
+#include <signal.h>
+#include <ucontext.h>
+#include <unistd.h>
+#include <sys/syscall.h>
+#include <dlfcn.h>
 
 namespace WK {
 
@@ -2113,7 +2123,30 @@ static const float    ENTER_RADIUS   = 5.0f;   // "Enter" icin maks. mesafe (m)
 static const float    EXIT_DIST      = 3.0f;   // inince aracin yanina koyma mesafesi (m)
 static const float    EXIT_SIDE      = 1.0f;   // [!] +1/-1: araci hangi yanindan inilir
 static const float    HITBOX_HX = 0.30f, HITBOX_HY = 0.25f;  // insan kutusu (yari kenar, m) [?: girdi duzeni]
-static const bool     KEEP_WHEELS    = false;  // [!] false: tekerlek sayisi 0. Update cokerse true yapip dene
+// --- v4: KARARLILIK ONLEMLERI (log bulgusu: yaya dogunca oyun kare basi ~13 sn ile calisti; Vehicle::update f1 = dt) ---
+#ifndef WK_MAX_DT_S
+#define WK_MAX_DT_S 0.25f      // Game::update dt kelepcesi (sn). 0 = kapali. Oyun dt'yi sinirlamiyor: tek takilma kalici uzun kareye doner.
+#endif
+#ifndef WK_AUTORECOVER
+#define WK_AUTORECOVER 1       // yaya varken kare > WK_SLOW_FRAME_MS ise yayayi otomatik kaldir, bu oturumda kapat
+#endif
+#ifndef WK_SLOW_FRAME_MS
+#define WK_SLOW_FRAME_MS 4000
+#endif
+#ifndef WK_PROFILER
+#define WK_PROFILER 1          // oyun thread'i takilinca PC/LR ornekleyici ("[PROF]"), sadece ARM Android
+#endif
+// --- desc yamalari: ARTIK VARSAYILAN KAPALI (her biri ayri test edilmeli) ---
+#ifndef WK_PATCH_HITBOX
+#define WK_PATCH_HITBOX 0      // 1: tek kucuk kutu (fixture girdi duzeni [?] dogrulanmadi)
+#endif
+#ifndef WK_PATCH_PARTS
+#define WK_PATCH_PARTS 0       // 1: alt parca sayisini 0 yap
+#endif
+#ifndef WK_KEEP_WHEELS
+#define WK_KEEP_WHEELS 1       // 0: tekerlek sayisini 0 yap (Vehicle::updateAIState 0'a bolme riski)
+#endif
+static const bool PATCH_HITBOX = WK_PATCH_HITBOX != 0, PATCH_PARTS = WK_PATCH_PARTS != 0, KEEP_WHEELS = WK_KEEP_WHEELS != 0;
 static const bool     DEBUG_INPUT    = true;   // Vehicle::update'in 3 float'ini logcat'e basar
 static const float    STRIDE         = 4.5f;   // yuruyus fazi (rad) = hiz(m/s) * STRIDE * dt
 // Insan iskeleti (tools/make_walker_assets.py olculeriyle BIREBIR; model degisirse ikisini birlikte guncelleyin)
@@ -2161,6 +2194,10 @@ static float g_HeadYaw = 0, g_HeadPitch = 0;   // yerel kafa (rad). Uzaklara SEN
 static bool  g_FirstPerson = false;
 static bool  g_ReqExit = false, g_ReqEnter = false;
 static bool  g_AssetsReady = false; static long long g_AssetsRetryMs = 0;
+static std::atomic<long long> g_LastFrameMs(0);   // OnGameFrame'in son calisma zamani (ornekleyici de okur)
+static std::atomic<int>       g_GameTid(0);       // oyun thread'inin tid'i
+static bool g_Disabled = false;                    // otomatik kurtarma sonrasi: bu oturumda yaya kapali
+static int  g_PostSpawnFrames = 0;                 // dogustan sonra ayrintili kare logu sayaci
 static uint32_t* g_Mesh[P_COUNT];              // oyunun IndexedTriangleMesh nesnesi: P[0]=vertexBuf, P[1]=indexBuf [D: enqueueRender]
 static uint32_t  g_TexObj[4] = {0, 0, 0, 0};   // Texture nesnesi = 4 bayt (GL handle) [D: EntityManager'da Texture dizisi 4'er bayt]
 
@@ -2359,18 +2396,23 @@ static void EnsureAssets(uintptr_t game) {
 static uint32_t SpawnWalker(uintptr_t game, const float* pos3, uint32_t angleBits, bool local) {
     uint8_t* desc = (uint8_t*)(game + G_ENTITYMGR + EM_DESC0 + (uintptr_t)BASE_TYPE * DESC_STRIDE);
     uint8_t backup[DESC_STRIDE]; memcpy(backup, desc, DESC_STRIDE);
-    *(uint32_t*)(desc + D_FIX_COUNT) = 1;                                      // hitbox: tek kucuk kutu
-    float* fx = (float*)(desc + D_FIX_ARRAY); fx[0] = 0; fx[1] = 0; fx[2] = HITBOX_HX; fx[3] = HITBOX_HY; fx[4] = 0; fx[5] = 1.0f;
+    if (PATCH_HITBOX) {                                                        // hitbox: tek kucuk kutu
+        *(uint32_t*)(desc + D_FIX_COUNT) = 1;
+        float* fx = (float*)(desc + D_FIX_ARRAY); fx[0] = 0; fx[1] = 0; fx[2] = HITBOX_HX; fx[3] = HITBOX_HY; fx[4] = 0; fx[5] = 1.0f;
+    }
     if (!KEEP_WHEELS) *(uint32_t*)(desc + D_WHEEL_COUNT) = 0;                  // tekerlek fizigi yok
-    *(uint32_t*)(desc + D_PART_COUNT) = 0;                                     // alt parcalari biz cizeriz
+    if (PATCH_PARTS)  *(uint32_t*)(desc + D_PART_COUNT) = 0;                   // alt parcalari biz cizeriz
+    LOGI("[WALKER] yama: hitbox=%d parts=%d wheels0=%d", (int)PATCH_HITBOX, (int)PATCH_PARTS, (int)!KEEP_WHEELS);
+    const long long tSpawn0 = NowMs();
     StageG("SpawnWalker:addVehicle");
     LOGI("[WALKER] SpawnWalker: addVehicle pos=(%.2f,%.2f,%.2f) baseType=%d", pos3[0], pos3[1], pos3[2], (int)BASE_TYPE);
     const uint32_t idx = orig_Game_addVehicle((void*)game, BASE_TYPE, pos3, angleBits, 0);
     StageG("SpawnWalker:addVehicle-bitti");
+    LOGI("[WALKER] addVehicle SURESI = %lld ms", NowMs() - tSpawn0);           // ZAMAN: takilma burada mi, sonraki karelerde mi?
     memcpy(desc, backup, DESC_STRIDE);                                         // temel arac bozulmasin
     if (idx >= VehicleCount(game)) return idx;
     const uintptr_t veh = RawVehicleSlot(game, idx);
-    { std::lock_guard<std::mutex> lk(g_Mu); Walker w; w.p = veh; w.phase = 0; w.amp = 0; w.lastMs = 0; g_Walkers.push_back(w); if (local) g_LocalWalker = veh; }
+    { std::lock_guard<std::mutex> lk(g_Mu); Walker w; w.p = veh; w.phase = 0; w.amp = 0; w.lastMs = 0; g_Walkers.push_back(w); if (local) { g_LocalWalker = veh; g_PostSpawnFrames = 20; } }
     LOGI("[WALKER] dogdu idx=%u veh=%p local=%d", idx, (void*)veh, (int)local);
     return idx;
 }
@@ -2385,7 +2427,7 @@ static void DoExit(uintptr_t game) {
     StageG("DoExit:basla");
     const uintptr_t cur = LocalActiveVehiclePtr(game);
     LOGI("[WALKER] DoExit: cur=%p walker=%d localWalker=%p count=%u", (void*)cur, (int)(cur && IsWalker(cur)), (void*)g_LocalWalker, VehicleCount(game));
-    if (!cur || IsWalker(cur) || g_LocalWalker || VehicleCount(game) >= 30) return;
+    if (g_Disabled || !cur || IsWalker(cur) || g_LocalWalker || VehicleCount(game) >= 30) return;
     float x, y, a; if (!BodyPose(cur, &x, &y, &a)) return;
     LOGI("[WALKER] DoExit: arac pozu x=%.2f y=%.2f a=%.3f", x, y, a);
     // [!] yon sozlesmesi: yanal = (-sin a, cos a) varsayildi; EXIT_SIDE ile yan degistirilir
@@ -2488,6 +2530,12 @@ static void DrawWalker(uintptr_t self, void* dev) {
     mats[P_ARM_L] = AroundPivot(B, RIG_SH_L,  RX(-sw * 0.4f)); mats[P_ARM_R] = AroundPivot(B, RIG_SH_R, RX(+sw * 0.4f));
     const bool mine = (self == g_LocalWalker);
     mats[P_HEAD] = AroundPivot(B, RIG_NECK, mine ? Mul(RY(g_HeadYaw), RX(g_HeadPitch)) : Id());   // uzak yayada kafa duz bakar (senkron yok)
+    // GUVENLIK: GL adlari kucuk pozitif tamsayidir; cop deger (0, 0xFFFFFFFF, ASCII) ile cizmek surucuyu dondurur.
+    static bool s_disabled = false;
+    if (s_disabled) return;
+    bool sane = (g_TexObj[0] != 0 && g_TexObj[0] < 0x100000u);
+    for (int i = 0; i < P_COUNT && sane; ++i) sane = g_Mesh[i] && g_Mesh[i][0] != 0 && g_Mesh[i][1] != 0 && g_Mesh[i][0] < 0x100000u && g_Mesh[i][1] < 0x100000u;
+    if (!sane) { s_disabled = true; g_AssetsReady = false; LOGI("[WALKER] CIZIM KAPATILDI: GL handle'lari gecersiz (tex=%u)", g_TexObj[0]); return; }
     StageR("DrawWalker:bindTex");
     fnBind(dev, g_TexObj[0], 0);                                               // katman 0 = diffuse [D: bindTextureLayer 3. arguman]
     StageR("DrawWalker:parcalar");
@@ -2518,6 +2566,7 @@ static void* Sym(void* lib, const char* mangled, const char* prefix) {
     if (!p) LOGI("[WALKER] SEMBOL YOK: %s", prefix ? prefix : mangled);
     return p;
 }
+static void StartProfiler();                                               // asagida tanimli (ornekleyici)
 static void Init(void* appLib) {
     fnMeshLoad = (MeshLoad_t)Sym(appLib, "_ZN19IndexedTriangleMesh4loadEPKcP27AndroidHandheldSystemDeviceP24GLESHandheldRenderDevice", "_ZN19IndexedTriangleMesh4loadEPKcP");
     fnTexLoad  = (TexLoad_t)Sym(appLib, "_ZN7Texture4loadEPKcP27AndroidHandheldSystemDeviceP24GLESHandheldRenderDevicebj", "_ZN7Texture4loadEPKcP");
@@ -2536,6 +2585,7 @@ static void Init(void* appLib) {
         {"Vehicle::enqueueRenderEnvMap",      "_ZN7Vehicle19enqueueRenderEnvMapE",      (void*)my_VehEnv,    (void**)&orig_VehEnv},
         {"Vehicle::enqueueRenderEmissive",    "_ZN7Vehicle21enqueueRenderEmissiveE",    (void*)my_VehEmis,   (void**)&orig_VehEmis},
     };
+    StartProfiler();
     for (size_t i = 0; i < sizeof(hooks) / sizeof(hooks[0]); ++i) {
         void* fn = Sym(appLib, "", hooks[i].prefix);
         const bool ok = fn && HookChecked(hooks[i].n, fn, hooks[i].repl, hooks[i].orig, true);   // riskli prologue'da TAKILMAZ [K]
@@ -2544,14 +2594,93 @@ static void Init(void* appLib) {
     { static bool s_wd = false; if (!s_wd) { s_wd = true; std::thread(WatchdogThread).detach(); LOGI("[WALKER] watchdog basladi"); } }
 }
 // Oyun thread'i: her karede (my_GameUpdate'ten)
+// ------------------------------- KURTARMA + ORNEKLEYICI (v4) -------------------------------
+// Yayayi, "aractan inme" kosulu aramadan kaldirir (yavas kare korumasi): once hedef araca gec, sonra yayayi sil.
+static void HardRemoveLocalWalker(uintptr_t game) {
+    const uintptr_t w = g_LocalWalker; if (!w) return;
+    uintptr_t best = (g_LastVehicle && SlotIndexOfVehicle(game, g_LastVehicle) >= 0) ? g_LastVehicle : 0;
+    for (uint32_t i = 0; !best && i < VehicleCount(game); ++i) { const uintptr_t v = RawVehicleSlot(game, i); if (v && !IsWalker(v)) best = v; }
+    if (best) SetActiveByPtr(game, best);
+    const int wi = SlotIndexOfVehicle(game, w);
+    if (wi >= 0) { my_Game_removeVehicle((void*)game, (uint32_t)wi); if (g_VehicleDestroyFn) g_VehicleDestroyFn((void*)w); }
+    OnVehicleRemoved(w);
+    if (best) SetActiveByPtr(game, best);
+    LOGI("[WALKER] yaya kaldirildi (hedef arac=%p)", (void*)best);
+}
+
+// Oyun thread'i takilinca (kare > 1.5 s, yaya varken) 30 kez PC/LR ornekler, en sik 6 konumu loglar:
+//   "libapp.so+0xOFFSET <mangled isim>" -> hangi oyun fonksiyonunun CPU yedigi gorunur.
+#if WK_PROFILER && ((defined(__ANDROID__) && defined(__arm__)) || defined(WK_FORCE_PROFILER))
+static const int WK_SMP_MAX = 64;
+static std::atomic<uintptr_t> g_SmpPc[WK_SMP_MAX], g_SmpLr[WK_SMP_MAX];
+static std::atomic<int> g_SmpN(0);
+static void SmpHandler(int, siginfo_t*, void* ucv) {                          // oyun thread'inde calisir: sadece atomik yazma
+    ucontext_t* uc = (ucontext_t*)ucv; const int i = g_SmpN.fetch_add(1);
+    if (i < WK_SMP_MAX) { g_SmpPc[i].store((uintptr_t)uc->uc_mcontext.arm_pc); g_SmpLr[i].store((uintptr_t)uc->uc_mcontext.arm_lr); }
+}
+static std::string SymOf(uintptr_t pc) {
+    Dl_info di; char buf[240];
+    if (pc && dladdr((void*)pc, &di)) {
+        const char* fn = di.dli_fname ? strrchr(di.dli_fname, '/') : nullptr; fn = fn ? fn + 1 : (di.dli_fname ? di.dli_fname : "?");
+        snprintf(buf, sizeof buf, "%s+0x%lx %s", fn, (unsigned long)(pc - (uintptr_t)di.dli_fbase), di.dli_sname ? di.dli_sname : "?");
+    } else snprintf(buf, sizeof buf, "0x%lx ?", (unsigned long)pc);
+    return std::string(buf);
+}
+static bool SmpCmp(const std::pair<int, std::string>& a, const std::pair<int, std::string>& b) { return a.first > b.first; }
+static void LogTop(const char* tag, const std::map<std::string, int>& h) {
+    std::vector<std::pair<int, std::string> > v;
+    for (std::map<std::string, int>::const_iterator it = h.begin(); it != h.end(); ++it) v.push_back(std::make_pair(it->second, it->first));
+    std::sort(v.begin(), v.end(), SmpCmp);
+    for (size_t i = 0; i < v.size() && i < 6; ++i) LOGI("[PROF] %s %2dx %s", tag, v[i].first, v[i].second.c_str());
+}
+static void ProfilerThread() {
+    int reports = 0;
+    for (;;) {
+        usleep(250000);
+        const long long last = g_LastFrameMs.load(); const int tid = g_GameTid.load();
+        if (!last || !tid || reports >= 6 || !g_LocalWalker) continue;
+        if (NowMs() - last < 1500) continue;                                     // oyun akici: ornekleme yok
+        g_SmpN.store(0);
+        for (int k = 0; k < 30; ++k) { syscall(__NR_tgkill, getpid(), tid, SIGRTMIN + 4); usleep(100000); }
+        const int n = std::min((int)g_SmpN.load(), WK_SMP_MAX);
+        std::map<std::string, int> hp, hl;
+        for (int i = 0; i < n; ++i) { ++hp[SymOf(g_SmpPc[i].load())]; ++hl[SymOf(g_SmpLr[i].load())]; }
+        LOGI("[PROF] === rapor %d: %d ornek, oyun thread tid=%d ===", reports + 1, n, tid);
+        LogTop("PC", hp); LogTop("LR", hl);
+        ++reports;
+    }
+}
+static void StartProfiler() {
+    struct sigaction sa; memset(&sa, 0, sizeof sa); sa.sa_sigaction = SmpHandler; sa.sa_flags = SA_SIGINFO | SA_RESTART; sigemptyset(&sa.sa_mask);
+    sigaction(SIGRTMIN + 4, &sa, nullptr);
+    std::thread(ProfilerThread).detach();
+    LOGI("[PROF] ornekleyici hazir");
+}
+#else
+static void StartProfiler() {}
+#endif
+
 static void OnGameFrame(uintptr_t game) {
     ++g_TickGame; StageG("OnGameFrame");
+    const long long nowF = NowMs(); const long long prevF = g_LastFrameMs.exchange(nowF);
+    g_GameTid.store((int)syscall(__NR_gettid));
+    const long long gap = prevF ? nowF - prevF : 0;
     {   // silinen/satilan yayalari temizle (uzak REMOVE orig'i dogrudan cagirir; havuz nesnesi yeniden kullanilabilir)
         std::lock_guard<std::mutex> lk(g_Mu);
         for (size_t i = g_Walkers.size(); i-- > 0;) if (SlotIndexOfVehicle(game, g_Walkers[i].p) < 0) {
             if (g_LocalWalker == g_Walkers[i].p) g_LocalWalker = 0;
             g_Walkers.erase(g_Walkers.begin() + i);
         }
+    }
+    if (g_PostSpawnFrames > 0 && g_LocalWalker) {                              // dogustan sonraki kareler: sure/konum/hiz/NaN izi
+        --g_PostSpawnFrames; float x = 0, y = 0, a = 0, vx = 0, vy = 0;
+        if (BodyPose(g_LocalWalker, &x, &y, &a)) { const uintptr_t b = *(uintptr_t*)(g_LocalWalker + V_PHYS_BODY); vx = *(float*)(b + B_VX); vy = *(float*)(b + B_VY); }
+        LOGI("[WALKER] kare+%d gap=%lld ms pos=(%.2f,%.2f) aci=%.3f vel=(%.2f,%.2f) sonlu=%d aktif=%u sayi=%u", 20 - g_PostSpawnFrames, gap, x, y, a, vx, vy,
+             (int)(x == x && y == y && a == a && vx == vx && vy == vy), *(uint32_t*)(game + G_ACTIVE), VehicleCount(game));
+    }
+    if (WK_AUTORECOVER && g_LocalWalker && gap > WK_SLOW_FRAME_MS) {          // yaya varken bir kare cok uzun surdu
+        LOGI("[WALKER] YAVAS KARE: %lld ms (esik %d) -> yaya kaldiriliyor, bu oturumda kapali", gap, (int)WK_SLOW_FRAME_MS);
+        g_Disabled = true; HardRemoveLocalWalker(game);
     }
     if (g_ReqExit)  { g_ReqExit = false;  DoExit(game); }
     if (g_ReqEnter) { g_ReqEnter = false; DoEnter(game, false); }
@@ -2576,7 +2705,8 @@ static void DrawImGui(uintptr_t game, const ImVec2& screen) {
     ImGui::Begin("##walker", nullptr, ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoScrollbar |
                  ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoFocusOnAppearing);
     const ImVec2 bs(screen.x * 0.15f, screen.y * 0.085f);
-    if (!onFoot) { if (!IsWalker(cur) && ImGui::Button("Exit Vehicle", bs)) g_ReqExit = true; }
+    if (g_Disabled) ImGui::TextUnformatted("Walker off (slow frame)");
+    else if (!onFoot) { if (!IsWalker(cur) && ImGui::Button("Exit Vehicle", bs)) g_ReqExit = true; }
     else {
         if (ImGui::Button("Enter Vehicle", bs)) g_ReqEnter = true;
         if (ImGui::Button(g_FirstPerson ? "Third Person" : "First Person", bs)) g_FirstPerson = !g_FirstPerson;
@@ -9400,6 +9530,13 @@ static void my_Map_updateFields(void* map, uint32_t f1, uint32_t f2, uint32_t f3
 }
 
 void my_GameUpdate(void* thiz, float param_1) {
+    // v4: Game::update'in param_1'i SANIYE cinsinden kare suresidir (this+0x58 ona toplanip 120/300 s ile karsilastiriliyor).
+    // Oyun bunu sinirlamiyor: tek bir uzun takilma, sonraki karelerin dt'sini de uzatip KALICI ~13 sn'lik karelere donusuyordu.
+    if (WK_MAX_DT_S > 0.0f && param_1 > WK_MAX_DT_S) {
+        static long long s_dl = 0; const long long nd = NowMs();
+        if (nd - s_dl > 2000) { s_dl = nd; LOGI("[WALKER] dt kelepcelendi: %.3f s -> %.3f s", (double)param_1, (double)WK_MAX_DT_S); }
+        param_1 = WK_MAX_DT_S;
+    }
     if (g_HUDInstance != 0) RepairShopClick((void*)g_HUDInstance, "gameUpdate");   // tiklama bu karede islenmeden once
     g_LastGameUpdateMs.store(NowMs());   // host canlilik sinyali icin (oyun dongusu donarsa ping kesilir)
     g_EngineInstance = (uintptr_t)thiz;
@@ -9745,7 +9882,7 @@ void* my_renderStartMenuMain(void* thiz, void* p1, void* p2, void* p3) {
 // ========================================================================
 __attribute__((constructor))
 void ModMain() {
-    LOGI(">>> MULTIPLAYER MOD STARTING <<< build=shopfix-36+walker-diag");
+    LOGI(">>> MULTIPLAYER MOD STARTING <<< build=shopfix-37+walker-v4");
 
     ResetVehicleSyncState();
     std::thread(StartPONGResponderThread).detach();
