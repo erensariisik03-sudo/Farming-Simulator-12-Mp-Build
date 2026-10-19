@@ -2138,10 +2138,10 @@ static const float    HITBOX_HX = 0.30f, HITBOX_HY = 0.25f;  // insan kutusu (ya
 #endif
 // --- desc yamalari: yaya icin kucuk hitbox ve alt-parca iptali varsayilan acik ---
 #ifndef WK_PATCH_HITBOX
-#define WK_PATCH_HITBOX 1      // yaya aracın büyük varsayılan çarpışma kutusunu kullanmasın
+#define WK_PATCH_HITBOX 0      // v6 GÜVENLI TEST: tekerleklerle uyumsuz kucuk sase fixture yamasini gecici kapat
 #endif
 #ifndef WK_PATCH_PARTS
-#define WK_PATCH_PARTS 1       // yaya nesnesinde temel aracın alt parça sayısını sıfırla
+#define WK_PATCH_PARTS 0       // v6 GÜVENLI TEST: VehicleDesc alanlarini degistirmeden orijinal parca sayisini koru
 #endif
 #ifndef WK_KEEP_WHEELS
 #define WK_KEEP_WHEELS 1       // 0: tekerlek sayisini 0 yap (Vehicle::updateAIState 0'a bolme riski)
@@ -9922,7 +9922,7 @@ void* my_renderStartMenuMain(void* thiz, void* p1, void* p2, void* p3) {
 // ========================================================================
 __attribute__((constructor))
 void ModMain() {
-    LOGI(">>> MULTIPLAYER MOD STARTING <<< build=shopfix-38+walker-v5");
+    LOGI(">>> MULTIPLAYER MOD STARTING <<< build=shopfix-38+walker-v6-safephysics");
 
     ResetVehicleSyncState();
     std::thread(StartPONGResponderThread).detach();
