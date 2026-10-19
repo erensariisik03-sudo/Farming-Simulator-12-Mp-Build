@@ -2118,10 +2118,10 @@ enum Part { P_TORSO, P_HEAD, P_ARM_L, P_ARM_R, P_LEG_L, P_LEG_R, P_COUNT };
 static const int      BASE_TYPE      = 0;      // [!] klonlanacak EntityManager::VEHICLES tipi (en kucuk / en sorunsuz arac)
 static const float    WALK_SPEED     = 2.2f;   // m/s
 static const float    TURN_RATE      = 3.0f;   // rad/s
-static const float    TURN_SIGN      = -1.0f;  // ters yon: geri viteste de input yonunu asagida ayri ele al
+static const float    TURN_SIGN      = +1.0f;  // duzeltme: sol/sağ direksiyon işareti ters çevrildi
 static const float    ENTER_RADIUS   = 7.0f;   // uzak inis konumundan da araca tekrar binebilmek icin (m)
-static const float    EXIT_DIST      = 5.5f;   // inince aractan daha uzaga, yan tarafa koy (m)
-static const float    EXIT_SIDE      = 1.0f;   // varsayilan taraf; cikista taraf sirali denenir
+static const float    EXIT_DIST      = 3.8f;   // inince aracin YANINA (sag/sol, bos olan taraf) koyma mesafesi (m); hitbox yamasi kapaliysa 5.5 yapin
+static const float    EXIT_SIDE      = 1.0f;   // +1/-1: araci hangi yanindan inilir
 static const float    HITBOX_HX = 0.30f, HITBOX_HY = 0.25f;  // insan kutusu (yari kenar, m) [?: girdi duzeni]
 // --- v4: KARARLILIK ONLEMLERI (log bulgusu: yaya dogunca oyun kare basi ~13 sn ile calisti; Vehicle::update f1 = dt) ---
 #ifndef WK_MAX_DT_S
@@ -2138,13 +2138,13 @@ static const float    HITBOX_HX = 0.30f, HITBOX_HY = 0.25f;  // insan kutusu (ya
 #endif
 // --- desc yamalari: yaya icin kucuk hitbox ve alt-parca iptali varsayilan acik ---
 #ifndef WK_PATCH_HITBOX
-#define WK_PATCH_HITBOX 1      // v7: yalnizca kucuk fixture; tekerlek ve alt-parca tanimlari korunur
+#define WK_PATCH_HITBOX 1      // v7: yaya icin kucuk hitbox (tek kucuk kutu). Takilma tekrar ederse 0 yapin.
 #endif
 #ifndef WK_PATCH_PARTS
 #define WK_PATCH_PARTS 0       // v6 GÜVENLI TEST: VehicleDesc alanlarini degistirmeden orijinal parca sayisini koru
 #endif
 #ifndef WK_KEEP_WHEELS
-#define WK_KEEP_WHEELS 1       // 0: tekerlek sayisini 0 yap (Vehicle::updateAIState 0'a bolme riski)
+#define WK_KEEP_WHEELS 0       // v7: tekerlek yok (tekerlek govdeleri de cakisma kutusu yapiyordu; decompile: tekerlek sayisi sadece for-dongulerinde). Sorun olursa 1.
 #endif
 static const bool PATCH_HITBOX = WK_PATCH_HITBOX != 0, PATCH_PARTS = WK_PATCH_PARTS != 0, KEEP_WHEELS = WK_KEEP_WHEELS != 0;
 static const bool     DEBUG_INPUT    = true;   // Vehicle::update'in 3 float'ini logcat'e basar
@@ -2198,6 +2198,8 @@ static std::atomic<long long> g_LastFrameMs(0);   // OnGameFrame'in son calisma 
 static std::atomic<int>       g_GameTid(0);       // oyun thread'inin tid'i
 static bool g_Disabled = false;                    // otomatik kurtarma sonrasi: bu oturumda yaya kapali
 static int  g_PostSpawnFrames = 0;                 // dogustan sonra ayrintili kare logu sayaci
+static float g_FpCam[16]; static volatile uint32_t g_FpStamp = 0;   // v7: son yazilan birinci sahis kamera matrisi (kesme duzeltmesi icin)
+static void AddLook(float dYaw, float dPitch);                     // asagida tanimli
 static uint32_t* g_Mesh[P_COUNT];              // oyunun IndexedTriangleMesh nesnesi: P[0]=vertexBuf, P[1]=indexBuf [D: enqueueRender]
 static uint32_t  g_TexObj[4] = {0, 0, 0, 0};   // Texture nesnesi = 4 bayt (GL handle) [D: EntityManager'da Texture dizisi 4'er bayt]
 
@@ -2430,11 +2432,29 @@ static void DoExit(uintptr_t game) {
     if (g_Disabled || !cur || IsWalker(cur) || g_LocalWalker || VehicleCount(game) >= 30) return;
     float x, y, a; if (!BodyPose(cur, &x, &y, &a)) return;
     LOGI("[WALKER] DoExit: arac pozu x=%.2f y=%.2f a=%.3f", x, y, a);
-    // [!] yon sozlesmesi: yanal = (-sin a, cos a) varsayildi; EXIT_SIDE ile yan degistirilir
-    static int s_exitSide = 1;
-    s_exitSide = -s_exitSide; // her iniste karsi tarafi tercih et; bos alan sorgusu henuz dogrulanmadi
-    const float px = x - sinf(a) * EXIT_DIST * (float)s_exitSide, py = y + cosf(a) * EXIT_DIST * (float)s_exitSide;
-    // Not: bu surum iki tarafi sirayla dener; Box2D QueryAABB bos-alan testi henuz baglanmadi.
+    // v7: ARACIN YANINA in (on/arka degil). Yon, govde matrisinin ileri ekseninden (M[8],M[10]) bulunur -> aci sozlesmesinden bagimsiz.
+    // Sag ve sol aday noktalardan, diger araclara/yayalara daha uzak (= bos) olan secilir; esitse EXIT_SIDE tercihi.
+    float lx = 0.f, ly = 1.f;
+    {
+        const float* CM = (const float*)(cur + V_BODY_MAT);
+        float fx = CM[8], fy = CM[10]; const float fl = sqrtf(fx * fx + fy * fy);
+        if (fl > 1e-4f) { fx /= fl; fy /= fl; lx = -fy; ly = fx; } else { lx = -sinf(a); ly = cosf(a); }
+    }
+    const float cxA = x + lx * EXIT_DIST, cyA = y + ly * EXIT_DIST;              // aday A
+    const float cxB = x - lx * EXIT_DIST, cyB = y - ly * EXIT_DIST;              // aday B
+    float freeA = 1e9f, freeB = 1e9f;
+    for (uint32_t i = 0; i < VehicleCount(game); ++i) {
+        const uintptr_t v = RawVehicleSlot(game, i); if (!v || v == cur) continue;
+        float ox, oy, oa; if (!BodyPose(v, &ox, &oy, &oa)) continue;
+        const float dA = sqrtf((ox - cxA) * (ox - cxA) + (oy - cyA) * (oy - cyA));
+        const float dB = sqrtf((ox - cxB) * (ox - cxB) + (oy - cyB) * (oy - cyB));
+        if (dA < freeA) freeA = dA;
+        if (dB < freeB) freeB = dB;
+    }
+    bool useA = (EXIT_SIDE >= 0.f);
+    if (freeA > freeB + 1.0f) useA = true; else if (freeB > freeA + 1.0f) useA = false;
+    const float px = useA ? cxA : cxB, py = useA ? cyA : cyB;
+    LOGI("[WALKER] DoExit: yan secimi A=(%.1f,%.1f) bos=%.1f B=(%.1f,%.1f) bos=%.1f -> %s", cxA, cyA, freeA, cxB, cyB, freeB, useA ? "A" : "B");
     const float pos[3] = {px, 0.0f, py};                                       // Vector3(x, yukseklik, fizik-y) [D][K]
     uint32_t ab; memcpy(&ab, &a, 4);
     StageG("DoExit:SpawnWalker");
@@ -2497,8 +2517,9 @@ static void AfterVehicleUpdate(uintptr_t self, uint32_t ua, uint32_t ub, uint32_
     const float* M = (const float*)(self + V_BODY_MAT);
     float fx = M[8], fy = M[10]; const float fl = sqrtf(fx * fx + fy * fy);
     if (fl > 1e-4f) { fx /= fl; fy /= fl; } else { fx = 1.f; fy = 0.f; }
-    const float reverseTurn = (throttle < -0.05f) ? -1.0f : 1.0f;
-    SetRemoteBodyVelocity(body, fx * throttle * WALK_SPEED, fy * throttle * WALK_SPEED, TURN_SIGN * steer * TURN_RATE * reverseTurn);   // geri yururken yon terslemesini telafi et
+    // v7: geri giderken sag/sol ters calisiyordu -> geri (gaz < 0) iken donus yonu tersine cevrilir (arac gibi degil, "dogal" yon)
+    const float revSign = (throttle < -0.05f) ? -1.0f : 1.0f;
+    SetRemoteBodyVelocity(body, fx * throttle * WALK_SPEED, fy * throttle * WALK_SPEED, TURN_SIGN * revSign * steer * TURN_RATE);   // [K] uyandirma dahil
     if (g_FirstPerson) {                                                       // kamera dunya matrisi: oyun daha sonra bunun tersini view matrisi yapar
         M4 B; memcpy(B.m, M, 64);
         // Vehicle::update, araç model matrisini açı-PI ile kurar; kamera normalde -Z yönüne bakar.
@@ -2506,6 +2527,93 @@ static void AfterVehicleUpdate(uintptr_t self, uint32_t ua, uint32_t ub, uint32_
         const float pi = 3.14159265358979323846f;
         M4 cam = Mul(Mul(Mul(B, Tr(0, EYE_HEIGHT, 0)), RY(pi + g_HeadYaw)), RX(g_HeadPitch));
         memcpy((void*)(self + V_CAM_WORLD), cam.m, 64);
+        memcpy(g_FpCam, cam.m, 64); g_FpStamp = g_TickGame;                    // v7: RenderArgs::update kancasi (kesme duzeltmesi) bunu tanir
+    }
+}
+
+// ------------------------------- v7: BIRINCI SAHIS GORUS KESME (CULL) DUZELTMESI -------------------------------
+// Bulgu (decompile): Game::updateStateBase -> RenderArgs::update(view, camWorld) kamera ustunden yer duzlemindeki "gorunur taban" alanini
+// hesaplar (RenderArgs+0xC4..: kamera frustumunun yer ile kesisimi; Map::cullScene arazi/nesne hucrelerini buna gore secer).
+// Yatay bakan birinci sahis kamerasinda ust isin yere hic inmez -> taban alani cokup ILERISI HIC OLUSTURULMAZ.
+// Cozum: sadece KESME icin ayni yonde, yukarida ve geride, asagi bakan sanal bir kamera verilir; cizim gorunumu (aMStack_98) degismez.
+#ifndef WK_FP_CULLFIX
+#define WK_FP_CULLFIX 1
+#endif
+#ifndef WK_FP_CULL_UP
+#define WK_FP_CULL_UP 35.0f       // sanal kamera yuksekligi (m)
+#endif
+#ifndef WK_FP_CULL_BACK
+#define WK_FP_CULL_BACK 22.0f     // sanal kamera geriye kaydirma (m)
+#endif
+#ifndef WK_FP_CULL_PITCH
+#define WK_FP_CULL_PITCH 0.80f    // asagi bakis acisi (rad, ~46 derece)
+#endif
+typedef void (*RAUpdate_t)(void*, const float*, const float*);
+static RAUpdate_t orig_RAUpdate = nullptr;
+static bool AffineInverse(const float* m, float* o) {                          // kolon-major 3x4 afin matris tersi (alt satir 0,0,0,1)
+    const float a = m[0], b = m[4], c = m[8], d = m[1], e = m[5], f = m[9], g = m[2], h = m[6], i = m[10];
+    const float det = a * (e * i - f * h) - b * (d * i - f * g) + c * (d * h - e * g);
+    if (!(fabsf(det) > 1e-9f)) return false;
+    const float id = 1.0f / det;
+    const float r00 = (e * i - f * h) * id, r01 = (c * h - b * i) * id, r02 = (b * f - c * e) * id;
+    const float r10 = (f * g - d * i) * id, r11 = (a * i - c * g) * id, r12 = (c * d - a * f) * id;
+    const float r20 = (d * h - e * g) * id, r21 = (b * g - a * h) * id, r22 = (a * e - b * d) * id;
+    const float tx = m[12], ty = m[13], tz = m[14];
+    memset(o, 0, 64);
+    o[0] = r00; o[4] = r01; o[8] = r02;  o[12] = -(r00 * tx + r01 * ty + r02 * tz);
+    o[1] = r10; o[5] = r11; o[9] = r12;  o[13] = -(r10 * tx + r11 * ty + r12 * tz);
+    o[2] = r20; o[6] = r21; o[10] = r22; o[14] = -(r20 * tx + r21 * ty + r22 * tz);
+    o[15] = 1.0f;
+    return true;
+}
+static void my_RAUpdate(void* self, const float* view, const float* cam) {
+    if (WK_FP_CULLFIX && g_FirstPerson && g_LocalWalker && cam && (uint32_t)(g_TickGame - g_FpStamp) <= 3 && memcmp(cam, g_FpCam, 64) == 0) {
+        M4 C; memcpy(C.m, cam, 64);
+        const M4 base = Mul(C, Tr(0, WK_FP_CULL_UP, WK_FP_CULL_BACK));
+        const M4 c1 = Mul(base, RX(-WK_FP_CULL_PITCH)), c2 = Mul(base, RX(+WK_FP_CULL_PITCH));
+        const M4& cv = (c1.m[9] >= c2.m[9]) ? c1 : c2;                         // bakis ekseni (-Z) asagi gosteren aday: dunya y'si azalan = m[9] buyuk
+        float inv[16];
+        if (AffineInverse(cv.m, inv)) {
+            static int s_n = 0; if (s_n < 3) { ++s_n; LOGI("[WALKER] kesme kamerasi aktif: konum=(%.1f,%.1f,%.1f) bakis.y=%.2f (gercek kamera y=%.1f)", cv.m[12], cv.m[13], cv.m[14], -cv.m[9], cam[13]); }
+            orig_RAUpdate(self, inv, cv.m);
+            return;
+        }
+    }
+    orig_RAUpdate(self, view, cam);
+}
+
+// ------------------------------- v7: BIRINCI SAHIS BAKIS (DOKUNMA SURUKLEME) -------------------------------
+// Ekranin ortasindaki bolgede (sol joystick, sag gaz surgusu ve alt dugmelerin disinda) parmak surukleyince kafa doner.
+// Oyuna giden olay YUTULMAZ; sadece ek bir parmak/surukleme izlenir.
+#ifndef WK_LOOK_YAW_SIGN
+#define WK_LOOK_YAW_SIGN (-1.0f)     // yatay yon ters ise +1
+#endif
+#ifndef WK_LOOK_PITCH_SIGN
+#define WK_LOOK_PITCH_SIGN (-1.0f)   // dikey yon ters ise +1
+#endif
+static void TouchLook(const AInputEvent* ev, int32_t rawAction, float W, float H) {
+    static int s_id = -1; static float s_lx = 0, s_ly = 0;
+    if (!g_FirstPerson || !g_LocalWalker || W < 100.f || H < 100.f) { s_id = -1; return; }
+    const int32_t act = rawAction & AMOTION_EVENT_ACTION_MASK;
+    const size_t n = AMotionEvent_getPointerCount(ev);
+    if (act == AMOTION_EVENT_ACTION_DOWN || act == AMOTION_EVENT_ACTION_POINTER_DOWN) {
+        const size_t pi = (act == AMOTION_EVENT_ACTION_DOWN) ? 0 : (size_t)((rawAction & AMOTION_EVENT_ACTION_POINTER_INDEX_MASK) >> AMOTION_EVENT_ACTION_POINTER_INDEX_SHIFT);
+        if (pi < n && s_id < 0) {
+            const float x = AMotionEvent_getX(ev, pi), y = AMotionEvent_getY(ev, pi);
+            if (x > W * 0.30f && x < W * 0.86f && y > H * 0.14f && y < H * 0.76f) { s_id = AMotionEvent_getPointerId(ev, pi); s_lx = x; s_ly = y; }
+        }
+    } else if (act == AMOTION_EVENT_ACTION_MOVE) {
+        for (size_t i = 0; i < n; ++i) if (s_id >= 0 && AMotionEvent_getPointerId(ev, i) == s_id) {
+            const float x = AMotionEvent_getX(ev, i), y = AMotionEvent_getY(ev, i);
+            const float k = 3.2f / W;                                          // ekran genisligi ~ 3.2 rad
+            AddLook(WK_LOOK_YAW_SIGN * (x - s_lx) * k, WK_LOOK_PITCH_SIGN * (y - s_ly) * k);
+            s_lx = x; s_ly = y;
+        }
+    } else if (act == AMOTION_EVENT_ACTION_UP || act == AMOTION_EVENT_ACTION_CANCEL) {
+        s_id = -1;
+    } else if (act == AMOTION_EVENT_ACTION_POINTER_UP) {
+        const size_t pi = (size_t)((rawAction & AMOTION_EVENT_ACTION_POINTER_INDEX_MASK) >> AMOTION_EVENT_ACTION_POINTER_INDEX_SHIFT);
+        if (pi < n && AMotionEvent_getPointerId(ev, pi) == s_id) s_id = -1;
     }
 }
 
@@ -2553,7 +2661,8 @@ static void DrawWalker(uintptr_t self, void* dev) {
     StageR("DrawWalker:bindTex");
     fnBind(dev, g_TexObj[0], 0);                                               // katman 0 = diffuse [D: bindTextureLayer 3. arguman]
     StageR("DrawWalker:parcalar");
-    for (int i = 0; i < P_COUNT; ++i) if (g_Mesh[i]) fnDraw(dev, mats[i].m, g_Mesh[i][0], g_Mesh[i][1]);
+    const bool hideHead = mine && g_FirstPerson;                                // v7: birinci sahista kafa kameranin onunu kapatmasin
+    for (int i = 0; i < P_COUNT; ++i) if (g_Mesh[i] && !(hideHead && i == P_HEAD)) fnDraw(dev, mats[i].m, g_Mesh[i][0], g_Mesh[i][1]);
     StageR("DrawWalker:bitti");
 }
 static void my_VehRender(void* self, void* ra, void* dev, uint32_t p3) {
@@ -2598,6 +2707,8 @@ static void Init(void* appLib) {
         {"Vehicle::enqueueRenderUVScroll",    "_ZN7Vehicle21enqueueRenderUVScrollE",    (void*)my_VehUV,     (void**)&orig_VehUV},
         {"Vehicle::enqueueRenderEnvMap",      "_ZN7Vehicle19enqueueRenderEnvMapE",      (void*)my_VehEnv,    (void**)&orig_VehEnv},
         {"Vehicle::enqueueRenderEmissive",    "_ZN7Vehicle21enqueueRenderEmissiveE",    (void*)my_VehEmis,   (void**)&orig_VehEmis},
+        // v7: birinci sahis gorus kesme duzeltmesi (RenderArgs::update tek yerden, Game::updateStateBase'ten cagriliyor)
+        {"RenderArgs::update",                "_ZN10RenderArgs6updateE",                (void*)my_RAUpdate,  (void**)&orig_RAUpdate},
     };
     StartProfiler();
     for (size_t i = 0; i < sizeof(hooks) / sizeof(hooks[0]); ++i) {
@@ -2674,6 +2785,20 @@ static void StartProfiler() {
 static void StartProfiler() {}
 #endif
 
+// v7: oyuncu oyunun kendi arac degistirme dugmesiyle (veya baska yolla) bir ARACA gectiyse yaya geride kalmasin: yayayi sil (REMOVE yayinlanir),
+// aktif araci degistirme. Tekrar "Exit Vehicle" yeni bir yaya olusturur.
+static void RemoveWalkerKeepActive(uintptr_t game, uintptr_t w) {
+    const uintptr_t act = LocalActiveVehiclePtr(game);
+    const int wi = SlotIndexOfVehicle(game, w);
+    if (wi >= 0) {
+        my_Game_removeVehicle((void*)game, (uint32_t)wi);                      // REMOVE olayini yayinlar, sonra orijinali cagirir
+        if (g_VehicleDestroyFn) g_VehicleDestroyFn((void*)w);
+    }
+    OnVehicleRemoved(w);
+    if (act && act != w) { const int ai = SlotIndexOfVehicle(game, act); if (ai >= 0) *(uint32_t*)(game + G_ACTIVE) = (uint32_t)ai; }   // dizi kaydi: indeksi yeniden hesapla
+    LOGI("[WALKER] araca binildi -> yaya silindi (aktif arac=%p)", (void*)act);
+}
+
 static void OnGameFrame(uintptr_t game) {
     ++g_TickGame; StageG("OnGameFrame");
     const long long nowF = NowMs(); const long long prevF = g_LastFrameMs.exchange(nowF);
@@ -2695,6 +2820,14 @@ static void OnGameFrame(uintptr_t game) {
     if (WK_AUTORECOVER && g_LocalWalker && gap > WK_SLOW_FRAME_MS) {          // yaya varken bir kare cok uzun surdu
         LOGI("[WALKER] YAVAS KARE: %lld ms (esik %d) -> yaya kaldiriliyor, bu oturumda kapali", gap, (int)WK_SLOW_FRAME_MS);
         g_Disabled = true; HardRemoveLocalWalker(game);
+    }
+    {   // v7: yaya varken aktif arac yaya degilse (arac degistirme dugmesi vb.) yayayi kaldir
+        static int s_notActive = 0;
+        if (g_LocalWalker) {
+            const uintptr_t act = LocalActiveVehiclePtr(game);
+            if (act && act != g_LocalWalker) { if (++s_notActive >= 3) { s_notActive = 0; RemoveWalkerKeepActive(game, g_LocalWalker); } }
+            else s_notActive = 0;
+        } else s_notActive = 0;
     }
     if (g_ReqExit)  { g_ReqExit = false;  DoExit(game); }
     if (g_ReqEnter) { g_ReqEnter = false; DoEnter(game, false); }
@@ -2725,15 +2858,6 @@ static void DrawImGui(uintptr_t game, const ImVec2& screen) {
     else {
         if (ImGui::Button("Enter Vehicle", bs)) g_ReqEnter = true;
         if (ImGui::Button(g_FirstPerson ? "Third Person" : "First Person", bs)) g_FirstPerson = !g_FirstPerson;
-        if (g_FirstPerson) {
-            ImGui::TextUnformatted("Drag below to look");
-            const ImVec2 lookSize(screen.x * 0.18f, screen.y * 0.22f);
-            ImGui::InvisibleButton("##walker_look_area", lookSize);
-            if (ImGui::IsItemActive() && ImGui::IsMouseDown(0)) {
-                const ImVec2 d = ImGui::GetIO().MouseDelta;
-                AddLook(-d.x * 0.008f, -d.y * 0.008f);
-            }
-        }
     }
     ImGui::End();
     // TODO: dokunusun alttaki oyun HUD'una da gecmesini engelleyin (sohbet HUD dugmenizdeki "press armed" mantigi gibi) [!]
@@ -8046,6 +8170,10 @@ int32_t my_AInputQueue_getEvent(void* queue, AInputEvent** outEvent) {
                     continue;
                 }
 
+                if (g_ImGuiInitialized && ImGui::GetCurrentContext() != nullptr && WK::g_FirstPerson && WK::g_LocalWalker) {
+                    const ImVec2 ds = ImGui::GetIO().DisplaySize;               // v7: birinci sahis kafa cevirme (surukleme)
+                    WK::TouchLook(*outEvent, AMotionEvent_getAction(*outEvent), ds.x, ds.y);
+                }
                 size_t pointerCount = AMotionEvent_getPointerCount(*outEvent);
                 if (pointerCount > 0) {
                     if (action == AMOTION_EVENT_ACTION_DOWN) {
@@ -9934,7 +10062,7 @@ void* my_renderStartMenuMain(void* thiz, void* p1, void* p2, void* p3) {
 // ========================================================================
 __attribute__((constructor))
 void ModMain() {
-    LOGI(">>> MULTIPLAYER MOD STARTING <<< build=shopfix-38+walker-v7-controls-camera");
+    LOGI(">>> MULTIPLAYER MOD STARTING <<< build=shopfix-39+walker-v7");
 
     ResetVehicleSyncState();
     std::thread(StartPONGResponderThread).detach();
