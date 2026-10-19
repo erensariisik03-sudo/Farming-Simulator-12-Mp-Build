@@ -2122,7 +2122,7 @@ static const float    TURN_SIGN      = +1.0f;  // duzeltme: sol/sağ direksiyon 
 static const float    ENTER_RADIUS   = 7.0f;   // uzak inis konumundan da araca tekrar binebilmek icin (m)
 static const float    EXIT_DIST      = 3.8f;   // inince aracin YANINA (sag/sol, bos olan taraf) koyma mesafesi (m); hitbox yamasi kapaliysa 5.5 yapin
 static const float    EXIT_SIDE      = 1.0f;   // +1/-1: araci hangi yanindan inilir
-static const float    HITBOX_HX = 0.30f, HITBOX_HY = 0.25f;  // insan kutusu (yari kenar, m) [?: girdi duzeni]
+static const float    HITBOX_HX = 0.32f, HITBOX_HY = 0.32f;  // insan kutusu (YARI kenar, m); yuvarlakca: eksen sirasindan bagimsiz
 // --- v4: KARARLILIK ONLEMLERI (log bulgusu: yaya dogunca oyun kare basi ~13 sn ile calisti; Vehicle::update f1 = dt) ---
 #ifndef WK_MAX_DT_S
 #define WK_MAX_DT_S 0.25f      // Game::update dt kelepcesi (sn). 0 = kapali. Oyun dt'yi sinirlamiyor: tek takilma kalici uzun kareye doner.
@@ -2144,9 +2144,9 @@ static const float    HITBOX_HX = 0.30f, HITBOX_HY = 0.25f;  // insan kutusu (ya
 #define WK_PATCH_PARTS 0       // v6 GÜVENLI TEST: VehicleDesc alanlarini degistirmeden orijinal parca sayisini koru
 #endif
 #ifndef WK_KEEP_WHEELS
-#define WK_KEEP_WHEELS 1       // v7: tekerlek yok (tekerlek govdeleri de cakisma kutusu yapiyordu; decompile: tekerlek sayisi sadece for-dongulerinde). Sorun olursa 1.
+#define WK_KEEP_WHEELS 0       // v7: tekerlek yok (tekerlek govdeleri de cakisma kutusu yapiyordu; decompile: tekerlek sayisi sadece for-dongulerinde). Sorun olursa 1.
 #endif
-static const bool PATCH_HITBOX = WK_PATCH_HITBOX != 0, PATCH_PARTS = WK_PATCH_PARTS != 0, KEEP_WHEELS = WK_KEEP_WHEELS != 1;
+static const bool PATCH_HITBOX = WK_PATCH_HITBOX != 0, PATCH_PARTS = WK_PATCH_PARTS != 0, KEEP_WHEELS = WK_KEEP_WHEELS != 0;
 static const bool     DEBUG_INPUT    = true;   // Vehicle::update'in 3 float'ini logcat'e basar
 static const float    STRIDE         = 4.5f;   // yuruyus fazi (rad) = hiz(m/s) * STRIDE * dt
 // Insan iskeleti (tools/make_walker_assets.py olculeriyle BIREBIR; model degisirse ikisini birlikte guncelleyin)
@@ -2160,7 +2160,7 @@ static const uintptr_t G_ACTIVE = 0xA8, G_STATE = 0x64, G_ENTITYMGR = 0x708;    
 static const uintptr_t G_SYSDEV = 0x74, G_RENDERDEV = 0x78;                            // [D] Game::init'te EntityManager::init'e verilen aygitlar
 static const uintptr_t EM_DESC0 = 8, DESC_STRIDE = 0x22C;                              // [D] desc = em + 8 + tip*0x22C
 static const uintptr_t D_MESH_BODY = 0x1C, D_PART_COUNT = 0x44, D_WHEEL_COUNT = 0xC8;  // [D]
-static const uintptr_t D_FIX_COUNT = 0xE4, D_FIX_ARRAY = 0xE8;                         // [D] sayi/dizi; girdi = {cx,cy,hx,hy,angle,density} [?]
+static const uintptr_t D_FIX_COUNT = 0xE4, D_FIX_ARRAY = 0xE8;                         // [D] sayi/dizi; girdi = {hx,hy,cx,cy,angle,density} (EntityManager decompile: +0/+4 yari boyut, +8/+0xC merkez, +0x14 yogunluk)
 static const uintptr_t V_BODY_MAT = 0x18, V_BODY_MESH = 0x58, V_PHYS_BODY = 0x528;     // [D][K]
 static const uintptr_t V_CAM_WORLD = 0x4E0;                                            // [D] Game::updateStateBase bunu okur
 static const uintptr_t B_X = 0x0C, B_Y = 0x10, B_ANGLE = 0x40, B_VX = 0x44, B_VY = 0x48; // [K] b2Body (sizin kodunuzdaki duzen)
@@ -2399,8 +2399,12 @@ static uint32_t SpawnWalker(uintptr_t game, const float* pos3, uint32_t angleBit
     uint8_t* desc = (uint8_t*)(game + G_ENTITYMGR + EM_DESC0 + (uintptr_t)BASE_TYPE * DESC_STRIDE);
     uint8_t backup[DESC_STRIDE]; memcpy(backup, desc, DESC_STRIDE);
     if (PATCH_HITBOX) {                                                        // hitbox: tek kucuk kutu
+        float* fx = (float*)(desc + D_FIX_ARRAY);
+        { static bool s_dump = false; if (!s_dump) { s_dump = true; const uint32_t n0 = *(uint32_t*)(desc + D_FIX_COUNT);
+            LOGI("[WALKER] desc fixture sayisi=%u tekerlek=%u", n0, *(uint32_t*)(desc + D_WHEEL_COUNT));
+            for (uint32_t k = 0; k < n0 && k < 4; ++k) { const float* q = (const float*)(desc + D_FIX_ARRAY + k * 0x18); LOGI("[WALKER] desc fix[%u] = %.3f %.3f %.3f %.3f %.3f %.3f", k, q[0], q[1], q[2], q[3], q[4], q[5]); } }
         *(uint32_t*)(desc + D_FIX_COUNT) = 1;
-        float* fx = (float*)(desc + D_FIX_ARRAY); fx[0] = 0; fx[1] = 0; fx[2] = HITBOX_HX; fx[3] = HITBOX_HY; fx[4] = 0; fx[5] = 1.0f;
+        fx[0] = HITBOX_HX; fx[1] = HITBOX_HY; fx[2] = 0; fx[3] = 0; fx[4] = 0; fx[5] = 1.0f;   // {hx,hy,cx,cy,angle,density}: onceki yama hx/hy ile merkezi ters yazmisti -> alan 0 -> kutle 0 -> NaN
     }
     if (!KEEP_WHEELS) *(uint32_t*)(desc + D_WHEEL_COUNT) = 0;                  // tekerlek fizigi yok
     if (PATCH_PARTS)  *(uint32_t*)(desc + D_PART_COUNT) = 0;                   // alt parcalari biz cizeriz
@@ -10062,7 +10066,7 @@ void* my_renderStartMenuMain(void* thiz, void* p1, void* p2, void* p3) {
 // ========================================================================
 __attribute__((constructor))
 void ModMain() {
-    LOGI(">>> MULTIPLAYER MOD STARTING <<< build=shopfix-39+walker-v7");
+    LOGI(">>> MULTIPLAYER MOD STARTING <<< build=shopfix-40+walker-v7b");
 
     ResetVehicleSyncState();
     std::thread(StartPONGResponderThread).detach();
