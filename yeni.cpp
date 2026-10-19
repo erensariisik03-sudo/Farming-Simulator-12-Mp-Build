@@ -2587,6 +2587,12 @@ static void DrawImGui(uintptr_t game, const ImVec2& screen) {
 
 } // namespace WK
 
+// TANI + CANLI LOG yardimcilari WK icinde tanimli; dis kodun (my_GameUpdate, my_Vehicle_update, DrawImGui, ModMain) kullanabilmesi icin disari aciliyor
+namespace LL = WK::LL;
+using WK::StageG;
+using WK::StageR;
+using WK::TickRender;
+
 // ===== walker_module.inc sonu =====
 
 static void QueueTrailerPosition(uint32_t idx, uint32_t type, float x, float y, float angle, bool moving, bool tool = false) {
