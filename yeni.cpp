@@ -2164,6 +2164,109 @@ static bool  g_AssetsReady = false; static long long g_AssetsRetryMs = 0;
 static uint32_t* g_Mesh[P_COUNT];              // oyunun IndexedTriangleMesh nesnesi: P[0]=vertexBuf, P[1]=indexBuf [D: enqueueRender]
 static uint32_t  g_TexObj[4] = {0, 0, 0, 0};   // Texture nesnesi = 4 bayt (GL handle) [D: EntityManager'da Texture dizisi 4'er bayt]
 
+// ------------------------------- CANLI LOG PANELI (libmultiplayermod.so + libapp.so) -------------------------------
+// Ayni surecin logcat ciktisini (--pid) okuyup ekranda gosterir. Sol altta "LOG" dugmesi; filtre dugmesi: Hepsi / Mod / libapp.
+// Not: logcat kullanilamazsa panelde hata satiri gorunur (cihaz/ROM kisiti) -> adb ile alinan log gecerlidir.
+namespace LL {
+static std::mutex g_Mu;
+static std::vector<std::string> g_Lines;
+static bool g_Started = false, g_Open = false;
+static int g_Filter = 0;                      // 0 = hepsi, 1 = mod (MultiplayerMod/WALKER), 2 = libapp (NativeLog/FMOD/threaded_app)
+static const size_t kMax = 200;
+static void Push(const char* s) {
+    std::lock_guard<std::mutex> lk(g_Mu);
+    g_Lines.push_back(s);
+    if (g_Lines.size() > kMax) g_Lines.erase(g_Lines.begin(), g_Lines.begin() + (g_Lines.size() - kMax));
+}
+static void Reader() {
+    char cmd[128];
+    snprintf(cmd, sizeof cmd, "logcat -v brief --pid=%d 2>&1", (int)getpid());
+    for (int attempt = 0; attempt < 2; ++attempt) {
+        FILE* f = popen(cmd, "r");
+        if (!f) { Push("E/LL: logcat acilamadi (popen)"); return; }
+        char buf[512]; int n = 0;
+        while (fgets(buf, sizeof buf, f)) {
+            size_t l = strlen(buf); while (l && (buf[l - 1] == '\n' || buf[l - 1] == '\r')) buf[--l] = 0;
+            if (!l) continue;
+            ++n; Push(buf);
+        }
+        pclose(f);
+        if (n == 0) Push("W/LL: logcat bos dondu, 3 sn sonra yeniden denenecek");
+        else Push("W/LL: logcat akisi kapandi, yeniden baglaniliyor");
+        sleep(3);
+    }
+}
+static void Start() {
+    if (g_Started) return; g_Started = true;
+    std::thread(Reader).detach();
+}
+static bool Match(const std::string& s) {
+    if (g_Filter == 0) return true;
+    if (g_Filter == 1) return s.find("MultiplayerMod") != std::string::npos || s.find("WALKER") != std::string::npos;
+    return s.find("NativeLog") != std::string::npos || s.find("FMOD") != std::string::npos || s.find("threaded_app") != std::string::npos
+        || s.find("libapp") != std::string::npos;
+}
+static void Draw(const ImVec2& screen) {
+    ImGui::SetNextWindowPos(ImVec2(screen.x * 0.01f, screen.y * 0.99f), ImGuiCond_Always, ImVec2(0.0f, 1.0f));
+    ImGui::Begin("##llbtn", nullptr, ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoScrollbar |
+                 ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoFocusOnAppearing | ImGuiWindowFlags_NoBackground);
+    if (ImGui::Button(g_Open ? "LOG x" : "LOG", ImVec2(screen.x * 0.07f, screen.y * 0.06f))) g_Open = !g_Open;
+    ImGui::End();
+    if (!g_Open) return;
+    ImGui::SetNextWindowPos(ImVec2(screen.x * 0.01f, screen.y * 0.02f), ImGuiCond_Always);
+    ImGui::SetNextWindowSize(ImVec2(screen.x * 0.62f, screen.y * 0.78f), ImGuiCond_Always);
+    ImGui::SetNextWindowBgAlpha(0.65f);
+    ImGui::Begin("##llwin", nullptr, ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoCollapse |
+                 ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoFocusOnAppearing);
+    static const char* kNames[3] = { "Filtre: Hepsi", "Filtre: Mod (MultiplayerMod/WALKER)", "Filtre: libapp" };
+    if (ImGui::Button(kNames[g_Filter])) g_Filter = (g_Filter + 1) % 3;
+    ImGui::SameLine();
+    if (ImGui::Button("Temizle")) { std::lock_guard<std::mutex> lk(g_Mu); g_Lines.clear(); }
+    ImGui::Separator();
+    ImGui::BeginChild("##llscroll", ImVec2(0, 0), false);
+    ImGui::PushTextWrapPos(0.0f);
+    {
+        std::lock_guard<std::mutex> lk(g_Mu);
+        for (size_t i = 0; i < g_Lines.size(); ++i) {
+            const std::string& s = g_Lines[i];
+            if (!Match(s)) continue;
+            ImVec4 col(0.85f, 0.85f, 0.85f, 1.0f);
+            if (s.find("WATCHDOG") != std::string::npos || (s.size() > 1 && s[0] == 'E' && s[1] == '/')) col = ImVec4(1.0f, 0.35f, 0.35f, 1.0f);
+            else if (s.find("WALKER") != std::string::npos) col = ImVec4(0.4f, 0.9f, 1.0f, 1.0f);
+            else if (s.size() > 1 && s[0] == 'W' && s[1] == '/') col = ImVec4(1.0f, 0.85f, 0.3f, 1.0f);
+            else if (s.find("MultiplayerMod") != std::string::npos) col = ImVec4(0.6f, 1.0f, 0.6f, 1.0f);
+            ImGui::TextColored(col, "%s", s.c_str());
+        }
+    }
+    ImGui::PopTextWrapPos();
+    if (ImGui::GetScrollY() >= ImGui::GetScrollMaxY() - 4.0f) ImGui::SetScrollHereY(1.0f);   // sondaysa otomatik kay
+    ImGui::EndChild();
+    ImGui::End();
+}
+} // namespace LL
+
+// ------------------------------- TANI: TAKILMA IZLEYICISI -------------------------------
+// Oyun ya da cizim thread'i 2 sn'den uzun takilirsa logcat'e "son asama" yazar: donmanin NEREDE oldugunu gosterir.
+//   logcat: adb logcat -d | Select-String "WALKER|MultiplayerMod"
+static const char* volatile g_StageGame = "-";
+static const char* volatile g_StageRender = "-";
+static volatile uint32_t g_TickGame = 0, g_TickRender = 0;
+static inline void StageG(const char* s) { g_StageGame = s; }
+static inline void StageR(const char* s) { g_StageRender = s; }
+static inline void TickRender() { g_TickRender = g_TickRender + 1; }
+static void WatchdogThread() {
+    uint32_t lastG = 0, lastR = 0; int stG = 0, stR = 0;
+    for (;;) {
+        usleep(1000000);
+        const uint32_t g = g_TickGame, r = g_TickRender;
+        if (g != 0 && g == lastG) ++stG; else stG = 0;
+        if (r != 0 && r == lastR) ++stR; else stR = 0;
+        lastG = g; lastR = r;
+        if (stG >= 2 && (stG % 3) == 2) LOGI("[WALKER][WATCHDOG] OYUN thread'i %d sn takildi. son asama=%s", stG, g_StageGame);
+        if (stR >= 2 && (stR % 3) == 2) LOGI("[WALKER][WATCHDOG] CIZIM (ImGui) thread'i %d sn takildi. son asama=%s", stR, g_StageRender);
+    }
+}
+
 // ------------------------------- SEMBOL TIPLERI -------------------------------
 // DUZELTME: IndexedTriangleMesh::load bir UYE fonksiyondur: ilk arguman 'this' = 8 baytlik {vertexBuf, indexBuf} nesnesi [D: libapp_so.c 5962, 23546].
 typedef void*    (*MeshLoad_t)(void* self, const char* path, void* sys, void* dev);                       // IndexedTriangleMesh::load(this, const char*, SysDev*, RenderDev*) [D]
@@ -2212,7 +2315,9 @@ static bool BodyPose(uintptr_t veh, float* x, float* y, float* a) {
 static void SetActiveByPtr(uintptr_t game, uintptr_t veh) {
     const int idx = SlotIndexOfVehicle(game, veh); if (idx < 0) return;
     *(uint32_t*)(game + G_ACTIVE) = (uint32_t)idx;                    // [D] Game::buyItem de boyle yapiyor
+    StageG("SetActive:activeVehicleChanged");
     if (fnActiveChanged) fnActiveChanged((void*)game);                // ses + kamera durumu [D]
+    StageG("SetActive:bitti");
 }
 
 // ------------------------------- VARLIKLAR (GL thread'inde) -------------------------------
@@ -2258,7 +2363,10 @@ static uint32_t SpawnWalker(uintptr_t game, const float* pos3, uint32_t angleBit
     float* fx = (float*)(desc + D_FIX_ARRAY); fx[0] = 0; fx[1] = 0; fx[2] = HITBOX_HX; fx[3] = HITBOX_HY; fx[4] = 0; fx[5] = 1.0f;
     if (!KEEP_WHEELS) *(uint32_t*)(desc + D_WHEEL_COUNT) = 0;                  // tekerlek fizigi yok
     *(uint32_t*)(desc + D_PART_COUNT) = 0;                                     // alt parcalari biz cizeriz
+    StageG("SpawnWalker:addVehicle");
+    LOGI("[WALKER] SpawnWalker: addVehicle pos=(%.2f,%.2f,%.2f) baseType=%d", pos3[0], pos3[1], pos3[2], (int)BASE_TYPE);
     const uint32_t idx = orig_Game_addVehicle((void*)game, BASE_TYPE, pos3, angleBits, 0);
+    StageG("SpawnWalker:addVehicle-bitti");
     memcpy(desc, backup, DESC_STRIDE);                                         // temel arac bozulmasin
     if (idx >= VehicleCount(game)) return idx;
     const uintptr_t veh = RawVehicleSlot(game, idx);
@@ -2274,18 +2382,26 @@ static uint32_t AddVehicleForNet(void* game, int type, const float* pos, uint32_
 
 // ------------------------------- IN / BIN (OYUN thread'i) -------------------------------
 static void DoExit(uintptr_t game) {
+    StageG("DoExit:basla");
     const uintptr_t cur = LocalActiveVehiclePtr(game);
+    LOGI("[WALKER] DoExit: cur=%p walker=%d localWalker=%p count=%u", (void*)cur, (int)(cur && IsWalker(cur)), (void*)g_LocalWalker, VehicleCount(game));
     if (!cur || IsWalker(cur) || g_LocalWalker || VehicleCount(game) >= 30) return;
     float x, y, a; if (!BodyPose(cur, &x, &y, &a)) return;
+    LOGI("[WALKER] DoExit: arac pozu x=%.2f y=%.2f a=%.3f", x, y, a);
     // [!] yon sozlesmesi: yanal = (-sin a, cos a) varsayildi; EXIT_SIDE ile yan degistirilir
     const float px = x - sinf(a) * EXIT_DIST * EXIT_SIDE, py = y + cosf(a) * EXIT_DIST * EXIT_SIDE;
     // TODO: Game::buyItem'daki b2World::QueryAABB bos-alan taramasi ile cakisma kontrolu
     const float pos[3] = {px, 0.0f, py};                                       // Vector3(x, yukseklik, fizik-y) [D][K]
     uint32_t ab; memcpy(&ab, &a, 4);
+    StageG("DoExit:SpawnWalker");
     const uint32_t idx = SpawnWalker(game, pos, ab, true);
+    LOGI("[WALKER] DoExit: SpawnWalker idx=%u (count=%u)", idx, VehicleCount(game));
     if (idx >= VehicleCount(game)) return;
     g_LastVehicle = cur; g_HeadYaw = g_HeadPitch = 0;
+    StageG("DoExit:SetActive");
     SetActiveByPtr(game, RawVehicleSlot(game, idx));                           // MP yayini: DetectNewLocalVehicles netId atar ve duyurur [K]
+    StageG("DoExit:bitti");
+    LOGI("[WALKER] DoExit: tamam");
 }
 static void DoEnter(uintptr_t game, bool ignoreRadius) {
     if (!g_LocalWalker || LocalActiveVehiclePtr(game) != g_LocalWalker) return;
@@ -2317,8 +2433,22 @@ static void AfterVehicleUpdate(uintptr_t self, uint32_t ua, uint32_t ub, uint32_
     const float f1 = BitsToFloat(ua), f2 = BitsToFloat(ub), f3 = BitsToFloat(uc);
     static long long s_log = 0; const long long now = NowMs();
     if (DEBUG_INPUT && (fabsf(f2) + fabsf(f3) > 0.05f) && now - s_log > 500) { s_log = now; LOGI("[WALKER] update girdi f1=%.3f f2=%.3f f3=%.3f", f1, f2, f3); }
-    const float steer = f2, throttle = f3;                                     // [!] teyit edilecek
+    StageG("AfterVehicleUpdate");
+    // TANI: girdi tahmini yanlis olabilir -> NaN/dev deger Box2D'yi bozmasin: sonlu degilse 0, aralik [-1,1]
+    float steer = f2, throttle = f3;                                           // [!] teyit edilecek
+    if (!(steer == steer) || !(throttle == throttle) || fabsf(steer) > 1e6f || fabsf(throttle) > 1e6f) { steer = 0; throttle = 0; }
+    if (steer > 1.f) steer = 1.f; if (steer < -1.f) steer = -1.f;
+    if (throttle > 1.f) throttle = 1.f; if (throttle < -1.f) throttle = -1.f;
     const uintptr_t body = *(uintptr_t*)(self + V_PHYS_BODY); if (!body) return;
+    {   // TANI: saniyede bir yaya durumu
+        static long long s_st = 0;
+        if (now - s_st > 1000) {
+            s_st = now;
+            LOGI("[WALKER] durum x=%.2f y=%.2f vx=%.2f vy=%.2f ang=%.2f | f1=%.3f f2=%.3f f3=%.3f -> steer=%.2f thr=%.2f fp=%d",
+                 *(float*)(body + B_X), *(float*)(body + B_Y), *(float*)(body + B_VX), *(float*)(body + B_VY), *(float*)(body + B_ANGLE),
+                 f1, f2, f3, steer, throttle, (int)g_FirstPerson);
+        }
+    }
     // ileri yon = govde matrisinin model +z ekseni (fizik duzlemine (x,z) olarak izdusum) -> acisal sozlesmeden bagimsiz
     const float* M = (const float*)(self + V_BODY_MAT);
     float fx = M[8], fy = M[10]; const float fl = sqrtf(fx * fx + fy * fy);
@@ -2334,6 +2464,8 @@ static void AfterVehicleUpdate(uintptr_t self, uint32_t ua, uint32_t ub, uint32_
 // ------------------------------- CIZIM -------------------------------
 static void DrawWalker(uintptr_t self, void* dev) {
     if (!g_AssetsReady || !fnDraw || !fnBind) return;                          // hazir degilse hicbir sey cizme (temel arac gorunmesin)
+    StageR("DrawWalker:basla");
+    { static int s_n = 0; if (s_n < 3) { ++s_n; LOGI("[WALKER] DrawWalker #%d self=%p dev=%p", s_n, (void*)self, dev); } }
     const uintptr_t body = *(uintptr_t*)(self + V_PHYS_BODY);
     float speed = 0; if (body) { const float vx = *(float*)(body + B_VX), vy = *(float*)(body + B_VY); speed = sqrtf(vx * vx + vy * vy); }
     float ph = 0, amp = 0;
@@ -2356,11 +2488,15 @@ static void DrawWalker(uintptr_t self, void* dev) {
     mats[P_ARM_L] = AroundPivot(B, RIG_SH_L,  RX(-sw * 0.4f)); mats[P_ARM_R] = AroundPivot(B, RIG_SH_R, RX(+sw * 0.4f));
     const bool mine = (self == g_LocalWalker);
     mats[P_HEAD] = AroundPivot(B, RIG_NECK, mine ? Mul(RY(g_HeadYaw), RX(g_HeadPitch)) : Id());   // uzak yayada kafa duz bakar (senkron yok)
+    StageR("DrawWalker:bindTex");
     fnBind(dev, g_TexObj[0], 0);                                               // katman 0 = diffuse [D: bindTextureLayer 3. arguman]
+    StageR("DrawWalker:parcalar");
     for (int i = 0; i < P_COUNT; ++i) if (g_Mesh[i]) fnDraw(dev, mats[i].m, g_Mesh[i][0], g_Mesh[i][1]);
+    StageR("DrawWalker:bitti");
 }
 static void my_VehRender(void* self, void* ra, void* dev, uint32_t p3) {
     if (IsWalker((uintptr_t)self)) { DrawWalker((uintptr_t)self, dev); return; }
+    StageR("VehRender(normal)");
     orig_VehRender(self, ra, dev, p3);
 }
 // Emissive gecisi: temel aracin far/isik mesh'leri yayanin uzerinde cizilmesin. Donus 0 = "isik cizilmedi" [D: local_20 = 0].
@@ -2405,9 +2541,11 @@ static void Init(void* appLib) {
         const bool ok = fn && HookChecked(hooks[i].n, fn, hooks[i].repl, hooks[i].orig, true);   // riskli prologue'da TAKILMAZ [K]
         LOGI("[WALKER] hook %s = %d", hooks[i].n, (int)ok);
     }
+    { static bool s_wd = false; if (!s_wd) { s_wd = true; std::thread(WatchdogThread).detach(); LOGI("[WALKER] watchdog basladi"); } }
 }
 // Oyun thread'i: her karede (my_GameUpdate'ten)
 static void OnGameFrame(uintptr_t game) {
+    ++g_TickGame; StageG("OnGameFrame");
     {   // silinen/satilan yayalari temizle (uzak REMOVE orig'i dogrudan cagirir; havuz nesnesi yeniden kullanilabilir)
         std::lock_guard<std::mutex> lk(g_Mu);
         for (size_t i = g_Walkers.size(); i-- > 0;) if (SlotIndexOfVehicle(game, g_Walkers[i].p) < 0) {
@@ -8682,7 +8820,9 @@ void DrawImGui() {
 
     // Diger oyuncularin araclari uzerinde isim etiketleri (kendi aracin haric)
     if (g_OnlineMode && !g_IsMultiplayerMenuActive) DrawPlayerNameTags(screen);
+    TickRender();                                                              // TANI: cizim thread'i canli mi (watchdog)
     if (!g_IsMultiplayerMenuActive) WK::DrawImGui(g_EngineInstance, screen);   // WALKER: Exit/Enter Vehicle dugmeleri (+ varlik yukleme: GL thread)
+    LL::Draw(screen);                                                          // CANLI LOG paneli (libmultiplayermod + libapp)
 
     if (g_IsMultiplayerMenuActive) {
         ImDrawList* bg = ImGui::GetBackgroundDrawList();
@@ -9123,6 +9263,7 @@ static void* my_Vehicle_update(void* t, uint32_t a, uint32_t b, uint32_t c, uint
                 *(float*)((uintptr_t)t + 0x568) = DequantizeSteer(q);
         }
     }
+    StageG("orig_Vehicle_update");
     void* wkRet = GuardedEntityUpdate(orig_Vehicle_update, (uintptr_t)t, "Vehicle", t, a, b, c, d, e);
     WK::AfterVehicleUpdate((uintptr_t)t, a, b, c, d);     // WALKER: yerel yayanin hareketi + birinci sahis kamera (update'ten SONRA)
     return wkRet;
@@ -9311,7 +9452,9 @@ void my_GameUpdate(void* thiz, float param_1) {
         }
         s_prevInGame = inGame;
     }
+    StageG("orig_GameUpdate");
     if (orig_GameUpdate) orig_GameUpdate(thiz, param_1);
+    StageG("GameUpdate-bitti");
 }
 
 void my_GameUpdateStateBase(void* thiz, float param_1, uint32_t param_2, uint32_t param_3, uint32_t param_4) {
@@ -9340,7 +9483,9 @@ void my_GameUpdateStateBase(void* thiz, float param_1, uint32_t param_2, uint32_
     if (inGame6) MiscSyncPre(g_EngineInstance);        // client: host'un fiyat listesi + gorevi (oyun kendi rastgelesini uretmesin)
 
     if (orig_GameUpdateStateBase) {
+        StageG("orig_GameUpdateStateBase");
         orig_GameUpdateStateBase(thiz, param_1, param_2, param_3, param_4);
+        StageG("StateBase-bitti");
     }
     g_BaleFrameGain = inGame6 ? (ReadMoney(g_EngineInstance) - moneyBefore) : 0.0;
 
@@ -9594,7 +9739,7 @@ void* my_renderStartMenuMain(void* thiz, void* p1, void* p2, void* p3) {
 // ========================================================================
 __attribute__((constructor))
 void ModMain() {
-    LOGI(">>> MULTIPLAYER MOD STARTING <<< build=shopfix-35+walker");
+    LOGI(">>> MULTIPLAYER MOD STARTING <<< build=shopfix-36+walker-diag");
 
     ResetVehicleSyncState();
     std::thread(StartPONGResponderThread).detach();
@@ -9664,6 +9809,7 @@ void ModMain() {
         HookChecked("Game::removeVehicle", remVeh, (void*)my_Game_removeVehicle, (void**)&orig_Game_removeVehicle, false);
         g_VehicleHooksOk = addVeh && remVeh && g_VehicleDestroyFn;
         WK::Init(appLib);                                      // WALKER: sembolleri bul + cizim kancalari (Vehicle::update'e DOKUNMAZ)
+        LL::Start();                                           // CANLI LOG: logcat okuyucu thread
 
         // Ortak para: hayalet varliklarin gelir/giderini geri alan kancalar (riskli prologue'da TAKILMAZ).
         if (kSharedMoney && kGuardGhostMoney) {
