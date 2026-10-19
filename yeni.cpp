@@ -2144,9 +2144,9 @@ static const float    HITBOX_HX = 0.30f, HITBOX_HY = 0.25f;  // insan kutusu (ya
 #define WK_PATCH_PARTS 0       // v6 GÜVENLI TEST: VehicleDesc alanlarini degistirmeden orijinal parca sayisini koru
 #endif
 #ifndef WK_KEEP_WHEELS
-#define WK_KEEP_WHEELS 0       // v7: tekerlek yok (tekerlek govdeleri de cakisma kutusu yapiyordu; decompile: tekerlek sayisi sadece for-dongulerinde). Sorun olursa 1.
+#define WK_KEEP_WHEELS 1       // v7: tekerlek yok (tekerlek govdeleri de cakisma kutusu yapiyordu; decompile: tekerlek sayisi sadece for-dongulerinde). Sorun olursa 1.
 #endif
-static const bool PATCH_HITBOX = WK_PATCH_HITBOX != 0, PATCH_PARTS = WK_PATCH_PARTS != 0, KEEP_WHEELS = WK_KEEP_WHEELS != 0;
+static const bool PATCH_HITBOX = WK_PATCH_HITBOX != 0, PATCH_PARTS = WK_PATCH_PARTS != 0, KEEP_WHEELS = WK_KEEP_WHEELS != 1;
 static const bool     DEBUG_INPUT    = true;   // Vehicle::update'in 3 float'ini logcat'e basar
 static const float    STRIDE         = 4.5f;   // yuruyus fazi (rad) = hiz(m/s) * STRIDE * dt
 // Insan iskeleti (tools/make_walker_assets.py olculeriyle BIREBIR; model degisirse ikisini birlikte guncelleyin)
