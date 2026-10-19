@@ -2118,10 +2118,10 @@ enum Part { P_TORSO, P_HEAD, P_ARM_L, P_ARM_R, P_LEG_L, P_LEG_R, P_COUNT };
 static const int      BASE_TYPE      = 0;      // [!] klonlanacak EntityManager::VEHICLES tipi (en kucuk / en sorunsuz arac)
 static const float    WALK_SPEED     = 2.2f;   // m/s
 static const float    TURN_RATE      = 3.0f;   // rad/s
-static const float    TURN_SIGN      = +1.0f;  // duzeltme: sol/sağ direksiyon işareti ters çevrildi
+static const float    TURN_SIGN      = -1.0f;  // ters yon: geri viteste de input yonunu asagida ayri ele al
 static const float    ENTER_RADIUS   = 7.0f;   // uzak inis konumundan da araca tekrar binebilmek icin (m)
 static const float    EXIT_DIST      = 5.5f;   // inince aractan daha uzaga, yan tarafa koy (m)
-static const float    EXIT_SIDE      = 1.0f;   // +1/-1: araci hangi yanindan inilir
+static const float    EXIT_SIDE      = 1.0f;   // varsayilan taraf; cikista taraf sirali denenir
 static const float    HITBOX_HX = 0.30f, HITBOX_HY = 0.25f;  // insan kutusu (yari kenar, m) [?: girdi duzeni]
 // --- v4: KARARLILIK ONLEMLERI (log bulgusu: yaya dogunca oyun kare basi ~13 sn ile calisti; Vehicle::update f1 = dt) ---
 #ifndef WK_MAX_DT_S
@@ -2138,7 +2138,7 @@ static const float    HITBOX_HX = 0.30f, HITBOX_HY = 0.25f;  // insan kutusu (ya
 #endif
 // --- desc yamalari: yaya icin kucuk hitbox ve alt-parca iptali varsayilan acik ---
 #ifndef WK_PATCH_HITBOX
-#define WK_PATCH_HITBOX 0      // v6 GÜVENLI TEST: tekerleklerle uyumsuz kucuk sase fixture yamasini gecici kapat
+#define WK_PATCH_HITBOX 1      // v7: yalnizca kucuk fixture; tekerlek ve alt-parca tanimlari korunur
 #endif
 #ifndef WK_PATCH_PARTS
 #define WK_PATCH_PARTS 0       // v6 GÜVENLI TEST: VehicleDesc alanlarini degistirmeden orijinal parca sayisini koru
@@ -2431,8 +2431,10 @@ static void DoExit(uintptr_t game) {
     float x, y, a; if (!BodyPose(cur, &x, &y, &a)) return;
     LOGI("[WALKER] DoExit: arac pozu x=%.2f y=%.2f a=%.3f", x, y, a);
     // [!] yon sozlesmesi: yanal = (-sin a, cos a) varsayildi; EXIT_SIDE ile yan degistirilir
-    const float px = x - sinf(a) * EXIT_DIST * EXIT_SIDE, py = y + cosf(a) * EXIT_DIST * EXIT_SIDE;
-    // TODO: Game::buyItem'daki b2World::QueryAABB bos-alan taramasi ile cakisma kontrolu
+    static int s_exitSide = 1;
+    s_exitSide = -s_exitSide; // her iniste karsi tarafi tercih et; bos alan sorgusu henuz dogrulanmadi
+    const float px = x - sinf(a) * EXIT_DIST * (float)s_exitSide, py = y + cosf(a) * EXIT_DIST * (float)s_exitSide;
+    // Not: bu surum iki tarafi sirayla dener; Box2D QueryAABB bos-alan testi henuz baglanmadi.
     const float pos[3] = {px, 0.0f, py};                                       // Vector3(x, yukseklik, fizik-y) [D][K]
     uint32_t ab; memcpy(&ab, &a, 4);
     StageG("DoExit:SpawnWalker");
@@ -2495,7 +2497,8 @@ static void AfterVehicleUpdate(uintptr_t self, uint32_t ua, uint32_t ub, uint32_
     const float* M = (const float*)(self + V_BODY_MAT);
     float fx = M[8], fy = M[10]; const float fl = sqrtf(fx * fx + fy * fy);
     if (fl > 1e-4f) { fx /= fl; fy /= fl; } else { fx = 1.f; fy = 0.f; }
-    SetRemoteBodyVelocity(body, fx * throttle * WALK_SPEED, fy * throttle * WALK_SPEED, TURN_SIGN * steer * TURN_RATE);   // [K] uyandirma dahil
+    const float reverseTurn = (throttle < -0.05f) ? -1.0f : 1.0f;
+    SetRemoteBodyVelocity(body, fx * throttle * WALK_SPEED, fy * throttle * WALK_SPEED, TURN_SIGN * steer * TURN_RATE * reverseTurn);   // geri yururken yon terslemesini telafi et
     if (g_FirstPerson) {                                                       // kamera dunya matrisi: oyun daha sonra bunun tersini view matrisi yapar
         M4 B; memcpy(B.m, M, 64);
         // Vehicle::update, araç model matrisini açı-PI ile kurar; kamera normalde -Z yönüne bakar.
@@ -2722,6 +2725,15 @@ static void DrawImGui(uintptr_t game, const ImVec2& screen) {
     else {
         if (ImGui::Button("Enter Vehicle", bs)) g_ReqEnter = true;
         if (ImGui::Button(g_FirstPerson ? "Third Person" : "First Person", bs)) g_FirstPerson = !g_FirstPerson;
+        if (g_FirstPerson) {
+            ImGui::TextUnformatted("Drag below to look");
+            const ImVec2 lookSize(screen.x * 0.18f, screen.y * 0.22f);
+            ImGui::InvisibleButton("##walker_look_area", lookSize);
+            if (ImGui::IsItemActive() && ImGui::IsMouseDown(0)) {
+                const ImVec2 d = ImGui::GetIO().MouseDelta;
+                AddLook(-d.x * 0.008f, -d.y * 0.008f);
+            }
+        }
     }
     ImGui::End();
     // TODO: dokunusun alttaki oyun HUD'una da gecmesini engelleyin (sohbet HUD dugmenizdeki "press armed" mantigi gibi) [!]
@@ -9922,7 +9934,7 @@ void* my_renderStartMenuMain(void* thiz, void* p1, void* p2, void* p3) {
 // ========================================================================
 __attribute__((constructor))
 void ModMain() {
-    LOGI(">>> MULTIPLAYER MOD STARTING <<< build=shopfix-38+walker-v6-safephysics");
+    LOGI(">>> MULTIPLAYER MOD STARTING <<< build=shopfix-38+walker-v7-controls-camera");
 
     ResetVehicleSyncState();
     std::thread(StartPONGResponderThread).detach();
