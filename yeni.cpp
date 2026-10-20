@@ -2234,7 +2234,8 @@ static SetMasterVol_t fnSetMasterVol = nullptr;
 static volatile bool  g_Run = false;                               // v9: kosma acik mi (dugme ile acilip kapanir)
 static volatile float g_BtnCX = -1, g_BtnCY = -1, g_BtnR = 0;      // v9: Enter/Exit dugmesi (piksel; DrawImGui yazar, dokunma kodu okur)
 static volatile int   g_BtnMode = 0;                               // 0 yok, 1 = Exit Vehicle (aractayken), 2 = Enter Vehicle + Run (yayadayken)
-static volatile bool  g_SkyWanted = false;                         // v9: yayadayken (oyun durumu 6) sanal gokyuzu cizilsin
+static volatile bool  g_SkyWanted = false;                         // v10: oyun icindeyken (durum 6, HER arac) sanal gokyuzu + daglar cizilsin
+static volatile bool  g_Dialog = false;                            // v10: oyun penceresi acik (durum 6 + alt durum != 0: fiyat listesi, gorev teklifi, onay...) -> dokunmalar OYUNA gecer
 static uint64_t my_OpenQueues(void* self);
 typedef uint64_t (*OpenQueues_t)(void*);
 static OpenQueues_t orig_OpenQueues = nullptr;
@@ -2621,9 +2622,32 @@ static bool AffineInverse(const float* m, float* o) {                          /
     o[15] = 1.0f;
     return true;
 }
+// v10: TEK RenderArgs::update kancasi. Gercek kamera (gorunum + dunya matrisi) burada yakalanir:
+//   - isim etiketleri (DrawPlayerNameTags) g_CamView/g_CamMs'i kullanir (ikinci bir kanca ayni fonksiyonda "riskli" sayilip atlaniyordu -> etiketler kayboldu)
+//   - gokyuzu/daglar (DrawSkyGL) bakis yonunu buradan alir (her arac icin, sadece yayada degil)
+static float g_CamView[16];
+static float g_CamWorld[16];
+static std::atomic<long long> g_CamMs(0);
 static void my_RAUpdate(void* self, const float* view, const float* cam) {
+    if (view) { memcpy(g_CamView, view, 64); g_CamMs.store(NowMs()); }
+    if (cam) memcpy(g_CamWorld, cam, 64);
     if (WK_FP_CULLFIX && g_FirstPerson && g_LocalWalker && cam && (uint32_t)(g_TickGame - g_FpStamp) <= 3 && memcmp(cam, g_FpCam, 64) == 0) {
-        M4 C; memcpy(C.m, cam, 64);
+        // v10: kesme kamerasi bakis ACISINDAN (pitch) bagimsiz: gercek kameranin sadece yatay yonu (yaw) kullanilir.
+        // Eskiden tam kamera matrisi kullaniliyordu -> cok yukari/asagi bakinca sanal kamera yere bakmaz oluyor, hicbir sey cizilmiyordu.
+        M4 C; memset(C.m, 0, 64);
+        {
+            float rx = cam[0], rz = cam[2]; const float rl = sqrtf(rx * rx + rz * rz);
+            if (rl > 1e-4f) {
+                rx /= rl; rz /= rl;
+                static float s_sgn = 1.0f;                                     // dunya el yonlulugu: "geri" ekseni (r x yukari) kameranin gercek +Z'siyle ayni yone bakmali
+                const float hx = cam[8], hz = cam[10];
+                if (hx * hx + hz * hz > 0.09f) s_sgn = ((-rz) * hx + rx * hz >= 0.f) ? 1.0f : -1.0f;
+                C.m[0] = rx;  C.m[1] = 0.f; C.m[2] = rz;                       // sag (yatay)
+                C.m[4] = 0.f; C.m[5] = 1.f; C.m[6] = 0.f;                      // yukari
+                C.m[8] = -rz * s_sgn; C.m[9] = 0.f; C.m[10] = rx * s_sgn;      // geri (yatay)
+                C.m[12] = cam[12]; C.m[13] = cam[13]; C.m[14] = cam[14]; C.m[15] = 1.f;
+            } else memcpy(C.m, cam, 64);
+        }
         const M4 base = Mul(C, Tr(0, WK_FP_CULL_UP, WK_FP_CULL_BACK));
         const M4 c1 = Mul(base, RX(-WK_FP_CULL_PITCH)), c2 = Mul(base, RX(+WK_FP_CULL_PITCH));
         const M4& cv = (c1.m[9] >= c2.m[9]) ? c1 : c2;                         // bakis ekseni (-Z) asagi gosteren aday: dunya y'si azalan = m[9] buyuk
@@ -2665,7 +2689,8 @@ static bool OnFootTouch(const AInputEvent* ev, int32_t rawAction, float W, float
     if (act == AMOTION_EVENT_ACTION_DOWN) {
         s_joyId = s_lookId = -1; OnFootCancel(); s_btnOnly = false; s_eat = false;
         const float x0 = AMotionEvent_getX(ev, 0), y0 = AMotionEvent_getY(ev, 0);
-        if (g_OnFoot) s_eat = (y0 >= H * 0.12f);                                // ust serit oyuna gecer (menu/duraklat/shop)
+        if (g_Dialog) s_eat = false;                                            // v10: fiyat/gorev/onay penceresi acikken hicbir dokunma yutulmaz
+        else if (g_OnFoot) s_eat = (y0 >= H * 0.12f);                           // ust serit oyuna gecer (menu/duraklat/shop)
         else if (g_BtnMode == 1 && g_BtnR > 1.f && InCircle(x0, y0, g_BtnCX, g_BtnCY, g_BtnR * 1.15f)) { g_ReqExit = true; s_eat = true; s_btnOnly = true; }   // Exit Vehicle
     }
     if (!s_eat) return false;
@@ -2908,6 +2933,33 @@ static void RemoveWalkerKeepActive(uintptr_t game, uintptr_t w) {
 struct SaveStash { bool had; float x, y, a; uintptr_t veh; long long ms; };
 static SaveStash g_Stash = {false, 0, 0, 0, 0, 0};
 static inline bool SavePending(uintptr_t game) { return *(volatile uint8_t*)(game + 0xa374 + 0x78) != 0; }   // SaveGames+0x78 = gorev suruyor [D: startTask/processWorkerTask]
+// ------------------------------- v10: OYUNA YAYA OLARAK DEVAM -------------------------------
+// Kayit, yayayi aracina geri bindirerek yazilir (yukaridaki neden). Oyundan cikip tekrar girince oyuncu yine aracin yaninda yaya olsun diye
+// yaya konumu + o andaki arac konumu bir dosyaya yazilir (profil klasorunde walker_resume.txt). Yuklemeden sonra aktif arac, dosyadaki arac konumuyla
+// ~3 m icinde eslesirse yaya ayni yerde yeniden dogar. Oyuncu aracina binince (Enter) dosya silinir. Client'ta kullanilmaz.
+struct ResumeRec { float wx, wy, wa, vx, vy; };
+static std::string ResumePath() {
+    BuildProfilePath(); if (g_ProfilePath.empty()) return std::string();
+    const size_t p = g_ProfilePath.rfind('/'); if (p == std::string::npos) return std::string();
+    return g_ProfilePath.substr(0, p + 1) + "walker_resume.txt";
+}
+static void ResumeClear() { const std::string f = ResumePath(); if (!f.empty() && remove(f.c_str()) == 0) LOGI("[WALKER] devam kaydi silindi"); }
+static void ResumeWrite(float wx, float wy, float wa, float vx, float vy) {
+    if (g_IsClient.load() || g_ClientPlaying.load()) return;
+    const std::string f = ResumePath(); if (f.empty()) return;
+    FILE* fp = fopen(f.c_str(), "wb"); if (!fp) return;
+    fprintf(fp, "WK1 %.4f %.4f %.5f %.4f %.4f\n", (double)wx, (double)wy, (double)wa, (double)vx, (double)vy); fclose(fp);
+    LOGI("[WALKER] devam kaydi yazildi: yaya=(%.1f,%.1f) arac=(%.1f,%.1f)", wx, wy, vx, vy);
+}
+static bool ResumeRead(ResumeRec* r) {
+    const std::string f = ResumePath(); if (f.empty()) return false;
+    FILE* fp = fopen(f.c_str(), "rb"); if (!fp) return false;
+    char tag[8] = {0}; double a = 0, b = 0, c = 0, d = 0, e = 0;
+    const int n = fscanf(fp, "%7s %lf %lf %lf %lf %lf", tag, &a, &b, &c, &d, &e); fclose(fp);
+    if (n != 6 || strcmp(tag, "WK1") != 0) return false;
+    if (!(a == a && b == b && c == c && d == d && e == e)) return false;
+    r->wx = (float)a; r->wy = (float)b; r->wa = (float)c; r->vx = (float)d; r->vy = (float)e; return true;
+}
 static void PreSave(uintptr_t game) {
     if (!game || !g_LocalWalker || g_Disabled) return;
     float x, y, a; if (!BodyPose(g_LocalWalker, &x, &y, &a)) return;
@@ -2916,7 +2968,35 @@ static void PreSave(uintptr_t game) {
     if (LocalActiveVehiclePtr(game) == g_LocalWalker) DoEnter(game, true); else RemoveWalkerKeepActive(game, g_LocalWalker);
     if (g_LocalWalker) HardRemoveLocalWalker(game);
     g_Stash.veh = LocalActiveVehiclePtr(game);
+    { float vx = 0, vy = 0, va = 0; if (g_Stash.veh && !IsWalker(g_Stash.veh) && BodyPose(g_Stash.veh, &vx, &vy, &va)) ResumeWrite(x, y, a, vx, vy); }   // v10: yuklenince yaya olarak devam
     g_OnFoot = false; g_JoyX = g_JoyY = 0; SoundTick(game);
+}
+// v10: oyuna yeni girildiginde (yukleme sonrasi) kayitli yaya konumunu geri yukle. Her karede cagrilir.
+static void TryResume(uintptr_t game, int st) {
+    static int s_prevSt = -1; static bool s_have = false; static ResumeRec s_rec; static long long s_until = 0, s_next = 0;
+    if (st == 6 && s_prevSt != 6 && s_prevSt != 7) {                           // yeni oyun dunyasi
+        s_have = !g_IsClient.load() && !g_ClientPlaying.load() && ResumeRead(&s_rec); s_until = NowMs() + 25000; s_next = 0;
+        if (s_have) LOGI("[WALKER] devam kaydi var: yaya=(%.1f,%.1f) arac=(%.1f,%.1f)", s_rec.wx, s_rec.wy, s_rec.vx, s_rec.vy);
+    }
+    s_prevSt = st;
+    if (!s_have || st != 6 || g_LocalWalker || g_Stash.had || g_Disabled) return;
+    const long long now = NowMs();
+    if (now > s_until) { s_have = false; LOGI("[WALKER] devam kaydi: eslesen arac bulunamadi (zaman asimi)"); return; }
+    if (now < s_next) return; s_next = now + 250;
+    if (g_IsClient.load() || g_ClientPlaying.load()) { s_have = false; return; }
+    if (SavePending(game) || VehicleCount(game) >= 30) return;
+    const uintptr_t act = LocalActiveVehiclePtr(game); if (!act || IsWalker(act)) return;
+    float x, y, a; if (!BodyPose(act, &x, &y, &a)) return;
+    if (sqrtf((x - s_rec.vx) * (x - s_rec.vx) + (y - s_rec.vy) * (y - s_rec.vy)) > 3.0f) return;   // henuz yuklenmedi ya da baska kayit
+    s_have = false;
+    const float pos[3] = {s_rec.wx, 0.0f, s_rec.wy};
+    uint32_t ab; memcpy(&ab, &s_rec.wa, 4);
+    const uint32_t idx = SpawnWalker(game, pos, ab, true);
+    if (idx >= VehicleCount(game)) return;
+    g_LastVehicle = act; g_HeadYaw = g_HeadPitch = 0; g_DesInit = false; g_JoyX = g_JoyY = 0;
+    SetActiveByPtr(game, RawVehicleSlot(game, idx));
+    g_OnFoot = true; SoundTick(game);
+    LOGI("[WALKER] devam: yaya kayitli yerde yeniden dogdu (%.1f,%.1f)", s_rec.wx, s_rec.wy);
 }
 // Kayit/menu bitti mi? Bittiyse yayayi ayni yerde geri olustur. Her karede (OnGameFrame) ve kayittan hemen sonra cagrilir.
 static void PostSave(uintptr_t game) {
@@ -3017,7 +3097,7 @@ static const char* kSkyFS =
     "    vec3 lit = mix(vec3(0.20, 0.22, 0.30), vec3(1.0), day); lit = mix(lit, vec3(1.0, 0.78, 0.60), clamp(1.0 - abs(uSun.y) * 3.0, 0.0, 1.0) * day * 0.6);\n"
     "    vec3 cc = mix(lit * 0.72, lit, smoothstep(0.55, 0.85, n)); col = mix(col, cc, c * 0.9); }\n"
     "  if (uM.z > 0.0) { float az = atan(ray.x, ray.z); float t = az * 0.1591549 * uM.z; float u = abs(mod(t, 2.0) - 1.0); float v = (e - uM.x) / (uM.y - uM.x);\n"
-    "    if (v < 1.0) { float vv = clamp(v, 0.0, 1.0); vec4 m = texture2D(uTex, vec2(u, 1.0 - vv)); vec3 mc = mix(m.rgb, uHz, 0.38); mc *= 0.12 + 0.88 * day; col = mix(col, mc, m.a); } }\n"
+    "    if (v < 1.0) { float vv = clamp(v, 0.0, 1.0); vec4 m = texture2D(uTex, vec2(u, 1.0 - vv)); vec3 mc = mix(m.rgb, uHz, 0.38); mc *= 0.12 + 0.88 * day; col = mix(col, mc, m.a * smoothstep(0.0, 0.22, v)); } }\n"
     "  gl_FragColor = vec4(col, 1.0);\n"
     "}\n";
 static GLuint SkyCompile(GLenum type, const char* src) {
@@ -3051,7 +3131,7 @@ static bool SkyInitGL() {
     return true;
 }
 static void DrawSkyGL(uintptr_t game) {
-    if (!game || (uint32_t)(g_TickGame - g_FpStamp) > 6) return;               // kamera guncel degilse cizme
+    if (!game) return;
     // --- GL durumunu kaydet ---
     GLint prog = 0, abuf = 0, ebuf = 0, atex = 0, tex0 = 0, vp[4] = {0, 0, 0, 0}, bsr = 0, bdr = 0, bsa = 0, bda = 0, beR = 0, beA = 0;
     GLint en0 = 0, ab0 = 0, sz0 = 4, ty0 = GL_FLOAT, st0 = 0; GLint nm0 = 0; GLvoid* pt0 = nullptr; GLboolean dmask = GL_TRUE, cmask[4] = {1, 1, 1, 1};
@@ -3074,8 +3154,17 @@ static void DrawSkyGL(uintptr_t game) {
     }
     double raw = 0; const double hour = ReadHour(game, &raw);
     SkyParams sp; ComputeSky(hour, &sp);
-    const float* C = g_FpCam;                                                  // kamera dunya matrisi (kolon-major): x=sag, y=yukari, -z=ileri
-    const float R[3] = {C[0], C[1], C[2]}, U[3] = {C[4], C[5], C[6]}, F[3] = {-C[8], -C[9], -C[10]};
+    // v10: bakis yonu GERCEK kameradan (RenderArgs::update'e giden gorunum matrisi): dunya yonleri = gorunum matrisinin satirlari (isim etiketleriyle ayni sozlesme)
+    float R[3], U[3], F[3];
+    if (NowMs() - g_CamMs.load() <= 500) {
+        const float* V = g_CamView;
+        R[0] = V[0]; R[1] = V[4]; R[2] = V[8];  U[0] = V[1]; U[1] = V[5]; U[2] = V[9];  F[0] = -V[2]; F[1] = -V[6]; F[2] = -V[10];
+    } else {                                                                   // kanca henuz veri vermediyse: aktif aracin kamera dunya matrisi
+        const uintptr_t av = LocalActiveVehiclePtr(game); if (!av) { glBindTexture(GL_TEXTURE_2D, (GLuint)tex0); glActiveTexture((GLenum)atex); return; }
+        const float* C = (const float*)(av + V_CAM_WORLD);
+        R[0] = C[0]; R[1] = C[1]; R[2] = C[2];  U[0] = C[4]; U[1] = C[5]; U[2] = C[6];  F[0] = -C[8]; F[1] = -C[9]; F[2] = -C[10];
+    }
+    for (int i = 0; i < 3; ++i) if (!(R[i] == R[i]) || !(U[i] == U[i]) || !(F[i] == F[i])) { glBindTexture(GL_TEXTURE_2D, (GLuint)tex0); glActiveTexture((GLenum)atex); return; }
     float tanX = 0.80f, tanY = 0.50f;
     { const float* pj = (const float*)(game + 0xa2b0); const float* pj2 = (const float*)(game + 0xa270);
       if (pj[5] > 0.3f && pj[5] < 8.f && pj[0] > 0.3f && pj[0] < 8.f) { tanX = 1.f / pj[0]; tanY = 1.f / pj[5]; }
@@ -3090,7 +3179,7 @@ static void DrawSkyGL(uintptr_t game) {
     glUniform3fv(s_uR, 1, R); glUniform3fv(s_uU, 1, U); glUniform3fv(s_uF, 1, F); glUniform3fv(s_uHz, 1, sp.hz); glUniform3fv(s_uZn, 1, sp.zn); glUniform3fv(s_uSun, 1, sp.sun);
     glUniform2f(s_uTan, tanX, tanY);
     glUniform4f(s_uP, sp.day, sp.night, (float)fmod((double)NowMs() * 0.001, 10000.0), 0.f);
-    glUniform4f(s_uM, -0.05f, 0.10f, s_skyTex ? 4.0f : 0.0f, 0.f);
+    glUniform4f(s_uM, -0.10f, 0.13f, s_skyTex ? 4.0f : 0.0f, 0.f);
     glActiveTexture(GL_TEXTURE0); glBindTexture(GL_TEXTURE_2D, s_skyTex); glUniform1i(s_uTex, 0);
     glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
     // --- durumu geri yaz ---
@@ -3119,7 +3208,7 @@ static void SkyTick(uintptr_t game) {
         if (!fnClearColor) { void* h = dlopen("libGLESv2.so", RTLD_NOW); if (h) fnClearColor = (ClearColor_t)dlsym(h, "glClearColor"); }
         if (!fnClearColor) return;
     }
-    if (g_OnFoot && g_FirstPerson && g_SkyGLFail) {
+    if (g_SkyWanted && g_SkyGLFail) {
         SkyParams sp; ComputeSky(ReadHour(game, nullptr), &sp); fnClearColor(sp.hz[0], sp.hz[1], sp.hz[2], 1.0f); s_applied = true;
     } else if (s_applied) {
         fnClearColor(0.221f, 0.241f, 0.0627f, 1.0f); s_applied = false;
@@ -3189,6 +3278,20 @@ static void OnGameFrame(uintptr_t game) {
         LOGI("[WALKER] kare+%d gap=%lld ms pos=(%.2f,%.2f) aci=%.3f vel=(%.2f,%.2f) sonlu=%d aktif=%u sayi=%u", 20 - g_PostSpawnFrames, gap, x, y, a, vx, vy,
              (int)(x == x && y == y && a == a && vx == vx && vy == vy), *(uint32_t*)(game + G_ACTIVE), VehicleCount(game));
     }
+    {   // v10: baska oyuncunun yayasini "izleme" (arac degistirme dugmesiyle ona gecme) engellenir: aktif arac uzak yaya ise son iyi araca don
+        static uintptr_t s_good = 0; static long long s_logMs = 0;
+        const uintptr_t act = LocalActiveVehiclePtr(game);
+        if (act && IsWalker(act) && act != g_LocalWalker) {
+            uintptr_t tgt = 0;
+            if (s_good && s_good != act && SlotIndexOfVehicle(game, s_good) >= 0 && (!IsWalker(s_good) || s_good == g_LocalWalker)) tgt = s_good;
+            if (!tgt && g_LocalWalker && SlotIndexOfVehicle(game, g_LocalWalker) >= 0) tgt = g_LocalWalker;
+            for (uint32_t i = 0; !tgt && i < VehicleCount(game); ++i) { const uintptr_t v = RawVehicleSlot(game, i); if (v && !IsWalker(v)) tgt = v; }
+            if (tgt) {
+                SetActiveByPtr(game, tgt);
+                if (NowMs() - s_logMs > 3000) { s_logMs = NowMs(); LOGI("[WALKER] baska oyuncunun yayasi izlenemez: aktif arac geri alindi"); }
+            }
+        } else if (act) s_good = act;
+    }
     if (WK_AUTORECOVER && g_LocalWalker && gap > WK_SLOW_FRAME_MS) {          // yaya varken bir kare cok uzun surdu
         LOGI("[WALKER] YAVAS KARE: %lld ms (esik %d) -> yaya kaldiriliyor, bu oturumda kapali", gap, (int)WK_SLOW_FRAME_MS);
         g_Disabled = true; HardRemoveLocalWalker(game);
@@ -3213,14 +3316,16 @@ static void OnGameFrame(uintptr_t game) {
         else if (g_LocalWalker && st != 6 && st != 7) { std::lock_guard<std::mutex> lk(g_Mu); g_LocalWalker = 0; g_Walkers.clear(); g_Stash.had = false; }   // oyun dunyasi gitti: sadece kayit tut
         if (st != 6 && st != 7) g_Stash.had = false;
         PostSave(game);                                                        // menu/kayit bittiyse yayayi geri olustur
+        TryResume(game, st);                                                   // v10: yukleme sonrasi yaya olarak devam
         g_OnFoot = g_LocalWalker && st == 6 && LocalActiveVehiclePtr(game) == g_LocalWalker;   // v9: menude/magazada dokunmalar yutulmasin
-        g_SkyWanted = g_OnFoot;
-        if (!g_OnFoot) { g_JoyX = g_JoyY = 0; g_JoyActive = false; g_Run = false; }
+        g_Dialog = (st == 6 && sub != 0);                                      // v10: oyun penceresi (fiyat/gorev/onay) acik: dokunmalar oyuna, yaya arayuzu gizli
+        g_SkyWanted = (st == 6) && !g_Disabled;                                // v10: gokyuzu + daglar her arac icin
+        if (!g_OnFoot || g_Dialog) { g_JoyX = g_JoyY = 0; g_JoyActive = false; if (!g_OnFoot) g_Run = false; }
         SoundTick(game);
         HudTick(game);
     }
     if (g_ReqExit)  { g_ReqExit = false;  DoExit(game); }
-    if (g_ReqEnter) { g_ReqEnter = false; DoEnter(game, false); }
+    if (g_ReqEnter) { g_ReqEnter = false; DoEnter(game, false); if (!g_LocalWalker) ResumeClear(); }   // v10: oyuncu araca bindi -> devam kaydi gecersiz
 }
 // Kayit oncesi/oturum bitisinde cagirin: yayayi kaldirip aracina geri bindirir (yoksa Vehicle::serialize yayayi
 // "temel arac" olarak kayda yazar). Su an HICBIR YERDEN CAGRILMIYOR [!]: kayit kancasina baglamak sizin kararinizdir.
@@ -3275,6 +3380,7 @@ static void DrawImGui(uintptr_t game, const ImVec2& screen) {
     const uintptr_t cur = LocalActiveVehiclePtr(game); if (!cur) { g_BtnMode = 0; return; }
     const bool onFoot = (cur == g_LocalWalker);
     SkyTick(game);                                                             // yedek gokyuzu (GL gokyuzu calismazsa)
+    if (g_Dialog) { g_BtnMode = 0; return; }                                   // v10: oyun penceresi acik: joystick/Enter/Exit dugmeleri gizli, dokunma oyuna
     if (onFoot && !g_Disabled) { DrawFootUI(game, screen); return; }
     if (g_Disabled) {
         g_BtnMode = 0;
@@ -9001,18 +9107,9 @@ static void DrawHeaderDarkening(const ImVec2& screen) {
 // izdusum matrisi Game+0xA2B0 (oyun ici) / +0xA270'tedir; ikisi de GL sutun-sirali. Oyuncu hangi aracin icinde
 // diye ActiveVehicle paketlerinden (g_RemoteActive) bakilir.
 // ========================================================================
-typedef void (*RenderArgsUpdate_t)(void* thiz, const float* view, const float* world);
-static RenderArgsUpdate_t orig_RenderArgs_update = nullptr;
-static float g_CamView[16];
-static std::atomic<long long> g_CamMs(0);
-
-static void my_RenderArgs_update(void* t, const float* view, const float* world) {
-    if (view) {
-        memcpy(g_CamView, view, sizeof(g_CamView));
-        g_CamMs.store(NowMs());
-    }
-    if (orig_RenderArgs_update) orig_RenderArgs_update(t, view, world);
-}
+// v10: kamera verisi artik WK::my_RAUpdate (tek RenderArgs::update kancasi) tarafindan yazilir.
+using WK::g_CamView;
+using WK::g_CamMs;
 
 static void DrawPlayerNameTags(const ImVec2& screen) {
     if (!g_IsConnected.load() || !g_VehNetArmed.load() || g_EngineInstance == 0) return;
@@ -9069,7 +9166,7 @@ static void DrawPlayerNameTags(const ImVec2& screen) {
         const uintptr_t v = GetVehicleFromIndex(game, (uint16_t)nids[k]);
         if (v == 0) continue;
         const float wx = *(float*)(v + 0x18 + 0x30);
-        const float wy = *(float*)(v + 0x18 + 0x34) + 4.2f;           // arac govdesinin ustu
+        const float wy = *(float*)(v + 0x18 + 0x34) + (WK::IsWalker(v) ? 2.5f : 4.2f);   // arac govdesinin ustu (yayada baston ustu)
         const float wz = *(float*)(v + 0x18 + 0x38);
         if (!(wx == wx) || !(wy == wy) || !(wz == wz)) continue;
         const float vx = V[0] * wx + V[4] * wy + V[8] * wz + V[12];
@@ -10504,7 +10601,7 @@ void* my_renderStartMenuMain(void* thiz, void* p1, void* p2, void* p3) {
 // ========================================================================
 __attribute__((constructor))
 void ModMain() {
-    LOGI(">>> MULTIPLAYER MOD STARTING <<< build=shopfix-42+walker-v9");
+    LOGI(">>> MULTIPLAYER MOD STARTING <<< build=shopfix-43+walker-v10");
 
     ResetVehicleSyncState();
     std::thread(StartPONGResponderThread).detach();
@@ -10600,12 +10697,8 @@ void ModMain() {
                                         (void**)&orig_Vehicle_updatePipeState, true);
             LOGI("[PIPE] updatePipeState=%p hook=%d", ups, (int)h4);
         }
-        {   // Oyuncu isim etiketleri: kameranin gorunum matrisi RenderArgs::update'ten alinir
-            void* rau = dlsym(appLib, "_ZN10RenderArgs6updateERK9Matrix4x4S2_");
-            if (!rau) rau = FindElfSymbolByPrefix("libapp.so", "_ZN10RenderArgs6update");
-            const bool hr = HookChecked("RenderArgs::update", rau, (void*)my_RenderArgs_update,
-                                        (void**)&orig_RenderArgs_update, true);
-            LOGI("[NAMETAG] RenderArgs::update=%p hook=%d", rau, (int)hr);
+        {   // Oyuncu isim etiketleri: kamera verisi WK::my_RAUpdate'ten gelir (RenderArgs::update ICIN TEK KANCA; ikincisi atlanir)
+            LOGI("[NAMETAG] kamera kaynagi: WK::my_RAUpdate (son kare yasi=%lld ms)", NowMs() - g_CamMs.load());
         }
         {   // romork/alet alim-satim fonksiyonlari (sadece cagrilir) + tarla islemi kancasi
             g_GameAddTrailerFn = (Game_addItem_t)dlsym(appLib, "_ZN4Game10addTrailerEN13EntityManager8TRAILERSERK7Vector3fj");
