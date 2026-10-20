@@ -508,7 +508,10 @@ static void my_SaveStartTask(void* thiz, int cmd, unsigned int slot, int sync) {
         if (cmd == 3) ShowNativeToast("Only the host can save the game.");
         return;
     }
+    const bool wkSave = (cmd == 3 || cmd == 5) && g_EngineInstance != 0;
+    if (wkSave) WK::PreSave(g_EngineInstance);             // v9: kayda yaya "traktor" olarak girmesin (yaya araca geri alinir)
     if (orig_SaveStartTask) orig_SaveStartTask(thiz, cmd, slot, sync);
+    if (wkSave) WK::PostSave(g_EngineInstance);            // kayit senkron bittiyse hemen, asenkronsa OnGameFrame bitince geri olusturur
 }
 
 // Host: oyunun kendi gecici kayit akisi (task 5) calisirken saveFile'a giden veriyi yakala.
@@ -2119,7 +2122,8 @@ static const char* const TEX_FILE     = "objects/walker_diffuse.p2d";
 enum Part { P_TORSO, P_HEAD, P_ARM_L, P_ARM_R, P_LEG_L, P_LEG_R, P_COUNT };
 
 static const int      BASE_TYPE      = 0;      // [!] klonlanacak EntityManager::VEHICLES tipi (en kucuk / en sorunsuz arac)
-static const float    WALK_SPEED     = 2.2f;   // m/s
+static const float    WALK_SPEED     = 3.3f;   // m/s (v9: 2.2 -> 3.3, cok yavasti)
+static const float    RUN_SPEED      = 6.2f;   // m/s (kosma dugmesi)
 static const float    TURN_RATE      = 3.0f;   // rad/s
 static const float    TURN_SIGN      = +1.0f;  // duzeltme: sol/sağ direksiyon işareti ters çevrildi
 static const float    ENTER_RADIUS   = 7.0f;   // uzak inis konumundan da araca tekrar binebilmek icin (m)
@@ -2227,6 +2231,13 @@ static SwitchToState_t orig_SwitchToState = nullptr;
 static void my_SwitchToState(void* game);
 typedef void (*SetMasterVol_t)(void*, uint32_t);                    // VehicleSound::setMasterVolume(this, float bits)
 static SetMasterVol_t fnSetMasterVol = nullptr;
+static volatile bool  g_Run = false;                               // v9: kosma acik mi (dugme ile acilip kapanir)
+static volatile float g_BtnCX = -1, g_BtnCY = -1, g_BtnR = 0;      // v9: Enter/Exit dugmesi (piksel; DrawImGui yazar, dokunma kodu okur)
+static volatile int   g_BtnMode = 0;                               // 0 yok, 1 = Exit Vehicle (aractayken), 2 = Enter Vehicle + Run (yayadayken)
+static volatile bool  g_SkyWanted = false;                         // v9: yayadayken (oyun durumu 6) sanal gokyuzu cizilsin
+static uint64_t my_OpenQueues(void* self);
+typedef uint64_t (*OpenQueues_t)(void*);
+static OpenQueues_t orig_OpenQueues = nullptr;
 static void SoundTick(uintptr_t game);                             // asagida: yayadayken motor sesini kapat
 static void SkyTick(uintptr_t game);                               // asagida: yayadayken gun saatine gore gokyuzu rengi
 static uint32_t* g_Mesh[P_COUNT];              // oyunun IndexedTriangleMesh nesnesi: P[0]=vertexBuf, P[1]=indexBuf [D: enqueueRender]
@@ -2555,7 +2566,8 @@ static void AfterVehicleUpdate(uintptr_t self, uint32_t ua, uint32_t ub, uint32_
     float rl = sqrtf(rx * rx + ry * ry); const float nrx = rl > 1e-4f ? rx / rl : 0.f, nry = rl > 1e-4f ? ry / rl : 0.f;
     float jx = g_JoyX, jy = g_JoyY; if (!(jx == jx) || !(jy == jy)) { jx = 0; jy = 0; }
     { const float jl = sqrtf(jx * jx + jy * jy); if (jl > 1.f) { jx /= jl; jy /= jl; } }
-    const float vx = (fx * jy + nrx * jx) * WALK_SPEED, vy = (fy * jy + nry * jx) * WALK_SPEED;
+    const float spd = g_Run ? RUN_SPEED : WALK_SPEED;
+    const float vx = (fx * jy + nrx * jx) * spd, vy = (fy * jy + nry * jx) * spd;
     // govde yonu: istenen bakis yonune (g_DesYaw) hizlica doner. "saga +" = TURN_SIGN * aci.
     const float pi = 3.14159265358979323846f;
     const float bodyR = TURN_SIGN * *(float*)(body + B_ANGLE);
@@ -2636,30 +2648,36 @@ static void my_RAUpdate(void* self, const float* view, const float* cam) {
 #ifndef WK_LOOK_PITCH_SIGN
 #define WK_LOOK_PITCH_SIGN (-1.0f)   // dikey yon ters ise +1
 #endif
-static void EnterBtnGeom(float W, float H, float* cx, float* cy, float* r) { *r = H * 0.058f; *cx = W * 0.68f; *cy = H * 0.905f; }
 static void JoyGeom(float W, float H, float* cx, float* cy, float* r) {
     *r = H * 0.17f;
-    if (g_JoyActive && g_JoyCX >= 0.f) { *cx = g_JoyCX; *cy = g_JoyCY; } else { *cx = W * 0.15f; *cy = H * 0.68f; }
+    if (g_JoyActive && g_JoyCX >= 0.f) { *cx = g_JoyCX; *cy = g_JoyCY; } else { *cx = W * 0.15f; *cy = H * 0.66f; }
 }
 static void OnFootCancel() { g_JoyX = g_JoyY = 0; g_JoyActive = false; }
+static inline bool InCircle(float x, float y, float cx, float cy, float r) { return (x - cx) * (x - cx) + (y - cy) * (y - cy) <= r * r; }
+// Enter/Exit dugmesi (g_BtnCX/CY/R) ve onun ustundeki Run dugmesi (yayadayken)
+static void RunBtnGeom(float* cx, float* cy, float* r) { *r = g_BtnR * 0.86f; *cx = g_BtnCX; *cy = g_BtnCY - g_BtnR * 2.25f; }
 static bool OnFootTouch(const AInputEvent* ev, int32_t rawAction, float W, float H) {
-    static int s_joyId = -1, s_lookId = -1; static float s_lx = 0, s_ly = 0; static bool s_eat = false;
+    static int s_joyId = -1, s_lookId = -1; static float s_lx = 0, s_ly = 0; static bool s_eat = false, s_btnOnly = false;
     if (W < 100.f || H < 100.f) return false;
     const int32_t act = rawAction & AMOTION_EVENT_ACTION_MASK;
     const size_t n = AMotionEvent_getPointerCount(ev);
     if (n == 0) return s_eat;
     if (act == AMOTION_EVENT_ACTION_DOWN) {
-        s_joyId = s_lookId = -1; OnFootCancel();
-        s_eat = g_OnFoot && AMotionEvent_getY(ev, 0) >= H * 0.12f;             // ust serit oyuna gecer (menu/duraklat)
+        s_joyId = s_lookId = -1; OnFootCancel(); s_btnOnly = false; s_eat = false;
+        const float x0 = AMotionEvent_getX(ev, 0), y0 = AMotionEvent_getY(ev, 0);
+        if (g_OnFoot) s_eat = (y0 >= H * 0.12f);                                // ust serit oyuna gecer (menu/duraklat/shop)
+        else if (g_BtnMode == 1 && g_BtnR > 1.f && InCircle(x0, y0, g_BtnCX, g_BtnCY, g_BtnR * 1.15f)) { g_ReqExit = true; s_eat = true; s_btnOnly = true; }   // Exit Vehicle
     }
     if (!s_eat) return false;
+    if (s_btnOnly) { if (act == AMOTION_EVENT_ACTION_UP || act == AMOTION_EVENT_ACTION_CANCEL) { s_eat = false; s_btnOnly = false; } return true; }
     const size_t api = (size_t)((rawAction & AMOTION_EVENT_ACTION_POINTER_INDEX_MASK) >> AMOTION_EVENT_ACTION_POINTER_INDEX_SHIFT);
     if (act == AMOTION_EVENT_ACTION_DOWN || act == AMOTION_EVENT_ACTION_POINTER_DOWN) {
         const size_t pi = (act == AMOTION_EVENT_ACTION_DOWN) ? 0 : api;
         if (pi < n) {
             const int id = AMotionEvent_getPointerId(ev, pi); const float x = AMotionEvent_getX(ev, pi), y = AMotionEvent_getY(ev, pi);
-            float bx, by, br; EnterBtnGeom(W, H, &bx, &by, &br);
-            if ((x - bx) * (x - bx) + (y - by) * (y - by) <= br * br * 1.5f) { g_ReqEnter = true; }
+            float rx, ry, rr; RunBtnGeom(&rx, &ry, &rr);
+            if (g_BtnR > 1.f && InCircle(x, y, g_BtnCX, g_BtnCY, g_BtnR * 1.15f)) { g_ReqEnter = true; }
+            else if (g_BtnR > 1.f && InCircle(x, y, rx, ry, rr * 1.15f)) { g_Run = !g_Run; }
             else if (x < W * 0.45f && y > H * 0.25f && s_joyId < 0) {
                 float jr = H * 0.17f; s_joyId = id;
                 g_JoyCX = fminf(fmaxf(x, jr), W * 0.45f - jr * 0.5f); g_JoyCY = fminf(fmaxf(y, H * 0.25f + jr * 0.5f), H - jr * 0.6f);
@@ -2789,6 +2807,8 @@ static void Init(void* appLib) {
         {"RenderArgs::update",                "_ZN10RenderArgs6updateE",                (void*)my_RAUpdate,  (void**)&orig_RAUpdate},
         // v8: oyundan cikarken (ana menuye donus) yaya once kaldirilsin -> kalan yaya + cokme onlenir
         {"Game::switchToStateStart",          "_ZN4Game18switchToStateStartE",          (void*)my_SwitchToState, (void**)&orig_SwitchToState},
+        // v9: yayadayken kare baslangicinda (glClear sonrasi) sanal gokyuzu + daglar
+        {"GLESHandheldRenderDevice::openQueues", "_ZN24GLESHandheldRenderDevice10openQueuesE",  (void*)my_OpenQueues, (void**)&orig_OpenQueues},
     };
     StartProfiler();
     for (size_t i = 0; i < sizeof(hooks) / sizeof(hooks[0]); ++i) {
@@ -2879,25 +2899,34 @@ static void RemoveWalkerKeepActive(uintptr_t game, uintptr_t w) {
     LOGI("[WALKER] araca binildi -> yaya silindi (aktif arac=%p)", (void*)act);
 }
 
-// ------------------------------- v8: KAYIT / CIKIS GUVENLIGI -------------------------------
-// Vehicle::serialize tipi this+0x10'dan yazar -> yaya kayda "temel traktor" olarak girer; client host kaydini yukleyince traktor gorur.
-// Host kaydi alinirken (HostCaptureSaveIfRequested) yaya araca geri bindirilir, kayittan sonra ayni yerde yeniden olusturulur.
-struct SaveStash { bool had; float x, y, a, des; };
-static SaveStash g_Stash = {false, 0, 0, 0, 0};
+// ------------------------------- v9: KAYIT / MENU / CIKIS GUVENLIGI -------------------------------
+// Vehicle::serialize tipi this+0x10'dan yazar -> yaya kayda "temel traktor" olarak girer (cikip tekrar girince traktor, client'ta traktor).
+// Ayrica magazada yaya "traktor" olarak listelenir ve satilarak para alinabilirdi. Bu yuzden yaya su durumlarda GEÇICI olarak
+// kaldirilip (araca geri bindirilir) isi bitince ayni yerde yeniden olusturulur ("stash"):
+//   - herhangi bir kayit (SaveGames::startTask 3/5: slot kaydi, gecici kayit, host->client kaydi; kayit bitene kadar beklenir)
+//   - oyun ici menu / magaza / ayarlar (oyun durumu 7)
+struct SaveStash { bool had; float x, y, a; uintptr_t veh; long long ms; };
+static SaveStash g_Stash = {false, 0, 0, 0, 0, 0};
+static inline bool SavePending(uintptr_t game) { return *(volatile uint8_t*)(game + 0xa374 + 0x78) != 0; }   // SaveGames+0x78 = gorev suruyor [D: startTask/processWorkerTask]
 static void PreSave(uintptr_t game) {
-    g_Stash.had = false;
     if (!game || !g_LocalWalker || g_Disabled) return;
     float x, y, a; if (!BodyPose(g_LocalWalker, &x, &y, &a)) return;
-    g_Stash.had = true; g_Stash.x = x; g_Stash.y = y; g_Stash.a = a; g_Stash.des = g_DesYaw;
-    LOGI("[WALKER] PreSave: yaya araca geri aliniyor (%.1f,%.1f)", x, y);
+    g_Stash.had = true; g_Stash.x = x; g_Stash.y = y; g_Stash.a = a; g_Stash.ms = NowMs();
+    LOGI("[WALKER] stash: yaya araca geri aliniyor (%.1f,%.1f)", x, y);
     if (LocalActiveVehiclePtr(game) == g_LocalWalker) DoEnter(game, true); else RemoveWalkerKeepActive(game, g_LocalWalker);
     if (g_LocalWalker) HardRemoveLocalWalker(game);
-    g_OnFoot = false; SoundTick(game);
+    g_Stash.veh = LocalActiveVehiclePtr(game);
+    g_OnFoot = false; g_JoyX = g_JoyY = 0; SoundTick(game);
 }
+// Kayit/menu bitti mi? Bittiyse yayayi ayni yerde geri olustur. Her karede (OnGameFrame) ve kayittan hemen sonra cagrilir.
 static void PostSave(uintptr_t game) {
-    if (!g_Stash.had) return;
+    if (!g_Stash.had || !game) return;
+    const int st = *(volatile int*)(game + G_STATE);
+    if (st != 6 || SavePending(game) || g_LocalWalker || g_Disabled) return;   // henuz degil (st 7 = menu acik, gorev suruyor...)
+    if (NowMs() - g_Stash.ms < 400) return;
     g_Stash.had = false;
-    if (!game || g_LocalWalker || g_Disabled || VehicleCount(game) >= 30) return;
+    const uintptr_t act = LocalActiveVehiclePtr(game);
+    if (!act || act != g_Stash.veh || SlotIndexOfVehicle(game, g_Stash.veh) < 0 || VehicleCount(game) >= 30) { LOGI("[WALKER] stash iptal (aktif arac degisti)"); return; }
     const float pos[3] = {g_Stash.x, 0.0f, g_Stash.y};
     uint32_t ab; memcpy(&ab, &g_Stash.a, 4);
     const uintptr_t lastVeh = g_LastVehicle;
@@ -2906,7 +2935,7 @@ static void PostSave(uintptr_t game) {
     g_LastVehicle = lastVeh; g_HeadYaw = 0; g_DesInit = false; g_JoyX = g_JoyY = 0;
     SetActiveByPtr(game, RawVehicleSlot(game, idx));
     g_OnFoot = true; SoundTick(game);
-    LOGI("[WALKER] PostSave: yaya yeniden olusturuldu");
+    LOGI("[WALKER] stash: yaya yeniden olusturuldu");
 }
 // Ana menuye donus: yaya (sahte Vehicle) oyun kapanirken geride kalmasin.
 static void my_SwitchToState(void* game) {
@@ -2914,6 +2943,7 @@ static void my_SwitchToState(void* game) {
         LOGI("[WALKER] switchToStateStart: yaya kaldiriliyor");
         HardRemoveLocalWalker((uintptr_t)game); g_OnFoot = false; SoundTick((uintptr_t)game);
     }
+    g_Stash.had = false;
     if (orig_SwitchToState) orig_SwitchToState(game);
 }
 
@@ -2931,39 +2961,214 @@ static void SoundTick(uintptr_t game) {
     }
 }
 
-// ------------------------------- v8: GOKYUZU (GL thread) -------------------------------
-// Oyunun ana temizleme rengi acilista zeytin yesili olarak ayarlanir ve kalici GL durumudur. Yayadayken her karede gun saatine gore
-// glClearColor cagirilir (arazi bitince gorunen "gokyuzu"); aractayken eski renk geri yazilir.
+// ------------------------------- v9: GOKYUZU (GL thread) -------------------------------
+// Oyunun ana temizleme rengi (zeytin yesili) arazi bitince gorunur. Yayadayken Game'in kare baslangicindaki GLESHandheldRenderDevice::openQueues
+// (glClear + glViewport) ARDINDAN, sahne cizilmeden once tam ekran bir "gokyuzu" cizilir (derinlik yazilmaz -> sahne her seyin onunde kalir):
+// gun saatine gore gradyan, gunes/ay, yildizlar (gece), bulutlar ve ufuktaki daglar (buton_texture.h icindeki mountain_png_data).
+// GL durumu cizimden once kaydedilip sonra birebir geri yazilir (oyunun cihaz onbellegi bozulmasin).
+struct SkyParams { float hz[3], zn[3], sun[3]; float day, night; };
+static float Sstep(float a, float b, float x) { float t = fminf(fmaxf((x - a) / (b - a), 0.f), 1.f); return t * t * (3.f - 2.f * t); }
+static void Lerp3(const float* a, const float* b, float t, float* o) { for (int i = 0; i < 3; ++i) o[i] = a[i] + (b[i] - a[i]) * t; }
+static double ReadHour(uintptr_t game, double* rawOut) {
+    double v = 0; memcpy(&v, (const void*)(game + 0xa098 + 0x18), 8);          // Environment: gun saati [D: getDayTime = env+0x18, double]
+    double h = 12.0;
+    if (v == v && v >= 0.0 && v < 1e12) { if (v >= 48.0) h = fmod(v / 3600.0, 24.0); else if (v <= 1.0) h = v * 24.0; else h = fmod(v, 24.0); }
+    if (rawOut) *rawOut = v;
+    return h;
+}
+static void ComputeSky(double hour, SkyParams* o) {
+    const float pi = 3.14159265f;
+    const float ang = (float)((hour - 6.0) / 12.0 * pi);                       // 6:00 dogus, 12:00 tepe, 18:00 batis
+    const float sn = sinf(ang);
+    float sx = cosf(ang), sy = sn, sz = 0.35f; const float l = sqrtf(sx * sx + sy * sy + sz * sz);
+    o->sun[0] = sx / l; o->sun[1] = sy / l; o->sun[2] = sz / l;
+    const float day = Sstep(-0.10f, 0.30f, sn);
+    const float tw = expf(-powf(sn / 0.20f, 2.f));                             // gun dogumu/batimi (turuncu) agirligi
+    o->day = day; o->night = 1.f - Sstep(-0.18f, 0.02f, sn);
+    static const float dayH[3] = {0.74f, 0.84f, 0.93f}, dayZ[3] = {0.30f, 0.52f, 0.84f}, nightH[3] = {0.05f, 0.06f, 0.13f}, nightZ[3] = {0.01f, 0.015f, 0.05f};
+    static const float orange[3] = {0.98f, 0.60f, 0.34f}, twZ[3] = {0.30f, 0.33f, 0.58f};
+    float h[3], z[3];
+    Lerp3(nightH, dayH, day, h); Lerp3(h, orange, tw * 0.80f, o->hz);
+    Lerp3(nightZ, dayZ, day, z); Lerp3(z, twZ, tw * 0.50f, o->zn);
+}
+static bool g_SkyGLOk = false, g_SkyGLFail = false;
+static const char* kSkyVS = "attribute vec2 aPos; varying vec2 vP; void main(){ vP = aPos; gl_Position = vec4(aPos, 0.0, 1.0); }";
+static const char* kSkyFS =
+    "#ifdef GL_FRAGMENT_PRECISION_HIGH\nprecision highp float;\n#else\nprecision mediump float;\n#endif\n"
+    "varying vec2 vP; uniform vec3 uR, uU, uF, uHz, uZn, uSun; uniform vec2 uTan; uniform vec4 uP; uniform vec4 uM; uniform sampler2D uTex;\n"
+    "float h31(vec3 p){ p = fract(p * 0.1031); p += dot(p, p.yzx + 33.33); return fract((p.x + p.y) * p.z); }\n"
+    "float h21(vec2 p){ vec3 q = fract(vec3(p.xyx) * 0.1031); q += dot(q, q.yzx + 33.33); return fract((q.x + q.y) * q.z); }\n"
+    "float vn(vec2 p){ vec2 i = floor(p); vec2 f = fract(p); f = f * f * (3.0 - 2.0 * f);\n"
+    "  return mix(mix(h21(i), h21(i + vec2(1.0, 0.0)), f.x), mix(h21(i + vec2(0.0, 1.0)), h21(i + vec2(1.0, 1.0)), f.x), f.y); }\n"
+    "float fbm(vec2 p){ float a = 0.5; float s = 0.0; for (int i = 0; i < 4; i++) { s += a * vn(p); p = p * 2.03 + vec2(1.7, 9.2); a *= 0.5; } return s; }\n"
+    "void main(){\n"
+    "  vec3 ray = normalize(uF + vP.x * uTan.x * uR + vP.y * uTan.y * uU);\n"
+    "  float e = ray.y; float day = uP.x; float night = uP.y; float tm = uP.z;\n"
+    "  vec3 col = mix(uHz, uZn, pow(clamp(e, 0.0, 1.0), 0.5));\n"
+    "  if (e < 0.0) col = uHz * 0.92;\n"
+    "  float sd = max(dot(ray, uSun), 0.0);\n"
+    "  col += vec3(1.0, 0.85, 0.6) * (pow(sd, 900.0) * 1.6 + pow(sd, 24.0) * 0.25) * smoothstep(-0.05, 0.08, uSun.y);\n"
+    "  float md = max(dot(ray, -uSun), 0.0);\n"
+    "  col = mix(col, vec3(0.92, 0.94, 1.0), smoothstep(0.99965, 0.9998, md) * night * step(0.0, -uSun.y));\n"
+    "  col += vec3(0.5, 0.6, 0.9) * pow(md, 40.0) * 0.08 * night;\n"
+    "  if (night > 0.02 && e > 0.0) { vec3 q = ray * 70.0; vec3 c = floor(q); float r = h31(c); vec3 f = fract(q) - 0.5; float d = length(f);\n"
+    "    float st = step(0.975, r) * smoothstep(0.22, 0.0, d); st *= 0.6 + 0.4 * sin(tm * 2.5 + r * 60.0); col += vec3(st) * night * smoothstep(0.0, 0.12, e); }\n"
+    "  if (e > 0.01) { vec2 uv = ray.xz / (e + 0.18) * 1.1 + vec2(tm * 0.012, tm * 0.004); float n = fbm(uv); float c = smoothstep(0.50, 0.80, n) * smoothstep(0.01, 0.22, e);\n"
+    "    vec3 lit = mix(vec3(0.20, 0.22, 0.30), vec3(1.0), day); lit = mix(lit, vec3(1.0, 0.78, 0.60), clamp(1.0 - abs(uSun.y) * 3.0, 0.0, 1.0) * day * 0.6);\n"
+    "    vec3 cc = mix(lit * 0.72, lit, smoothstep(0.55, 0.85, n)); col = mix(col, cc, c * 0.9); }\n"
+    "  if (uM.z > 0.0) { float az = atan(ray.x, ray.z); float t = az * 0.1591549 * uM.z; float u = abs(mod(t, 2.0) - 1.0); float v = (e - uM.x) / (uM.y - uM.x);\n"
+    "    if (v < 1.0) { float vv = clamp(v, 0.0, 1.0); vec4 m = texture2D(uTex, vec2(u, 1.0 - vv)); vec3 mc = mix(m.rgb, uHz, 0.38); mc *= 0.12 + 0.88 * day; col = mix(col, mc, m.a); } }\n"
+    "  gl_FragColor = vec4(col, 1.0);\n"
+    "}\n";
+static GLuint SkyCompile(GLenum type, const char* src) {
+    const GLuint sh = glCreateShader(type); glShaderSource(sh, 1, &src, nullptr); glCompileShader(sh);
+    GLint ok = 0; glGetShaderiv(sh, GL_COMPILE_STATUS, &ok);
+    if (!ok) { char log[512]; GLsizei n = 0; glGetShaderInfoLog(sh, sizeof log - 1, &n, log); log[n] = 0; LOGI("[WALKER] gokyuzu shader HATA (%s): %s", type == GL_VERTEX_SHADER ? "vs" : "fs", log); glDeleteShader(sh); return 0; }
+    return sh;
+}
+static GLuint s_skyProg = 0, s_skyVbo = 0, s_skyTex = 0; static GLint s_uR, s_uU, s_uF, s_uHz, s_uZn, s_uSun, s_uTan, s_uP, s_uM, s_uTex;
+static bool SkyInitGL() {
+    const GLuint vs = SkyCompile(GL_VERTEX_SHADER, kSkyVS), fs = SkyCompile(GL_FRAGMENT_SHADER, kSkyFS);
+    if (!vs || !fs) return false;
+    s_skyProg = glCreateProgram(); glAttachShader(s_skyProg, vs); glAttachShader(s_skyProg, fs);
+    glBindAttribLocation(s_skyProg, 0, "aPos"); glLinkProgram(s_skyProg);
+    GLint ok = 0; glGetProgramiv(s_skyProg, GL_LINK_STATUS, &ok);
+    if (!ok) { char log[512]; GLsizei n = 0; glGetProgramInfoLog(s_skyProg, sizeof log - 1, &n, log); log[n] = 0; LOGI("[WALKER] gokyuzu program HATA: %s", log); return false; }
+    s_uR = glGetUniformLocation(s_skyProg, "uR"); s_uU = glGetUniformLocation(s_skyProg, "uU"); s_uF = glGetUniformLocation(s_skyProg, "uF");
+    s_uHz = glGetUniformLocation(s_skyProg, "uHz"); s_uZn = glGetUniformLocation(s_skyProg, "uZn"); s_uSun = glGetUniformLocation(s_skyProg, "uSun");
+    s_uTan = glGetUniformLocation(s_skyProg, "uTan"); s_uP = glGetUniformLocation(s_skyProg, "uP"); s_uM = glGetUniformLocation(s_skyProg, "uM"); s_uTex = glGetUniformLocation(s_skyProg, "uTex");
+    static const float quad[8] = {-1.f, -1.f, 1.f, -1.f, -1.f, 1.f, 1.f, 1.f};
+    glGenBuffers(1, &s_skyVbo); glBindBuffer(GL_ARRAY_BUFFER, s_skyVbo); glBufferData(GL_ARRAY_BUFFER, sizeof quad, quad, GL_STATIC_DRAW);
+    int w = 0, h = 0, ch = 0;
+    unsigned char* px = stbi_load_from_memory(mountain_png_data, mountain_png_len, &w, &h, &ch, 4);
+    if (px && w > 0 && h > 0) {
+        glGenTextures(1, &s_skyTex); glBindTexture(GL_TEXTURE_2D, s_skyTex);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR); glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE); glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, w, h, 0, GL_RGBA, GL_UNSIGNED_BYTE, px);
+        stbi_image_free(px); LOGI("[WALKER] dag dokusu yuklendi %dx%d", w, h);
+    } else { LOGI("[WALKER] dag dokusu YUKLENEMEDI (dagsiz gokyuzu)"); if (px) stbi_image_free(px); }
+    return true;
+}
+static void DrawSkyGL(uintptr_t game) {
+    if (!game || (uint32_t)(g_TickGame - g_FpStamp) > 6) return;               // kamera guncel degilse cizme
+    // --- GL durumunu kaydet ---
+    GLint prog = 0, abuf = 0, ebuf = 0, atex = 0, tex0 = 0, vp[4] = {0, 0, 0, 0}, bsr = 0, bdr = 0, bsa = 0, bda = 0, beR = 0, beA = 0;
+    GLint en0 = 0, ab0 = 0, sz0 = 4, ty0 = GL_FLOAT, st0 = 0; GLint nm0 = 0; GLvoid* pt0 = nullptr; GLboolean dmask = GL_TRUE, cmask[4] = {1, 1, 1, 1};
+    glGetIntegerv(GL_CURRENT_PROGRAM, &prog); glGetIntegerv(GL_ARRAY_BUFFER_BINDING, &abuf); glGetIntegerv(GL_ELEMENT_ARRAY_BUFFER_BINDING, &ebuf);
+    glGetIntegerv(GL_ACTIVE_TEXTURE, &atex); glActiveTexture(GL_TEXTURE0); glGetIntegerv(GL_TEXTURE_BINDING_2D, &tex0); glGetIntegerv(GL_VIEWPORT, vp);
+    const GLboolean eDepth = glIsEnabled(GL_DEPTH_TEST), eBlend = glIsEnabled(GL_BLEND), eCull = glIsEnabled(GL_CULL_FACE), eScis = glIsEnabled(GL_SCISSOR_TEST), eSten = glIsEnabled(GL_STENCIL_TEST);
+    glGetBooleanv(GL_DEPTH_WRITEMASK, &dmask); glGetBooleanv(GL_COLOR_WRITEMASK, cmask);
+    glGetIntegerv(GL_BLEND_SRC_RGB, &bsr); glGetIntegerv(GL_BLEND_DST_RGB, &bdr); glGetIntegerv(GL_BLEND_SRC_ALPHA, &bsa); glGetIntegerv(GL_BLEND_DST_ALPHA, &bda);
+    glGetIntegerv(GL_BLEND_EQUATION_RGB, &beR); glGetIntegerv(GL_BLEND_EQUATION_ALPHA, &beA);
+    glGetVertexAttribiv(0, GL_VERTEX_ATTRIB_ARRAY_ENABLED, &en0); glGetVertexAttribiv(0, GL_VERTEX_ATTRIB_ARRAY_BUFFER_BINDING, &ab0);
+    glGetVertexAttribiv(0, GL_VERTEX_ATTRIB_ARRAY_SIZE, &sz0); glGetVertexAttribiv(0, GL_VERTEX_ATTRIB_ARRAY_TYPE, &ty0);
+    glGetVertexAttribiv(0, GL_VERTEX_ATTRIB_ARRAY_NORMALIZED, &nm0); glGetVertexAttribiv(0, GL_VERTEX_ATTRIB_ARRAY_STRIDE, &st0);
+    glGetVertexAttribPointerv(0, GL_VERTEX_ATTRIB_ARRAY_POINTER, &pt0);
+    // --- ilk kullanimda kaynaklari olustur ---
+    if (!g_SkyGLOk) {
+        if (!SkyInitGL()) { g_SkyGLFail = true; LOGI("[WALKER] gokyuzu GL kapandi (derleme hatasi): temizleme rengine donuldu"); }
+        else g_SkyGLOk = true;
+        glBindTexture(GL_TEXTURE_2D, (GLuint)tex0); glActiveTexture((GLenum)atex); glBindBuffer(GL_ARRAY_BUFFER, (GLuint)abuf); glUseProgram((GLuint)prog);
+        if (!g_SkyGLOk) return;
+    }
+    double raw = 0; const double hour = ReadHour(game, &raw);
+    SkyParams sp; ComputeSky(hour, &sp);
+    const float* C = g_FpCam;                                                  // kamera dunya matrisi (kolon-major): x=sag, y=yukari, -z=ileri
+    const float R[3] = {C[0], C[1], C[2]}, U[3] = {C[4], C[5], C[6]}, F[3] = {-C[8], -C[9], -C[10]};
+    float tanX = 0.80f, tanY = 0.50f;
+    { const float* pj = (const float*)(game + 0xa2b0); const float* pj2 = (const float*)(game + 0xa270);
+      if (pj[5] > 0.3f && pj[5] < 8.f && pj[0] > 0.3f && pj[0] < 8.f) { tanX = 1.f / pj[0]; tanY = 1.f / pj[5]; }
+      else if (pj2[5] > 0.3f && pj2[5] < 8.f && pj2[0] > 0.3f && pj2[0] < 8.f) { tanX = 1.f / pj2[0]; tanY = 1.f / pj2[5]; }
+      else if (vp[3] > 0) { tanX = tanY * (float)vp[2] / (float)vp[3]; } }
+    { static long long s_l = 0; const long long now = NowMs(); if (now - s_l > 10000) { s_l = now; LOGI("[WALKER] gokyuzu GL: saat=%.2f (ham=%.3f) tan=(%.2f,%.2f) vp=%dx%d gunes.y=%.2f gunduz=%.2f", hour, raw, tanX, tanY, vp[2], vp[3], sp.sun[1], sp.day); } }
+    // --- ciz ---
+    glDisable(GL_DEPTH_TEST); glDisable(GL_BLEND); glDisable(GL_CULL_FACE); glDisable(GL_SCISSOR_TEST); glDisable(GL_STENCIL_TEST);
+    glDepthMask(GL_FALSE); glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+    glUseProgram(s_skyProg);
+    glBindBuffer(GL_ARRAY_BUFFER, s_skyVbo); glEnableVertexAttribArray(0); glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 0, (const void*)0);
+    glUniform3fv(s_uR, 1, R); glUniform3fv(s_uU, 1, U); glUniform3fv(s_uF, 1, F); glUniform3fv(s_uHz, 1, sp.hz); glUniform3fv(s_uZn, 1, sp.zn); glUniform3fv(s_uSun, 1, sp.sun);
+    glUniform2f(s_uTan, tanX, tanY);
+    glUniform4f(s_uP, sp.day, sp.night, (float)fmod((double)NowMs() * 0.001, 10000.0), 0.f);
+    glUniform4f(s_uM, -0.05f, 0.10f, s_skyTex ? 4.0f : 0.0f, 0.f);
+    glActiveTexture(GL_TEXTURE0); glBindTexture(GL_TEXTURE_2D, s_skyTex); glUniform1i(s_uTex, 0);
+    glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+    // --- durumu geri yaz ---
+    glBindBuffer(GL_ARRAY_BUFFER, (GLuint)ab0);
+    glVertexAttribPointer(0, sz0, (GLenum)ty0, (GLboolean)nm0, st0, pt0);
+    if (!en0) glDisableVertexAttribArray(0);
+    glBindBuffer(GL_ARRAY_BUFFER, (GLuint)abuf); glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, (GLuint)ebuf);
+    glBindTexture(GL_TEXTURE_2D, (GLuint)tex0); glActiveTexture((GLenum)atex); glUseProgram((GLuint)prog);
+    glDepthMask(dmask); glColorMask(cmask[0], cmask[1], cmask[2], cmask[3]);
+    if (eDepth) glEnable(GL_DEPTH_TEST); if (eBlend) glEnable(GL_BLEND); if (eCull) glEnable(GL_CULL_FACE); if (eScis) glEnable(GL_SCISSOR_TEST); if (eSten) glEnable(GL_STENCIL_TEST);
+    glBlendFuncSeparate((GLenum)bsr, (GLenum)bdr, (GLenum)bsa, (GLenum)bda); glBlendEquationSeparate((GLenum)beR, (GLenum)beA);
+}
+static uint64_t my_OpenQueues(void* self) {
+    const uint64_t r = orig_OpenQueues ? orig_OpenQueues(self) : 0;
+    if (g_SkyWanted && !g_SkyGLFail && g_EngineInstance) DrawSkyGL(g_EngineInstance);
+    return r;
+}
+// Yedek yontem (GL gokyuzu kapaliysa): oyunun kalici temizleme rengini gun saatine gore ayarla; aractayken eski renge don.
 typedef void (*ClearColor_t)(float, float, float, float);
 static ClearColor_t fnClearColor = nullptr;
-static void SkyColorForHour(double h, float* o) {
-    struct K { float h, r, g, b; };
-    static const K k[] = { {0.f, .02f, .03f, .10f}, {4.5f, .03f, .04f, .13f}, {5.8f, .85f, .45f, .25f}, {7.3f, .70f, .72f, .85f}, {9.5f, .36f, .62f, .95f},
-                           {16.0f, .36f, .62f, .95f}, {17.6f, .98f, .78f, .38f}, {19.0f, .95f, .50f, .22f}, {20.5f, .30f, .17f, .32f}, {22.0f, .03f, .04f, .13f}, {24.f, .02f, .03f, .10f} };
-    const int n = (int)(sizeof(k) / sizeof(k[0]));
-    for (int i = 0; i + 1 < n; ++i) if (h >= k[i].h && h <= k[i + 1].h) {
-        const float t = (float)((h - k[i].h) / (k[i + 1].h - k[i].h));
-        o[0] = k[i].r + (k[i + 1].r - k[i].r) * t; o[1] = k[i].g + (k[i + 1].g - k[i].g) * t; o[2] = k[i].b + (k[i + 1].b - k[i].b) * t; return;
-    }
-    o[0] = .36f; o[1] = .62f; o[2] = .95f;
-}
 static void SkyTick(uintptr_t game) {
-    static bool s_applied = false; static long long s_log = 0;
+    static bool s_applied = false;
+    if (!orig_OpenQueues) g_SkyGLFail = true;                                  // openQueues kancasi takilamadiysa yedek yonteme gec
     if (!fnClearColor) {
         fnClearColor = (ClearColor_t)dlsym(RTLD_DEFAULT, "glClearColor");
         if (!fnClearColor) { void* h = dlopen("libGLESv2.so", RTLD_NOW); if (h) fnClearColor = (ClearColor_t)dlsym(h, "glClearColor"); }
-        if (!fnClearColor) { static bool w = false; if (!w) { w = true; LOGI("[WALKER] glClearColor bulunamadi: gokyuzu rengi yok"); } return; }
+        if (!fnClearColor) return;
     }
-    if (g_OnFoot && g_FirstPerson) {
-        double v = 0; memcpy(&v, (const void*)(game + 0xa098 + 0x18), 8);        // Environment: gun saati [D: getDayTime = env+0x18, double]
-        double h = 12.0;
-        if (v == v && v >= 0.0 && v < 1e12) { if (v >= 48.0) h = fmod(v / 3600.0, 24.0); else if (v <= 1.0) h = v * 24.0; else h = fmod(v, 24.0); }
-        float c[3]; SkyColorForHour(h, c);
-        fnClearColor(c[0], c[1], c[2], 1.0f); s_applied = true;
-        const long long now = NowMs(); if (now - s_log > 10000) { s_log = now; LOGI("[WALKER] gokyuzu: dayTime ham=%.3f saat=%.2f renk=(%.2f,%.2f,%.2f)", v, h, c[0], c[1], c[2]); }
+    if (g_OnFoot && g_FirstPerson && g_SkyGLFail) {
+        SkyParams sp; ComputeSky(ReadHour(game, nullptr), &sp); fnClearColor(sp.hz[0], sp.hz[1], sp.hz[2], 1.0f); s_applied = true;
     } else if (s_applied) {
         fnClearColor(0.221f, 0.241f, 0.0627f, 1.0f); s_applied = false;
     }
+}
+
+// ------------------------------- v9: OYUN HUD'I (kaydiricilar gizle + alt satir konumu) -------------------------------
+// GenericGUIManager = Game+0x2c88 [D: renderBaseMenu cagrisi]. Dugme dizisi manager+8 + i*0xB0: +0x0C bayrak (bit7 = CIZME), +0x20 x (0..1).
+// Alt satir: sayac manager+0x59A8, liste manager+0x59AC (dugme indisleri), aralik manager+0x5910.
+// Sol (direksiyon) kaydirici = indisler @0x5994/5998/599C/59A0, sag (gaz/fren) kaydirici = indisler @0x59B8/0x59BC [D: updateBaseMenu/ctor].
+static void HudTick(uintptr_t game) {
+    static uint8_t s_orig[6]; static bool s_hidden = false;
+    uint8_t* gm = (uint8_t*)(game + 0x2c88);
+    static const int offs[6] = {0x5994, 0x5998, 0x599C, 0x59A0, 0x59B8, 0x59BC};
+    const int cnt = *(int*)(gm + 4);
+    if (cnt <= 0 || cnt > 200) return;
+    if (g_OnFoot) {
+        for (int i = 0; i < 6; ++i) {
+            const int idx = *(int*)(gm + offs[i]); if (idx < 0 || idx >= cnt) continue;
+            uint8_t* f = gm + (size_t)idx * 0xB0 + 0x0C;
+            if (!s_hidden) s_orig[i] = *f & 0x80;
+            *f |= 0x80;
+        }
+        if (!s_hidden) LOGI("[WALKER] eski gaz/direksiyon kaydiricilari gizlendi (dugme sayisi=%d)", cnt);
+        s_hidden = true;
+    } else if (s_hidden) {
+        for (int i = 0; i < 6; ++i) {
+            const int idx = *(int*)(gm + offs[i]); if (idx < 0 || idx >= cnt) continue;
+            uint8_t* f = gm + (size_t)idx * 0xB0 + 0x0C;
+            *f = (uint8_t)((*f & 0x7F) | s_orig[i]);
+        }
+        s_hidden = false;
+    }
+}
+// Alt satirdaki son oyun dugmesinin hemen sagi: Enter/Exit dugmesi buraya gelir (dugme sayisi 3-4-5 olsa da ust uste binmez).
+static bool HudRowNext(uintptr_t game, float W, float H, float R, float* cx, float* cy) {
+    const uint8_t* gm = (const uint8_t*)(game + 0x2c88);
+    const int cnt = *(const int*)(gm + 4), n = *(const int*)(gm + 0x59A8);
+    *cx = W * 0.62f; *cy = H * 0.92f;
+    if (cnt <= 0 || cnt > 200 || n < 6 || n > 40) return false;
+    const int last = *(const int*)(gm + 0x59AC + (n - 1) * 4);
+    if (last < 0 || last >= cnt) return false;
+    const float xl = *(const float*)(gm + (size_t)last * 0xB0 + 0x20), sp = *(const float*)(gm + 0x5910);
+    if (!(xl > 0.05f && xl < 1.0f && sp > 0.03f && sp < 0.3f)) return false;
+    float x = (xl + sp) * W + R; if (x > W - R * 1.2f) x = W - R * 1.2f;
+    *cx = x; *cy = H * 0.92f;
+    static long long s_l = 0; const long long now = NowMs();
+    if (now - s_l > 8000) { s_l = now; LOGI("[WALKER] HUD satiri: n=%d son=%d x=%.3f aralik=%.3f -> dugme (%.0f,%.0f) R=%.0f ekran=%.0fx%.0f", n, last, xl, sp, x, *cy, R, W, H); }
+    return true;
 }
 
 static void OnGameFrame(uintptr_t game) {
@@ -2996,13 +3201,23 @@ static void OnGameFrame(uintptr_t game) {
             else s_notActive = 0;
         } else s_notActive = 0;
     }
-    {   // v8: durum + cikis guvenligi + ses
+    {   // v9: oyun durumu + menu/kayit guvenligi + ses + HUD
         const int st = *(volatile int*)(game + G_STATE), sub = *(volatile int*)(game + 0x68);
-        if (g_LocalWalker && st == 7 && sub == 7) { LOGI("[WALKER] cikis onayi: yaya kaldiriliyor"); HardRemoveLocalWalker(game); }
-        else if (g_LocalWalker && st != 6 && st != 7) { std::lock_guard<std::mutex> lk(g_Mu); g_LocalWalker = 0; g_Walkers.clear(); }   // oyun dunyasi gitti: sadece kayit tut
-        g_OnFoot = g_LocalWalker && LocalActiveVehiclePtr(game) == g_LocalWalker;
-        if (!g_OnFoot) { g_JoyX = g_JoyY = 0; g_JoyActive = false; }
+        static int s_lst = -1, s_lsub = -1;
+        if ((g_LocalWalker || g_Stash.had) && (st != s_lst || sub != s_lsub)) LOGI("[WALKER] oyun durumu st=%d sub=%d (yaya=%d stash=%d)", st, sub, (int)(g_LocalWalker != 0), (int)g_Stash.had);
+        s_lst = st; s_lsub = sub;
+        if (g_LocalWalker && st == 7) {                                        // oyun ici menu / magaza / ayarlar: yaya gecici kaldirilir (magazada traktor gorunmesin, satilamasin)
+            if (sub == 7) { LOGI("[WALKER] cikis onayi: yaya kaldiriliyor"); HardRemoveLocalWalker(game); g_Stash.had = false; }
+            else PreSave(game);
+        }
+        else if (g_LocalWalker && st != 6 && st != 7) { std::lock_guard<std::mutex> lk(g_Mu); g_LocalWalker = 0; g_Walkers.clear(); g_Stash.had = false; }   // oyun dunyasi gitti: sadece kayit tut
+        if (st != 6 && st != 7) g_Stash.had = false;
+        PostSave(game);                                                        // menu/kayit bittiyse yayayi geri olustur
+        g_OnFoot = g_LocalWalker && st == 6 && LocalActiveVehiclePtr(game) == g_LocalWalker;   // v9: menude/magazada dokunmalar yutulmasin
+        g_SkyWanted = g_OnFoot;
+        if (!g_OnFoot) { g_JoyX = g_JoyY = 0; g_JoyActive = false; g_Run = false; }
         SoundTick(game);
+        HudTick(game);
     }
     if (g_ReqExit)  { g_ReqExit = false;  DoExit(game); }
     if (g_ReqEnter) { g_ReqEnter = false; DoEnter(game, false); }
@@ -3016,8 +3231,30 @@ static void AddLook(float dYawRight, float dPitch) {                      // v8:
     if (g_HeadPitch > 1.3f)  g_HeadPitch = 1.3f;
     if (g_HeadPitch < -1.3f) g_HeadPitch = -1.3f;
 }
-// v8: yaya arayuzu (joystick + yuvarlak gumus "Enter Vehicle" dugmesi). ImGui penceresi acilmaz -> dokunma yakalamasi yok; dokunmalar OnFootTouch'ta.
-static void DrawFootUI(const ImVec2& screen) {
+// v9: yaya arayuzu (joystick) + oyunun alt beyaz yuvarlak dugmelerine benzeyen gumus dugmeler (Enter / Exit / Run).
+// ImGui penceresi acilmaz -> dokunma yakalamasi yok; dokunmalar OnFootTouch'ta islenir.
+static void DrawRoundBtn(ImDrawList* dl, float bx, float by, float br, const char* label, int icon, bool on) {
+    const ImVec2 c(bx, by);
+    dl->AddCircleFilled(ImVec2(bx, by + br * 0.06f), br, IM_COL32(0, 0, 0, 70), 48);                  // golge
+    dl->AddCircleFilled(c, br, on ? IM_COL32(255, 214, 120, 250) : IM_COL32(226, 228, 231, 245), 48);  // gumus yuz (acikken sari)
+    dl->AddCircleFilled(ImVec2(bx, by - br * 0.18f), br * 0.78f, IM_COL32(244, 245, 247, 150), 40);    // ust parlama
+    dl->AddCircle(c, br, IM_COL32(122, 126, 131, 255), 48, 3.0f);
+    dl->AddCircle(c, br * 0.86f, IM_COL32(255, 255, 255, 210), 48, 2.0f);
+    const ImU32 ink = IM_COL32(70, 74, 79, 255);
+    if (icon == 0) {                                                                                   // arac simgesi
+        dl->AddRectFilled(ImVec2(bx - br * 0.28f, by - br * 0.58f), ImVec2(bx + br * 0.28f, by - br * 0.30f), ink, br * 0.08f);
+        dl->AddRectFilled(ImVec2(bx - br * 0.56f, by - br * 0.32f), ImVec2(bx + br * 0.56f, by - br * 0.02f), ink, br * 0.08f);
+        dl->AddCircleFilled(ImVec2(bx - br * 0.33f, by - br * 0.02f), br * 0.12f, ink, 16);
+        dl->AddCircleFilled(ImVec2(bx + br * 0.33f, by - br * 0.02f), br * 0.12f, ink, 16);
+    } else {                                                                                           // kosma: iki ok
+        for (int k = 0; k < 2; ++k) { const float ox = bx - br * 0.30f + k * br * 0.36f;
+            dl->AddTriangleFilled(ImVec2(ox, by - br * 0.52f), ImVec2(ox, by - br * 0.04f), ImVec2(ox + br * 0.30f, by - br * 0.28f), ink); }
+    }
+    ImFont* f = ImGui::GetFont(); const float fs = br * 0.27f;
+    const ImVec2 ts = f->CalcTextSizeA(fs, 1e9f, 0.f, label);
+    dl->AddText(f, fs, ImVec2(bx - ts.x * 0.5f, by + br * 0.20f), ink, label);
+}
+static void DrawFootUI(uintptr_t game, const ImVec2& screen) {
     ImDrawList* dl = ImGui::GetBackgroundDrawList(); if (!dl) return;
     float cx, cy, r; JoyGeom(screen.x, screen.y, &cx, &cy, &r);
     const bool act = g_JoyActive;
@@ -3025,39 +3262,35 @@ static void DrawFootUI(const ImVec2& screen) {
     dl->AddCircle(ImVec2(cx, cy), r, IM_COL32(255, 255, 255, act ? 170 : 100), 48, 3.0f);
     dl->AddCircleFilled(ImVec2(cx + g_JoyX * r * 0.6f, cy - g_JoyY * r * 0.6f), r * 0.38f, IM_COL32(235, 237, 240, act ? 220 : 150), 40);
     dl->AddCircle(ImVec2(cx + g_JoyX * r * 0.6f, cy - g_JoyY * r * 0.6f), r * 0.38f, IM_COL32(110, 114, 118, 200), 40, 2.5f);
-    float bx, by, br; EnterBtnGeom(screen.x, screen.y, &bx, &by, &br);
-    const ImVec2 c(bx, by);
-    dl->AddCircleFilled(ImVec2(bx, by + br * 0.06f), br, IM_COL32(0, 0, 0, 70), 48);                 // golge
-    dl->AddCircleFilled(c, br, IM_COL32(226, 228, 231, 245), 48);                                     // gumus yuz
-    dl->AddCircleFilled(ImVec2(bx, by - br * 0.18f), br * 0.78f, IM_COL32(244, 245, 247, 150), 40);   // ust parlama
-    dl->AddCircle(c, br, IM_COL32(122, 126, 131, 255), 48, 3.0f);
-    dl->AddCircle(c, br * 0.86f, IM_COL32(255, 255, 255, 210), 48, 2.0f);
-    const ImU32 ink = IM_COL32(70, 74, 79, 255);                                                      // arac simgesi
-    dl->AddRectFilled(ImVec2(bx - br * 0.28f, by - br * 0.58f), ImVec2(bx + br * 0.28f, by - br * 0.30f), ink, br * 0.08f);
-    dl->AddRectFilled(ImVec2(bx - br * 0.56f, by - br * 0.32f), ImVec2(bx + br * 0.56f, by - br * 0.02f), ink, br * 0.08f);
-    dl->AddCircleFilled(ImVec2(bx - br * 0.33f, by - br * 0.02f), br * 0.12f, ink, 16);
-    dl->AddCircleFilled(ImVec2(bx + br * 0.33f, by - br * 0.02f), br * 0.12f, ink, 16);
-    ImFont* f = ImGui::GetFont(); const float fs = br * 0.27f; const char* t = "ENTER";
-    const ImVec2 ts = f->CalcTextSizeA(fs, 1e9f, 0.f, t);
-    dl->AddText(f, fs, ImVec2(bx - ts.x * 0.5f, by + br * 0.20f), ink, t);
+    const float br = screen.y * 0.053f; float bx, by; HudRowNext(game, screen.x, screen.y, br, &bx, &by);
+    g_BtnCX = bx; g_BtnCY = by; g_BtnR = br; g_BtnMode = 2;
+    DrawRoundBtn(dl, bx, by, br, "ENTER", 0, false);
+    DrawRoundBtn(dl, bx, by - br * 2.25f, br * 0.86f, g_Run ? "RUN ON" : "RUN", 1, g_Run);
 }
 // GL thread'i (ImGui kare fonksiyonundan). Etiketler Ingilizce: oyunun yazi tipi Turkce karakter icermeyebilir.
 static void DrawImGui(uintptr_t game, const ImVec2& screen) {
     if (game == 0) return;
-    if (*(volatile uint32_t*)(game + G_STATE) != 6) return;                    // sadece oyun icinde (magaza/ayarlar degil)
+    if (*(volatile uint32_t*)(game + G_STATE) != 6) { g_BtnMode = 0; return; }   // sadece oyun icinde (magaza/ayarlar degil)
     EnsureAssets(game);                                                        // oyun hazir olunca (Game+0xA340 shader no, EntityManager kurulu) yukle
-    const uintptr_t cur = LocalActiveVehiclePtr(game); if (!cur) return;
+    const uintptr_t cur = LocalActiveVehiclePtr(game); if (!cur) { g_BtnMode = 0; return; }
     const bool onFoot = (cur == g_LocalWalker);
-    SkyTick(game);                                                             // v8: gun saatine gore gokyuzu (yayadayken)
-    if (onFoot && !g_Disabled) { DrawFootUI(screen); return; }
-    // Aractayken: Exit Vehicle ust-sag bolgede (sagdaki gaz/fren surgusunu ve alt HUD dugmelerini kapatmasin)
-    ImGui::SetNextWindowPos(ImVec2(screen.x * 0.985f, screen.y * 0.13f), ImGuiCond_Always, ImVec2(1.0f, 0.0f));
-    ImGui::Begin("##walker", nullptr, ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoScrollbar |
-                 ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoFocusOnAppearing);
-    const ImVec2 bs(screen.x * 0.15f, screen.y * 0.085f);
-    if (g_Disabled) ImGui::TextUnformatted("Walker off (slow frame)");
-    else if (!IsWalker(cur) && ImGui::Button("Exit Vehicle", bs)) g_ReqExit = true;
-    ImGui::End();
+    SkyTick(game);                                                             // yedek gokyuzu (GL gokyuzu calismazsa)
+    if (onFoot && !g_Disabled) { DrawFootUI(game, screen); return; }
+    if (g_Disabled) {
+        g_BtnMode = 0;
+        ImGui::SetNextWindowPos(ImVec2(screen.x * 0.985f, screen.y * 0.13f), ImGuiCond_Always, ImVec2(1.0f, 0.0f));
+        ImGui::Begin("##walker", nullptr, ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoScrollbar |
+                     ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoFocusOnAppearing);
+        ImGui::TextUnformatted("Walker off (slow frame)");
+        ImGui::End();
+        return;
+    }
+    if (IsWalker(cur)) { g_BtnMode = 0; return; }
+    // Aractayken: yuvarlak "EXIT" dugmesi alt satirin sonunda (dokunma OnFootTouch'ta)
+    ImDrawList* dl = ImGui::GetBackgroundDrawList(); if (!dl) return;
+    const float br = screen.y * 0.053f; float bx, by; HudRowNext(game, screen.x, screen.y, br, &bx, &by);
+    g_BtnCX = bx; g_BtnCY = by; g_BtnR = br; g_BtnMode = 1;
+    DrawRoundBtn(dl, bx, by, br, "EXIT", 0, false);
 }
 
 } // namespace WK
@@ -6093,7 +6326,15 @@ static void CaptureAndQueueLocalVehicleState(uintptr_t game) {
             ownerId = g_VehicleAuthority[vehicleId].ownerId;
         }
 
-        const bool moving = moved || rotated;
+        bool moving = moved || rotated;
+        // v9: yaya (WALKER): "hareket" kare-kare 5 cm esiginden degil, GERCEK govde hizindan alinir -> en kucuk adimda hemen baslar; sahiplik
+        // yaya aktifken birakilmaz (her durup kalkista yeniden otorite beklemesin).
+        const bool isWalkerVeh = WK::IsWalker(vehicle);
+        if (isWalkerVeh) {
+            const uintptr_t wb = *(uintptr_t*)(vehicle + 0x528);
+            if (wb) { const float wvx = *(float*)(wb + 0x44), wvy = *(float*)(wb + 0x48), ww = *(float*)(wb + 0x4C);
+                      moving = (wvx * wvx + wvy * wvy) > 0.0016f || fabsf(ww) > 0.05f; }
+        }
 
         // Ask the host for authority when appropriate, but do not make
         // network publication depend on the authority handshake. This is
@@ -6101,7 +6342,7 @@ static void CaptureAndQueueLocalVehicleState(uintptr_t game) {
         // the tractor on a different vehicle slot.
         // Isciye (AI) verilen arac aktif arac olmasa da hareket ediyorsa sahipligini iste/yayinla.
         const bool aiDriven = (*(uint32_t*)(vehicle + 0x730) != 0) && !g_AiMirrored[vehicleId];
-        if ((vehicleId == activeVehicleId || aiDriven) && moving &&
+        if ((vehicleId == activeVehicleId || aiDriven) && (moving || isWalkerVeh) &&
             ownerId == VEHICLE_OWNER_NONE) {
             TryClaimLocalVehicle(vehicleId);
         }
@@ -6113,6 +6354,7 @@ static void CaptureAndQueueLocalVehicleState(uintptr_t game) {
         }
 
         const bool stoppedLongEnough =
+            !isWalkerVeh &&
             g_LocalStationarySince[vehicleId] != 0 &&
             (nowMs - g_LocalStationarySince[vehicleId]) >= VEHICLE_STOP_RELEASE_MS;
 
@@ -6147,12 +6389,14 @@ static void CaptureAndQueueLocalVehicleState(uintptr_t game) {
             {
                 std::lock_guard<std::mutex> lock(g_VehicleStateMutex);
                 VehicleSampleState& sent = g_LastSentLocalVehicles[vehicleId];
+                const float pe = isWalkerVeh ? 0.004f : POSITION_EPSILON;      // v9: yaya icin cok daha hassas esikler
+                const float ae = isWalkerVeh ? 0.002f : ANGLE_EPSILON;
                 changed = !sent.valid ||
                           sent.moving != moving ||
-                          fabsf(x - sent.x) > POSITION_EPSILON ||
-                          fabsf(y - sent.y) > POSITION_EPSILON ||
-                          GetAngleDelta(angle, sent.angle) > ANGLE_EPSILON ||
-                          (nowMs - sent.timeMs) >= VEHICLE_KEEPALIVE_MS;
+                          fabsf(x - sent.x) > pe ||
+                          fabsf(y - sent.y) > pe ||
+                          GetAngleDelta(angle, sent.angle) > ae ||
+                          (nowMs - sent.timeMs) >= (isWalkerVeh ? 250u : VEHICLE_KEEPALIVE_MS);
                 if (changed) {
                     sent.valid = true;
                     sent.moving = moving;
@@ -10260,7 +10504,7 @@ void* my_renderStartMenuMain(void* thiz, void* p1, void* p2, void* p3) {
 // ========================================================================
 __attribute__((constructor))
 void ModMain() {
-    LOGI(">>> MULTIPLAYER MOD STARTING <<< build=shopfix-41+walker-v8");
+    LOGI(">>> MULTIPLAYER MOD STARTING <<< build=shopfix-42+walker-v9");
 
     ResetVehicleSyncState();
     std::thread(StartPONGResponderThread).detach();
