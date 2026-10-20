@@ -498,6 +498,7 @@ AInputQueue_getEvent_t orig_AInputQueue_getEvent = nullptr;
 typedef void (*GameUpdate_t)(void* thiz, float param_1);
 GameUpdate_t orig_GameUpdate = nullptr;
 
+namespace WK { static void PreSave(uintptr_t game); static void PostSave(uintptr_t game); }   // v8: yaya kayda "traktor" olarak yazilmasin
 // Client baska birinin oyununda oldugu icin kaydedemez: SaveGames::startTask(3 = slota kaydet) engellenir.
 typedef void (*SaveStartTask_t)(void* thiz, int cmd, unsigned int slot, int sync);
 static SaveStartTask_t orig_SaveStartTask = nullptr;
@@ -550,9 +551,11 @@ static void HostCaptureSaveIfRequested() {
     if (st != 6 && st != 7) return;
     const uintptr_t sg = g_EngineInstance + 0xa374;
     g_CaptureBuf.clear();
+    WK::PreSave(g_EngineInstance);                          // v8: yaya varsa araca geri bindir (Vehicle::serialize yayayi traktor diye yazardi)
     g_CaptureNext.store(true);
     ((SaveStartTask_t)g_SaveStartTaskFn)((void*)sg, 5, *(volatile unsigned int*)(g_EngineInstance + 0xa3f0), 1);
     g_CaptureNext.store(false);
+    WK::PostSave(g_EngineInstance);                         // v8: kayittan sonra ayni yerde yayayi yeniden olustur
     if (g_CaptureBuf.empty()) return;
     std::lock_guard<std::mutex> lock(g_SaveBlobMutex);
     g_HostBlob.swap(g_CaptureBuf);
@@ -649,7 +652,7 @@ static const uint8_t VEHICLE_OWNER_NONE = 0xFF;
 // The actual callback frequency still follows the game's own update/vsync loop.
 // Network vehicle snapshots go out 30 times/sec, but only for vehicles that changed.
 static const uint32_t VEHICLE_LOCAL_SAMPLE_INTERVAL_US = 8333;
-static const uint32_t VEHICLE_NETWORK_INTERVAL_MS = 33;
+static const uint32_t VEHICLE_NETWORK_INTERVAL_MS = 16;   // v8: 33 -> 16 ms (yaya hareketi daha anlik)
 static const uint32_t VEHICLE_KEEPALIVE_MS = 1000;  // unchanged vehicles are re-sent this often (late joiners)
 static const uint32_t VEHICLE_STOP_RELEASE_MS = 1000;
 static const uint8_t VEHICLE_SNAPSHOT_MAX_COUNT = 64;
@@ -2154,6 +2157,19 @@ static const float RIG_NECK[3]  = {0.00f, 1.52f, 0.00f};
 static const float RIG_SH_L[3]  = {+0.28f, 1.42f, 0.00f}, RIG_SH_R[3] = {-0.28f, 1.42f, 0.00f};
 static const float RIG_HIP_L[3] = {+0.10f, 0.90f, 0.00f}, RIG_HIP_R[3] = {-0.10f, 0.90f, 0.00f};
 static const float EYE_HEIGHT   = 1.66f;
+// v8 ayarlari (ters calisirsa isaret makrosunu -1/+1 cevirin)
+#ifndef WK_STRAFE_SIGN
+#define WK_STRAFE_SIGN (1.0f)        // joystick sagi ters gidiyorsa -1
+#endif
+#ifndef WK_CAM_RESID_SIGN
+#define WK_CAM_RESID_SIGN (-1.0f)    // donerken kamera once yanlis yone kayip duzeliyorsa +1
+#endif
+#ifndef WK_TURN_GAIN
+#define WK_TURN_GAIN 12.0f           // govde donus kazanci (1/s)
+#endif
+#ifndef WK_TURN_MAXW
+#define WK_TURN_MAXW 14.0f           // en fazla donus hizi (rad/s)
+#endif
 
 // ------------------------------- OFFSETLER -------------------------------
 static const uintptr_t G_ACTIVE = 0xA8, G_STATE = 0x64, G_ENTITYMGR = 0x708;           // [D] aktif arac idx / oyun durumu (6=oyun) / EntityManager
@@ -2191,7 +2207,7 @@ static std::vector<Walker> g_Walkers;          // TUM yayalar (yerel + uzak). Di
 static uintptr_t g_LocalWalker = 0;            // bizim yayamiz
 static uintptr_t g_LastVehicle = 0;            // indigimiz arac
 static float g_HeadYaw = 0, g_HeadPitch = 0;   // yerel kafa (rad). Uzaklara SENKRONLANMAZ (bkz. README "MP genisletme")
-static bool  g_FirstPerson = false;
+static bool  g_FirstPerson = true;                 // v8: sadece birinci sahis
 static bool  g_ReqExit = false, g_ReqEnter = false;
 static bool  g_AssetsReady = false; static long long g_AssetsRetryMs = 0;
 static std::atomic<long long> g_LastFrameMs(0);   // OnGameFrame'in son calisma zamani (ornekleyici de okur)
@@ -2200,6 +2216,19 @@ static bool g_Disabled = false;                    // otomatik kurtarma sonrasi:
 static int  g_PostSpawnFrames = 0;                 // dogustan sonra ayrintili kare logu sayaci
 static float g_FpCam[16]; static volatile uint32_t g_FpStamp = 0;   // v7: son yazilan birinci sahis kamera matrisi (kesme duzeltmesi icin)
 static void AddLook(float dYaw, float dPitch);                     // asagida tanimli
+// v8: yaya girdisi (sol joystick + sag taraf bakis). Dokunma kodu yazar, AfterVehicleUpdate okur.
+static volatile bool  g_OnFoot = false;                            // aktif arac = yerel yaya (OnGameFrame yazar)
+static volatile float g_JoyX = 0, g_JoyY = 0;                      // joystick: x sag +, y ileri +  ([-1,1])
+static volatile bool  g_JoyActive = false;
+static volatile float g_JoyCX = -1, g_JoyCY = -1;                  // joystick tabani (piksel); -1 = varsayilan konum
+static float g_DesYaw = 0; static bool g_DesInit = false;          // istenen bakis yonu ("saga +"); govde buna donerek takip eder
+typedef void (*SwitchToState_t)(void*);                             // Game::switchToStateStart kancasi (asagida tanimli)
+static SwitchToState_t orig_SwitchToState = nullptr;
+static void my_SwitchToState(void* game);
+typedef void (*SetMasterVol_t)(void*, uint32_t);                    // VehicleSound::setMasterVolume(this, float bits)
+static SetMasterVol_t fnSetMasterVol = nullptr;
+static void SoundTick(uintptr_t game);                             // asagida: yayadayken motor sesini kapat
+static void SkyTick(uintptr_t game);                               // asagida: yayadayken gun saatine gore gokyuzu rengi
 static uint32_t* g_Mesh[P_COUNT];              // oyunun IndexedTriangleMesh nesnesi: P[0]=vertexBuf, P[1]=indexBuf [D: enqueueRender]
 static uint32_t  g_TexObj[4] = {0, 0, 0, 0};   // Texture nesnesi = 4 bayt (GL handle) [D: EntityManager'da Texture dizisi 4'er bayt]
 
@@ -2465,9 +2494,10 @@ static void DoExit(uintptr_t game) {
     const uint32_t idx = SpawnWalker(game, pos, ab, true);
     LOGI("[WALKER] DoExit: SpawnWalker idx=%u (count=%u)", idx, VehicleCount(game));
     if (idx >= VehicleCount(game)) return;
-    g_LastVehicle = cur; g_HeadYaw = g_HeadPitch = 0;
+    g_LastVehicle = cur; g_HeadYaw = g_HeadPitch = 0; g_DesInit = false; g_JoyX = g_JoyY = 0;
     StageG("DoExit:SetActive");
     SetActiveByPtr(game, RawVehicleSlot(game, idx));                           // MP yayini: DetectNewLocalVehicles netId atar ve duyurur [K]
+    g_OnFoot = true; SoundTick(game);                                          // v8: motor sesi hemen kapansin
     StageG("DoExit:bitti");
     LOGI("[WALKER] DoExit: tamam");
 }
@@ -2517,18 +2547,27 @@ static void AfterVehicleUpdate(uintptr_t self, uint32_t ua, uint32_t ub, uint32_
                  f1, f2, f3, steer, throttle, (int)g_FirstPerson);
         }
     }
-    // ileri yon = govde matrisinin model +z ekseni (fizik duzlemine (x,z) olarak izdusum) -> acisal sozlesmeden bagimsiz
+    // v8: hareket joystick'ten (oyunun gaz/direksiyon girdisi f2/f3 YOKSAYILIR). Yon: govdenin ileri/sag eksenleri.
     const float* M = (const float*)(self + V_BODY_MAT);
     float fx = M[8], fy = M[10]; const float fl = sqrtf(fx * fx + fy * fy);
     if (fl > 1e-4f) { fx /= fl; fy /= fl; } else { fx = 1.f; fy = 0.f; }
-    // v7: geri giderken sag/sol ters calisiyordu -> geri (gaz < 0) iken donus yonu tersine cevrilir (arac gibi degil, "dogal" yon)
-    const float revSign = (throttle < -0.05f) ? -1.0f : 1.0f;
-    SetRemoteBodyVelocity(body, fx * throttle * WALK_SPEED, fy * throttle * WALK_SPEED, TURN_SIGN * revSign * steer * TURN_RATE);   // [K] uyandirma dahil
+    const float rx = -M[0] * WK_STRAFE_SIGN, ry = -M[2] * WK_STRAFE_SIGN;      // sag = model +X'in tersi (+X sol) [bkz. RIG_SH_L]
+    float rl = sqrtf(rx * rx + ry * ry); const float nrx = rl > 1e-4f ? rx / rl : 0.f, nry = rl > 1e-4f ? ry / rl : 0.f;
+    float jx = g_JoyX, jy = g_JoyY; if (!(jx == jx) || !(jy == jy)) { jx = 0; jy = 0; }
+    { const float jl = sqrtf(jx * jx + jy * jy); if (jl > 1.f) { jx /= jl; jy /= jl; } }
+    const float vx = (fx * jy + nrx * jx) * WALK_SPEED, vy = (fy * jy + nry * jx) * WALK_SPEED;
+    // govde yonu: istenen bakis yonune (g_DesYaw) hizlica doner. "saga +" = TURN_SIGN * aci.
+    const float pi = 3.14159265358979323846f;
+    const float bodyR = TURN_SIGN * *(float*)(body + B_ANGLE);
+    if (!g_DesInit) { g_DesYaw = bodyR; g_DesInit = true; }
+    float err = fmodf(g_DesYaw - bodyR, 2.f * pi); if (err > pi) err -= 2.f * pi; if (err < -pi) err += 2.f * pi;
+    float om = err * WK_TURN_GAIN; if (om > WK_TURN_MAXW) om = WK_TURN_MAXW; if (om < -WK_TURN_MAXW) om = -WK_TURN_MAXW;
+    SetRemoteBodyVelocity(body, vx, vy, TURN_SIGN * om);                       // [K] uyandirma dahil
+    g_HeadYaw = WK_CAM_RESID_SIGN * err;                                                          // kamera istenen yone ANINDA bakar, govde sonradan yetisir (toplam = istenen yon)
     if (g_FirstPerson) {                                                       // kamera dunya matrisi: oyun daha sonra bunun tersini view matrisi yapar
         M4 B; memcpy(B.m, M, 64);
         // Vehicle::update, araç model matrisini açı-PI ile kurar; kamera normalde -Z yönüne bakar.
         // Yarım tur düzeltmesi kamerayı aracın arkasından önüne çevirir.
-        const float pi = 3.14159265358979323846f;
         M4 cam = Mul(Mul(Mul(B, Tr(0, EYE_HEIGHT, 0)), RY(pi + g_HeadYaw)), RX(g_HeadPitch));
         memcpy((void*)(self + V_CAM_WORLD), cam.m, 64);
         memcpy(g_FpCam, cam.m, 64); g_FpStamp = g_TickGame;                    // v7: RenderArgs::update kancasi (kesme duzeltmesi) bunu tanir
@@ -2544,13 +2583,13 @@ static void AfterVehicleUpdate(uintptr_t self, uint32_t ua, uint32_t ub, uint32_
 #define WK_FP_CULLFIX 1
 #endif
 #ifndef WK_FP_CULL_UP
-#define WK_FP_CULL_UP 35.0f       // sanal kamera yuksekligi (m)
+#define WK_FP_CULL_UP 42.0f       // sanal kamera yuksekligi (m)
 #endif
 #ifndef WK_FP_CULL_BACK
-#define WK_FP_CULL_BACK 22.0f     // sanal kamera geriye kaydirma (m)
+#define WK_FP_CULL_BACK 30.0f     // sanal kamera geriye kaydirma (m)
 #endif
 #ifndef WK_FP_CULL_PITCH
-#define WK_FP_CULL_PITCH 0.80f    // asagi bakis acisi (rad, ~46 derece)
+#define WK_FP_CULL_PITCH 0.66f    // asagi bakis acisi (rad, ~46 derece)
 #endif
 typedef void (*RAUpdate_t)(void*, const float*, const float*);
 static RAUpdate_t orig_RAUpdate = nullptr;
@@ -2586,39 +2625,73 @@ static void my_RAUpdate(void* self, const float* view, const float* cam) {
     orig_RAUpdate(self, view, cam);
 }
 
-// ------------------------------- v7: BIRINCI SAHIS BAKIS (DOKUNMA SURUKLEME) -------------------------------
-// Ekranin ortasindaki bolgede (sol joystick, sag gaz surgusu ve alt dugmelerin disinda) parmak surukleyince kafa doner.
-// Oyuna giden olay YUTULMAZ; sadece ek bir parmak/surukleme izlenir.
+// ------------------------------- v8: YAYA DOKUNMATIK KONTROL (joystick + bakis + Enter Vehicle) -------------------------------
+// Yayadayken traktor kontrolleri iptal: ust seritin (y < %12) disindaki TUM dokunmalar yutulur (gaz/direksiyon/korna oyuna ulasmaz).
+//   sol taraf (x < %45) : yuzen joystick  -> ileri/geri/yan yurume
+//   diger yerler        : surukleme       -> bakis (govde istenen yone doner, bkz. AfterVehicleUpdate)
+//   sag alttaki yuvarlak dugme : Enter Vehicle
 #ifndef WK_LOOK_YAW_SIGN
-#define WK_LOOK_YAW_SIGN (-1.0f)     // yatay yon ters ise +1
+#define WK_LOOK_YAW_SIGN (1.0f)      // sag suruklenince SOLA donuyorsa -1
 #endif
 #ifndef WK_LOOK_PITCH_SIGN
 #define WK_LOOK_PITCH_SIGN (-1.0f)   // dikey yon ters ise +1
 #endif
-static void TouchLook(const AInputEvent* ev, int32_t rawAction, float W, float H) {
-    static int s_id = -1; static float s_lx = 0, s_ly = 0;
-    if (!g_FirstPerson || !g_LocalWalker || W < 100.f || H < 100.f) { s_id = -1; return; }
+static void EnterBtnGeom(float W, float H, float* cx, float* cy, float* r) { *r = H * 0.058f; *cx = W * 0.68f; *cy = H * 0.905f; }
+static void JoyGeom(float W, float H, float* cx, float* cy, float* r) {
+    *r = H * 0.17f;
+    if (g_JoyActive && g_JoyCX >= 0.f) { *cx = g_JoyCX; *cy = g_JoyCY; } else { *cx = W * 0.15f; *cy = H * 0.68f; }
+}
+static void OnFootCancel() { g_JoyX = g_JoyY = 0; g_JoyActive = false; }
+static bool OnFootTouch(const AInputEvent* ev, int32_t rawAction, float W, float H) {
+    static int s_joyId = -1, s_lookId = -1; static float s_lx = 0, s_ly = 0; static bool s_eat = false;
+    if (W < 100.f || H < 100.f) return false;
     const int32_t act = rawAction & AMOTION_EVENT_ACTION_MASK;
     const size_t n = AMotionEvent_getPointerCount(ev);
+    if (n == 0) return s_eat;
+    if (act == AMOTION_EVENT_ACTION_DOWN) {
+        s_joyId = s_lookId = -1; OnFootCancel();
+        s_eat = g_OnFoot && AMotionEvent_getY(ev, 0) >= H * 0.12f;             // ust serit oyuna gecer (menu/duraklat)
+    }
+    if (!s_eat) return false;
+    const size_t api = (size_t)((rawAction & AMOTION_EVENT_ACTION_POINTER_INDEX_MASK) >> AMOTION_EVENT_ACTION_POINTER_INDEX_SHIFT);
     if (act == AMOTION_EVENT_ACTION_DOWN || act == AMOTION_EVENT_ACTION_POINTER_DOWN) {
-        const size_t pi = (act == AMOTION_EVENT_ACTION_DOWN) ? 0 : (size_t)((rawAction & AMOTION_EVENT_ACTION_POINTER_INDEX_MASK) >> AMOTION_EVENT_ACTION_POINTER_INDEX_SHIFT);
-        if (pi < n && s_id < 0) {
-            const float x = AMotionEvent_getX(ev, pi), y = AMotionEvent_getY(ev, pi);
-            if (x > W * 0.30f && x < W * 0.86f && y > H * 0.14f && y < H * 0.76f) { s_id = AMotionEvent_getPointerId(ev, pi); s_lx = x; s_ly = y; }
+        const size_t pi = (act == AMOTION_EVENT_ACTION_DOWN) ? 0 : api;
+        if (pi < n) {
+            const int id = AMotionEvent_getPointerId(ev, pi); const float x = AMotionEvent_getX(ev, pi), y = AMotionEvent_getY(ev, pi);
+            float bx, by, br; EnterBtnGeom(W, H, &bx, &by, &br);
+            if ((x - bx) * (x - bx) + (y - by) * (y - by) <= br * br * 1.5f) { g_ReqEnter = true; }
+            else if (x < W * 0.45f && y > H * 0.25f && s_joyId < 0) {
+                float jr = H * 0.17f; s_joyId = id;
+                g_JoyCX = fminf(fmaxf(x, jr), W * 0.45f - jr * 0.5f); g_JoyCY = fminf(fmaxf(y, H * 0.25f + jr * 0.5f), H - jr * 0.6f);
+                g_JoyActive = true; g_JoyX = g_JoyY = 0;
+            }
+            else if (s_lookId < 0) { s_lookId = id; s_lx = x; s_ly = y; }
         }
     } else if (act == AMOTION_EVENT_ACTION_MOVE) {
-        for (size_t i = 0; i < n; ++i) if (s_id >= 0 && AMotionEvent_getPointerId(ev, i) == s_id) {
-            const float x = AMotionEvent_getX(ev, i), y = AMotionEvent_getY(ev, i);
-            const float k = 3.2f / W;                                          // ekran genisligi ~ 3.2 rad
-            AddLook(WK_LOOK_YAW_SIGN * (x - s_lx) * k, WK_LOOK_PITCH_SIGN * (y - s_ly) * k);
-            s_lx = x; s_ly = y;
+        for (size_t i = 0; i < n; ++i) {
+            const int id = AMotionEvent_getPointerId(ev, i); const float x = AMotionEvent_getX(ev, i), y = AMotionEvent_getY(ev, i);
+            if (id == s_joyId) {
+                float cx, cy, r; JoyGeom(W, H, &cx, &cy, &r);
+                float dx = (x - cx) / r, dy = -(y - cy) / r; const float l = sqrtf(dx * dx + dy * dy);
+                if (l > 1.f) { dx /= l; dy /= l; }
+                if (l < 0.12f) { dx = 0; dy = 0; }                              // olu bolge
+                g_JoyX = dx; g_JoyY = dy;
+            } else if (id == s_lookId) {
+                const float k = 3.6f / W;                                       // ekran genisligi ~ 3.6 rad
+                AddLook(WK_LOOK_YAW_SIGN * (x - s_lx) * k, WK_LOOK_PITCH_SIGN * (y - s_ly) * k);
+                s_lx = x; s_ly = y;
+            }
+        }
+    } else if (act == AMOTION_EVENT_ACTION_POINTER_UP) {
+        if (api < n) {
+            const int id = AMotionEvent_getPointerId(ev, api);
+            if (id == s_joyId) { s_joyId = -1; OnFootCancel(); }
+            if (id == s_lookId) s_lookId = -1;
         }
     } else if (act == AMOTION_EVENT_ACTION_UP || act == AMOTION_EVENT_ACTION_CANCEL) {
-        s_id = -1;
-    } else if (act == AMOTION_EVENT_ACTION_POINTER_UP) {
-        const size_t pi = (size_t)((rawAction & AMOTION_EVENT_ACTION_POINTER_INDEX_MASK) >> AMOTION_EVENT_ACTION_POINTER_INDEX_SHIFT);
-        if (pi < n && AMotionEvent_getPointerId(ev, pi) == s_id) s_id = -1;
+        s_joyId = s_lookId = -1; OnFootCancel(); s_eat = false;
     }
+    return true;
 }
 
 // Sahte Vehicle olarak kullanılan yaya, HUD'da yakıtı olan gerçek araç gibi görünmesin.
@@ -2702,6 +2775,7 @@ static void Init(void* appLib) {
     fnBind = (BindTex_t)Sym(appLib, "_ZN24GLESHandheldRenderDevice16bindTextureLayerEjj", "_ZN24GLESHandheldRenderDevice16bindTextureLayerE");
     fnBindAttrs = (BindAttrs_t)Sym(appLib, "", "_ZN24GLESHandheldRenderDevice20bindShaderAttributesE");
     fnActiveChanged = (ActiveChanged_t)Sym(appLib, "_ZN4Game20activeVehicleChangedEv", "_ZN4Game20activeVehicleChanged");
+    fnSetMasterVol = (SetMasterVol_t)Sym(appLib, "_ZN12VehicleSound15setMasterVolumeEf", "_ZN12VehicleSound15setMasterVolumeE");   // v8: yayadayken motor sesi kapatma
     // Vehicle::update'i KANCALAMIYORUZ: sizin my_Vehicle_update tutuyor -> WK::AfterVehicleUpdate oradan cagrilir.
     struct H { const char* n; const char* prefix; void* repl; void** orig; };
     const H hooks[] = {
@@ -2713,6 +2787,8 @@ static void Init(void* appLib) {
         {"Vehicle::enqueueRenderEmissive",    "_ZN7Vehicle21enqueueRenderEmissiveE",    (void*)my_VehEmis,   (void**)&orig_VehEmis},
         // v7: birinci sahis gorus kesme duzeltmesi (RenderArgs::update tek yerden, Game::updateStateBase'ten cagriliyor)
         {"RenderArgs::update",                "_ZN10RenderArgs6updateE",                (void*)my_RAUpdate,  (void**)&orig_RAUpdate},
+        // v8: oyundan cikarken (ana menuye donus) yaya once kaldirilsin -> kalan yaya + cokme onlenir
+        {"Game::switchToStateStart",          "_ZN4Game18switchToStateStartE",          (void*)my_SwitchToState, (void**)&orig_SwitchToState},
     };
     StartProfiler();
     for (size_t i = 0; i < sizeof(hooks) / sizeof(hooks[0]); ++i) {
@@ -2803,6 +2879,93 @@ static void RemoveWalkerKeepActive(uintptr_t game, uintptr_t w) {
     LOGI("[WALKER] araca binildi -> yaya silindi (aktif arac=%p)", (void*)act);
 }
 
+// ------------------------------- v8: KAYIT / CIKIS GUVENLIGI -------------------------------
+// Vehicle::serialize tipi this+0x10'dan yazar -> yaya kayda "temel traktor" olarak girer; client host kaydini yukleyince traktor gorur.
+// Host kaydi alinirken (HostCaptureSaveIfRequested) yaya araca geri bindirilir, kayittan sonra ayni yerde yeniden olusturulur.
+struct SaveStash { bool had; float x, y, a, des; };
+static SaveStash g_Stash = {false, 0, 0, 0, 0};
+static void PreSave(uintptr_t game) {
+    g_Stash.had = false;
+    if (!game || !g_LocalWalker || g_Disabled) return;
+    float x, y, a; if (!BodyPose(g_LocalWalker, &x, &y, &a)) return;
+    g_Stash.had = true; g_Stash.x = x; g_Stash.y = y; g_Stash.a = a; g_Stash.des = g_DesYaw;
+    LOGI("[WALKER] PreSave: yaya araca geri aliniyor (%.1f,%.1f)", x, y);
+    if (LocalActiveVehiclePtr(game) == g_LocalWalker) DoEnter(game, true); else RemoveWalkerKeepActive(game, g_LocalWalker);
+    if (g_LocalWalker) HardRemoveLocalWalker(game);
+    g_OnFoot = false; SoundTick(game);
+}
+static void PostSave(uintptr_t game) {
+    if (!g_Stash.had) return;
+    g_Stash.had = false;
+    if (!game || g_LocalWalker || g_Disabled || VehicleCount(game) >= 30) return;
+    const float pos[3] = {g_Stash.x, 0.0f, g_Stash.y};
+    uint32_t ab; memcpy(&ab, &g_Stash.a, 4);
+    const uintptr_t lastVeh = g_LastVehicle;
+    const uint32_t idx = SpawnWalker(game, pos, ab, true);
+    if (idx >= VehicleCount(game)) return;
+    g_LastVehicle = lastVeh; g_HeadYaw = 0; g_DesInit = false; g_JoyX = g_JoyY = 0;
+    SetActiveByPtr(game, RawVehicleSlot(game, idx));
+    g_OnFoot = true; SoundTick(game);
+    LOGI("[WALKER] PostSave: yaya yeniden olusturuldu");
+}
+// Ana menuye donus: yaya (sahte Vehicle) oyun kapanirken geride kalmasin.
+static void my_SwitchToState(void* game) {
+    if (g_LocalWalker && game) {
+        LOGI("[WALKER] switchToStateStart: yaya kaldiriliyor");
+        HardRemoveLocalWalker((uintptr_t)game); g_OnFoot = false; SoundTick((uintptr_t)game);
+    }
+    if (orig_SwitchToState) orig_SwitchToState(game);
+}
+
+// ------------------------------- v8: SES (motor) -------------------------------
+// VehicleSound master sesi 0'lanir (setVehicleState her kare sesi bununla carpar [D: this+0x124]); yayadan inince eski deger geri yazilir.
+static void SoundTick(uintptr_t game) {
+    static bool s_muted = false; static uint32_t s_saved = 0x3f800000u;
+    if (!fnSetMasterVol || !game) return;
+    void* snd = *(void**)(game + 0xa450); if (!snd) return;
+    if (g_OnFoot) {
+        if (!s_muted) { s_muted = true; s_saved = *(uint32_t*)((uintptr_t)snd + 0x124); LOGI("[WALKER] motor sesi kapatildi (eski ses=%08x)", s_saved); }
+        fnSetMasterVol(snd, 0u);
+    } else if (s_muted) {
+        fnSetMasterVol(snd, s_saved); s_muted = false; LOGI("[WALKER] motor sesi geri acildi");
+    }
+}
+
+// ------------------------------- v8: GOKYUZU (GL thread) -------------------------------
+// Oyunun ana temizleme rengi acilista zeytin yesili olarak ayarlanir ve kalici GL durumudur. Yayadayken her karede gun saatine gore
+// glClearColor cagirilir (arazi bitince gorunen "gokyuzu"); aractayken eski renk geri yazilir.
+typedef void (*ClearColor_t)(float, float, float, float);
+static ClearColor_t fnClearColor = nullptr;
+static void SkyColorForHour(double h, float* o) {
+    struct K { float h, r, g, b; };
+    static const K k[] = { {0.f, .02f, .03f, .10f}, {4.5f, .03f, .04f, .13f}, {5.8f, .85f, .45f, .25f}, {7.3f, .70f, .72f, .85f}, {9.5f, .36f, .62f, .95f},
+                           {16.0f, .36f, .62f, .95f}, {17.6f, .98f, .78f, .38f}, {19.0f, .95f, .50f, .22f}, {20.5f, .30f, .17f, .32f}, {22.0f, .03f, .04f, .13f}, {24.f, .02f, .03f, .10f} };
+    const int n = (int)(sizeof(k) / sizeof(k[0]));
+    for (int i = 0; i + 1 < n; ++i) if (h >= k[i].h && h <= k[i + 1].h) {
+        const float t = (float)((h - k[i].h) / (k[i + 1].h - k[i].h));
+        o[0] = k[i].r + (k[i + 1].r - k[i].r) * t; o[1] = k[i].g + (k[i + 1].g - k[i].g) * t; o[2] = k[i].b + (k[i + 1].b - k[i].b) * t; return;
+    }
+    o[0] = .36f; o[1] = .62f; o[2] = .95f;
+}
+static void SkyTick(uintptr_t game) {
+    static bool s_applied = false; static long long s_log = 0;
+    if (!fnClearColor) {
+        fnClearColor = (ClearColor_t)dlsym(RTLD_DEFAULT, "glClearColor");
+        if (!fnClearColor) { void* h = dlopen("libGLESv2.so", RTLD_NOW); if (h) fnClearColor = (ClearColor_t)dlsym(h, "glClearColor"); }
+        if (!fnClearColor) { static bool w = false; if (!w) { w = true; LOGI("[WALKER] glClearColor bulunamadi: gokyuzu rengi yok"); } return; }
+    }
+    if (g_OnFoot && g_FirstPerson) {
+        double v = 0; memcpy(&v, (const void*)(game + 0xa098 + 0x18), 8);        // Environment: gun saati [D: getDayTime = env+0x18, double]
+        double h = 12.0;
+        if (v == v && v >= 0.0 && v < 1e12) { if (v >= 48.0) h = fmod(v / 3600.0, 24.0); else if (v <= 1.0) h = v * 24.0; else h = fmod(v, 24.0); }
+        float c[3]; SkyColorForHour(h, c);
+        fnClearColor(c[0], c[1], c[2], 1.0f); s_applied = true;
+        const long long now = NowMs(); if (now - s_log > 10000) { s_log = now; LOGI("[WALKER] gokyuzu: dayTime ham=%.3f saat=%.2f renk=(%.2f,%.2f,%.2f)", v, h, c[0], c[1], c[2]); }
+    } else if (s_applied) {
+        fnClearColor(0.221f, 0.241f, 0.0627f, 1.0f); s_applied = false;
+    }
+}
+
 static void OnGameFrame(uintptr_t game) {
     ++g_TickGame; StageG("OnGameFrame");
     const long long nowF = NowMs(); const long long prevF = g_LastFrameMs.exchange(nowF);
@@ -2833,6 +2996,14 @@ static void OnGameFrame(uintptr_t game) {
             else s_notActive = 0;
         } else s_notActive = 0;
     }
+    {   // v8: durum + cikis guvenligi + ses
+        const int st = *(volatile int*)(game + G_STATE), sub = *(volatile int*)(game + 0x68);
+        if (g_LocalWalker && st == 7 && sub == 7) { LOGI("[WALKER] cikis onayi: yaya kaldiriliyor"); HardRemoveLocalWalker(game); }
+        else if (g_LocalWalker && st != 6 && st != 7) { std::lock_guard<std::mutex> lk(g_Mu); g_LocalWalker = 0; g_Walkers.clear(); }   // oyun dunyasi gitti: sadece kayit tut
+        g_OnFoot = g_LocalWalker && LocalActiveVehiclePtr(game) == g_LocalWalker;
+        if (!g_OnFoot) { g_JoyX = g_JoyY = 0; g_JoyActive = false; }
+        SoundTick(game);
+    }
     if (g_ReqExit)  { g_ReqExit = false;  DoExit(game); }
     if (g_ReqEnter) { g_ReqEnter = false; DoEnter(game, false); }
 }
@@ -2840,10 +3011,35 @@ static void OnGameFrame(uintptr_t game) {
 // "temel arac" olarak kayda yazar). Su an HICBIR YERDEN CAGRILMIYOR [!]: kayit kancasina baglamak sizin kararinizdir.
 static void ForceReturnToVehicle(uintptr_t game) { DoEnter(game, true); }
 // Dokunma surukleme (ornegin ekranin sag yarisi): kafayi cevirir. Sizin dokunma kodunuzdan cagrilir.
-static void AddLook(float dYaw, float dPitch) {
-    g_HeadYaw += dYaw; g_HeadPitch += dPitch;
-    if (g_HeadPitch > 1.4f)  g_HeadPitch = 1.4f;
-    if (g_HeadPitch < -1.4f) g_HeadPitch = -1.4f;
+static void AddLook(float dYawRight, float dPitch) {                      // v8: yaw "saga +" istenen yone eklenir (govde buna doner), pitch kameraya
+    g_DesYaw += dYawRight; g_HeadPitch += dPitch;
+    if (g_HeadPitch > 1.3f)  g_HeadPitch = 1.3f;
+    if (g_HeadPitch < -1.3f) g_HeadPitch = -1.3f;
+}
+// v8: yaya arayuzu (joystick + yuvarlak gumus "Enter Vehicle" dugmesi). ImGui penceresi acilmaz -> dokunma yakalamasi yok; dokunmalar OnFootTouch'ta.
+static void DrawFootUI(const ImVec2& screen) {
+    ImDrawList* dl = ImGui::GetBackgroundDrawList(); if (!dl) return;
+    float cx, cy, r; JoyGeom(screen.x, screen.y, &cx, &cy, &r);
+    const bool act = g_JoyActive;
+    dl->AddCircleFilled(ImVec2(cx, cy), r, IM_COL32(255, 255, 255, act ? 55 : 32), 48);
+    dl->AddCircle(ImVec2(cx, cy), r, IM_COL32(255, 255, 255, act ? 170 : 100), 48, 3.0f);
+    dl->AddCircleFilled(ImVec2(cx + g_JoyX * r * 0.6f, cy - g_JoyY * r * 0.6f), r * 0.38f, IM_COL32(235, 237, 240, act ? 220 : 150), 40);
+    dl->AddCircle(ImVec2(cx + g_JoyX * r * 0.6f, cy - g_JoyY * r * 0.6f), r * 0.38f, IM_COL32(110, 114, 118, 200), 40, 2.5f);
+    float bx, by, br; EnterBtnGeom(screen.x, screen.y, &bx, &by, &br);
+    const ImVec2 c(bx, by);
+    dl->AddCircleFilled(ImVec2(bx, by + br * 0.06f), br, IM_COL32(0, 0, 0, 70), 48);                 // golge
+    dl->AddCircleFilled(c, br, IM_COL32(226, 228, 231, 245), 48);                                     // gumus yuz
+    dl->AddCircleFilled(ImVec2(bx, by - br * 0.18f), br * 0.78f, IM_COL32(244, 245, 247, 150), 40);   // ust parlama
+    dl->AddCircle(c, br, IM_COL32(122, 126, 131, 255), 48, 3.0f);
+    dl->AddCircle(c, br * 0.86f, IM_COL32(255, 255, 255, 210), 48, 2.0f);
+    const ImU32 ink = IM_COL32(70, 74, 79, 255);                                                      // arac simgesi
+    dl->AddRectFilled(ImVec2(bx - br * 0.28f, by - br * 0.58f), ImVec2(bx + br * 0.28f, by - br * 0.30f), ink, br * 0.08f);
+    dl->AddRectFilled(ImVec2(bx - br * 0.56f, by - br * 0.32f), ImVec2(bx + br * 0.56f, by - br * 0.02f), ink, br * 0.08f);
+    dl->AddCircleFilled(ImVec2(bx - br * 0.33f, by - br * 0.02f), br * 0.12f, ink, 16);
+    dl->AddCircleFilled(ImVec2(bx + br * 0.33f, by - br * 0.02f), br * 0.12f, ink, 16);
+    ImFont* f = ImGui::GetFont(); const float fs = br * 0.27f; const char* t = "ENTER";
+    const ImVec2 ts = f->CalcTextSizeA(fs, 1e9f, 0.f, t);
+    dl->AddText(f, fs, ImVec2(bx - ts.x * 0.5f, by + br * 0.20f), ink, t);
 }
 // GL thread'i (ImGui kare fonksiyonundan). Etiketler Ingilizce: oyunun yazi tipi Turkce karakter icermeyebilir.
 static void DrawImGui(uintptr_t game, const ImVec2& screen) {
@@ -2852,19 +3048,16 @@ static void DrawImGui(uintptr_t game, const ImVec2& screen) {
     EnsureAssets(game);                                                        // oyun hazir olunca (Game+0xA340 shader no, EntityManager kurulu) yukle
     const uintptr_t cur = LocalActiveVehiclePtr(game); if (!cur) return;
     const bool onFoot = (cur == g_LocalWalker);
-    // Yaya kontrollerini üst-sağ bölgede tut: sağdaki gaz/fren sürgüsünü ve alt HUD düğmelerini kapatmasın.
+    SkyTick(game);                                                             // v8: gun saatine gore gokyuzu (yayadayken)
+    if (onFoot && !g_Disabled) { DrawFootUI(screen); return; }
+    // Aractayken: Exit Vehicle ust-sag bolgede (sagdaki gaz/fren surgusunu ve alt HUD dugmelerini kapatmasin)
     ImGui::SetNextWindowPos(ImVec2(screen.x * 0.985f, screen.y * 0.13f), ImGuiCond_Always, ImVec2(1.0f, 0.0f));
     ImGui::Begin("##walker", nullptr, ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoScrollbar |
                  ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoFocusOnAppearing);
     const ImVec2 bs(screen.x * 0.15f, screen.y * 0.085f);
     if (g_Disabled) ImGui::TextUnformatted("Walker off (slow frame)");
-    else if (!onFoot) { if (!IsWalker(cur) && ImGui::Button("Exit Vehicle", bs)) g_ReqExit = true; }
-    else {
-        if (ImGui::Button("Enter Vehicle", bs)) g_ReqEnter = true;
-        if (ImGui::Button(g_FirstPerson ? "Third Person" : "First Person", bs)) g_FirstPerson = !g_FirstPerson;
-    }
+    else if (!IsWalker(cur) && ImGui::Button("Exit Vehicle", bs)) g_ReqExit = true;
     ImGui::End();
-    // TODO: dokunusun alttaki oyun HUD'una da gecmesini engelleyin (sohbet HUD dugmenizdeki "press armed" mantigi gibi) [!]
 }
 
 } // namespace WK
@@ -8164,6 +8357,7 @@ int32_t my_AInputQueue_getEvent(void* queue, AInputEvent** outEvent) {
                 int32_t action = AMotionEvent_getAction(*outEvent) & AMOTION_EVENT_ACTION_MASK;
 
                 if (action == AMOTION_EVENT_ACTION_CANCEL) {
+                    WK::OnFootCancel();
                     g_TouchDown.store(false);
                     g_IsEatingTouch = false;
                     void* finishEventAddr = dlsym(RTLD_DEFAULT, "AInputQueue_finishEvent");
@@ -8174,10 +8368,6 @@ int32_t my_AInputQueue_getEvent(void* queue, AInputEvent** outEvent) {
                     continue;
                 }
 
-                if (g_ImGuiInitialized && ImGui::GetCurrentContext() != nullptr && WK::g_FirstPerson && WK::g_LocalWalker) {
-                    const ImVec2 ds = ImGui::GetIO().DisplaySize;               // v7: birinci sahis kafa cevirme (surukleme)
-                    WK::TouchLook(*outEvent, AMotionEvent_getAction(*outEvent), ds.x, ds.y);
-                }
                 size_t pointerCount = AMotionEvent_getPointerCount(*outEvent);
                 if (pointerCount > 0) {
                     if (action == AMOTION_EVENT_ACTION_DOWN) {
@@ -8220,6 +8410,10 @@ int32_t my_AInputQueue_getEvent(void* queue, AInputEvent** outEvent) {
                         if (g_IsEatingTouch) shouldEatEvent = true;
                         g_IsEatingTouch = false;
                     }
+                }
+                if (!shouldEatEvent && g_ImGuiInitialized && ImGui::GetCurrentContext() != nullptr) {
+                    const ImVec2 ds = ImGui::GetIO().DisplaySize;               // v8: yaya joystick + bakis + "Enter Vehicle" dokunmalari (yutulur: traktor kontrolleri/korna calismasin)
+                    if (WK::OnFootTouch(*outEvent, AMotionEvent_getAction(*outEvent), ds.x, ds.y)) shouldEatEvent = true;
                 }
 
                 if (shouldEatEvent) {
@@ -10066,7 +10260,7 @@ void* my_renderStartMenuMain(void* thiz, void* p1, void* p2, void* p3) {
 // ========================================================================
 __attribute__((constructor))
 void ModMain() {
-    LOGI(">>> MULTIPLAYER MOD STARTING <<< build=shopfix-40+walker-v7b");
+    LOGI(">>> MULTIPLAYER MOD STARTING <<< build=shopfix-41+walker-v8");
 
     ResetVehicleSyncState();
     std::thread(StartPONGResponderThread).detach();
