@@ -23,6 +23,7 @@
 #include <fcntl.h>
 #include <sys/stat.h>
 #include <sys/mman.h>
+#include <link.h>
 #include <strings.h>
 #include <elf.h>
 #include <sys/ioctl.h>
@@ -301,6 +302,10 @@ std::string g_ConnectedStatus = "Not Connected";
 
 // CHAT SYSTEM
 std::vector<std::string> g_ChatMessages;
+// v10: okunmamis mesaj sayaci (sohbet butonunda kirmizi rozet) + araclarin/yayalarin ustunde 3 sn gorunen mesaj balonlari
+static std::atomic<int> g_ChatUnread(0);
+struct ChatBubbleRec { std::string name; std::string text; long long ms; };
+static std::vector<ChatBubbleRec> g_ChatBubbles;     // g_ChatMutex ile korunur
 std::mutex g_ChatMutex;
 
 std::vector<std::string> g_OutgoingChats;
@@ -452,6 +457,7 @@ static void* FindElfSymbolByPrefix(const char* lib, const char* prefix) {
 }
 
 void ClearChat() {
+    g_ChatUnread.store(0);
     {
         std::lock_guard<std::mutex> lock(g_ChatMutex);
         g_ChatMessages.clear();
@@ -2234,11 +2240,11 @@ static SetMasterVol_t fnSetMasterVol = nullptr;
 static volatile bool  g_Run = false;                               // v9: kosma acik mi (dugme ile acilip kapanir)
 static volatile float g_BtnCX = -1, g_BtnCY = -1, g_BtnR = 0;      // v9: Enter/Exit dugmesi (piksel; DrawImGui yazar, dokunma kodu okur)
 static volatile int   g_BtnMode = 0;                               // 0 yok, 1 = Exit Vehicle (aractayken), 2 = Enter Vehicle + Run (yayadayken)
-static volatile bool  g_SkyWanted = false;                         // v10: oyun icindeyken (durum 6, HER arac) sanal gokyuzu + daglar cizilsin
+static volatile bool  g_SkyWanted = false;                         // sadece yayadayken sanal gokyuzu + daglar cizilir
 static volatile bool  g_Dialog = false;                            // v10: oyun penceresi acik (durum 6 + alt durum != 0: fiyat listesi, gorev teklifi, onay...) -> dokunmalar OYUNA gecer
-static uint64_t my_OpenQueues(void* self);
-typedef uint64_t (*OpenQueues_t)(void*);
-static OpenQueues_t orig_OpenQueues = nullptr;
+static void SkyInstallHooks();
+static bool g_SkyHooked = false;                                   // v10: glClear/glViewport GOT yamasi takildi mi
+static volatile int g_SkyStatClear = 0, g_SkyStatVp = 0, g_SkyStatDraw = 0;
 static void SoundTick(uintptr_t game);                             // asagida: yayadayken motor sesini kapat
 static void SkyTick(uintptr_t game);                               // asagida: yayadayken gun saatine gore gokyuzu rengi
 static uint32_t* g_Mesh[P_COUNT];              // oyunun IndexedTriangleMesh nesnesi: P[0]=vertexBuf, P[1]=indexBuf [D: enqueueRender]
@@ -2680,22 +2686,30 @@ static void OnFootCancel() { g_JoyX = g_JoyY = 0; g_JoyActive = false; }
 static inline bool InCircle(float x, float y, float cx, float cy, float r) { return (x - cx) * (x - cx) + (y - cy) * (y - cy) <= r * r; }
 // Enter/Exit dugmesi (g_BtnCX/CY/R) ve onun ustundeki Run dugmesi (yayadayken)
 static void RunBtnGeom(float* cx, float* cy, float* r) { *r = g_BtnR * 0.86f; *cx = g_BtnCX; *cy = g_BtnCY - g_BtnR * 2.25f; }
+static bool GameHudHit(uintptr_t game, float x, float y, float W, float H);   // asagida
+// v10: dokunmalar POINTER (parmak) bazinda dagitilir: joystick/bakis/Enter/Run bizim (yutulur), ust serit ve oyunun kendi alt satir dugmeleri OYUNUN (gecer).
+// Boylece joystick basili dururken baska parmakla oyun dugmelerine basilabilir ve yayadayken de calisirlar.
 static bool OnFootTouch(const AInputEvent* ev, int32_t rawAction, float W, float H) {
-    static int s_joyId = -1, s_lookId = -1; static float s_lx = 0, s_ly = 0; static bool s_eat = false, s_btnOnly = false;
+    static int s_joyId = -1, s_lookId = -1; static float s_lx = 0, s_ly = 0; static bool s_on = false, s_btnOnly = false;
+    static int s_game[8]; static int s_gameN = 0;
     if (W < 100.f || H < 100.f) return false;
     const int32_t act = rawAction & AMOTION_EVENT_ACTION_MASK;
     const size_t n = AMotionEvent_getPointerCount(ev);
-    if (n == 0) return s_eat;
+    if (n == 0) return s_on && s_gameN == 0;
+    auto isGame = [&](int id) { for (int i = 0; i < s_gameN; ++i) if (s_game[i] == id) return true; return false; };
+    auto delGame = [&](int id) { for (int i = 0; i < s_gameN; ++i) if (s_game[i] == id) { s_game[i] = s_game[--s_gameN]; return; } };
     if (act == AMOTION_EVENT_ACTION_DOWN) {
-        s_joyId = s_lookId = -1; OnFootCancel(); s_btnOnly = false; s_eat = false;
+        s_joyId = s_lookId = -1; OnFootCancel(); s_btnOnly = false; s_on = false; s_gameN = 0;
         const float x0 = AMotionEvent_getX(ev, 0), y0 = AMotionEvent_getY(ev, 0);
-        if (g_Dialog) s_eat = false;                                            // v10: fiyat/gorev/onay penceresi acikken hicbir dokunma yutulmaz
-        else if (g_OnFoot) s_eat = (y0 >= H * 0.12f);                           // ust serit oyuna gecer (menu/duraklat/shop)
-        else if (g_BtnMode == 1 && g_BtnR > 1.f && InCircle(x0, y0, g_BtnCX, g_BtnCY, g_BtnR * 1.15f)) { g_ReqExit = true; s_eat = true; s_btnOnly = true; }   // Exit Vehicle
+        if (g_Dialog) return false;                                             // fiyat/gorev/onay penceresi: her sey oyuna
+        if (g_OnFoot) s_on = true;
+        else if (g_BtnMode == 1 && g_BtnR > 1.f && InCircle(x0, y0, g_BtnCX, g_BtnCY, g_BtnR * 1.15f)) { g_ReqExit = true; s_btnOnly = true; }   // Exit Vehicle
+        else return false;
     }
-    if (!s_eat) return false;
-    if (s_btnOnly) { if (act == AMOTION_EVENT_ACTION_UP || act == AMOTION_EVENT_ACTION_CANCEL) { s_eat = false; s_btnOnly = false; } return true; }
+    if (s_btnOnly) { if (act == AMOTION_EVENT_ACTION_UP || act == AMOTION_EVENT_ACTION_CANCEL) s_btnOnly = false; return true; }
+    if (!s_on) return false;
     const size_t api = (size_t)((rawAction & AMOTION_EVENT_ACTION_POINTER_INDEX_MASK) >> AMOTION_EVENT_ACTION_POINTER_INDEX_SHIFT);
+    bool eat = true;
     if (act == AMOTION_EVENT_ACTION_DOWN || act == AMOTION_EVENT_ACTION_POINTER_DOWN) {
         const size_t pi = (act == AMOTION_EVENT_ACTION_DOWN) ? 0 : api;
         if (pi < n) {
@@ -2703,6 +2717,10 @@ static bool OnFootTouch(const AInputEvent* ev, int32_t rawAction, float W, float
             float rx, ry, rr; RunBtnGeom(&rx, &ry, &rr);
             if (g_BtnR > 1.f && InCircle(x, y, g_BtnCX, g_BtnCY, g_BtnR * 1.15f)) { g_ReqEnter = true; }
             else if (g_BtnR > 1.f && InCircle(x, y, rx, ry, rr * 1.15f)) { g_Run = !g_Run; }
+            else if (y < H * 0.12f || GameHudHit(g_EngineInstance, x, y, W, H)) {   // ust serit / oyunun kendi dugmeleri: bu parmak OYUNUN
+                if (s_gameN < 8) s_game[s_gameN++] = id;
+                eat = false;
+            }
             else if (x < W * 0.45f && y > H * 0.25f && s_joyId < 0) {
                 float jr = H * 0.17f; s_joyId = id;
                 g_JoyCX = fminf(fmaxf(x, jr), W * 0.45f - jr * 0.5f); g_JoyCY = fminf(fmaxf(y, H * 0.25f + jr * 0.5f), H - jr * 0.6f);
@@ -2725,16 +2743,19 @@ static bool OnFootTouch(const AInputEvent* ev, int32_t rawAction, float W, float
                 s_lx = x; s_ly = y;
             }
         }
+        eat = (s_gameN == 0);                                                   // oyunun bir parmagi basiliysa hareket olaylari oyuna da gider
     } else if (act == AMOTION_EVENT_ACTION_POINTER_UP) {
         if (api < n) {
             const int id = AMotionEvent_getPointerId(ev, api);
-            if (id == s_joyId) { s_joyId = -1; OnFootCancel(); }
-            if (id == s_lookId) s_lookId = -1;
+            if (isGame(id)) { delGame(id); eat = false; }
+            else { if (id == s_joyId) { s_joyId = -1; OnFootCancel(); } if (id == s_lookId) s_lookId = -1; }
         }
     } else if (act == AMOTION_EVENT_ACTION_UP || act == AMOTION_EVENT_ACTION_CANCEL) {
-        s_joyId = s_lookId = -1; OnFootCancel(); s_eat = false;
+        const int id = AMotionEvent_getPointerId(ev, 0);
+        eat = !isGame(id);
+        s_joyId = s_lookId = -1; OnFootCancel(); s_on = false; s_gameN = 0;
     }
-    return true;
+    return eat;
 }
 
 // Sahte Vehicle olarak kullanılan yaya, HUD'da yakıtı olan gerçek araç gibi görünmesin.
@@ -2832,10 +2853,9 @@ static void Init(void* appLib) {
         {"RenderArgs::update",                "_ZN10RenderArgs6updateE",                (void*)my_RAUpdate,  (void**)&orig_RAUpdate},
         // v8: oyundan cikarken (ana menuye donus) yaya once kaldirilsin -> kalan yaya + cokme onlenir
         {"Game::switchToStateStart",          "_ZN4Game18switchToStateStartE",          (void*)my_SwitchToState, (void**)&orig_SwitchToState},
-        // v9: yayadayken kare baslangicinda (glClear sonrasi) sanal gokyuzu + daglar
-        {"GLESHandheldRenderDevice::openQueues", "_ZN24GLESHandheldRenderDevice10openQueuesE",  (void*)my_OpenQueues, (void**)&orig_OpenQueues},
     };
     StartProfiler();
+    SkyInstallHooks();                                                         // v10: glClear/glViewport GOT yamasi (gokyuzu + daglar)
     for (size_t i = 0; i < sizeof(hooks) / sizeof(hooks[0]); ++i) {
         void* fn = Sym(appLib, "", hooks[i].prefix);
         const bool ok = fn && HookChecked(hooks[i].n, fn, hooks[i].repl, hooks[i].orig, true);   // riskli prologue'da TAKILMAZ [K]
@@ -2944,6 +2964,9 @@ static std::string ResumePath() {
     return g_ProfilePath.substr(0, p + 1) + "walker_resume.txt";
 }
 static void ResumeClear() { const std::string f = ResumePath(); if (!f.empty() && remove(f.c_str()) == 0) LOGI("[WALKER] devam kaydi silindi"); }
+// Cokme korumasi: devam dogumundan once ".try" isaretcisi yazilir, yaya 10 sn saglikli yasarsa silinir. Acilista isaretci duruyorsa
+// (= onceki devam denemesi oyunu bozdu/cokertti) devam kaydi tamamen atilir -> oyun normal (araclı) acilir.
+static std::string ResumeTryPath() { const std::string f = ResumePath(); return f.empty() ? f : f + ".try"; }
 static void ResumeWrite(float wx, float wy, float wa, float vx, float vy) {
     if (g_IsClient.load() || g_ClientPlaying.load()) return;
     const std::string f = ResumePath(); if (f.empty()) return;
@@ -2953,6 +2976,8 @@ static void ResumeWrite(float wx, float wy, float wa, float vx, float vy) {
 }
 static bool ResumeRead(ResumeRec* r) {
     const std::string f = ResumePath(); if (f.empty()) return false;
+    { const std::string t = ResumeTryPath(); FILE* tf = t.empty() ? nullptr : fopen(t.c_str(), "rb");
+      if (tf) { fclose(tf); remove(t.c_str()); remove(f.c_str()); LOGI("[WALKER] onceki devam denemesi tamamlanmadi (cokme?) -> devam kaydi atildi"); return false; } }
     FILE* fp = fopen(f.c_str(), "rb"); if (!fp) return false;
     char tag[8] = {0}; double a = 0, b = 0, c = 0, d = 0, e = 0;
     const int n = fscanf(fp, "%7s %lf %lf %lf %lf %lf", tag, &a, &b, &c, &d, &e); fclose(fp);
@@ -2973,29 +2998,33 @@ static void PreSave(uintptr_t game) {
 }
 // v10: oyuna yeni girildiginde (yukleme sonrasi) kayitli yaya konumunu geri yukle. Her karede cagrilir.
 static void TryResume(uintptr_t game, int st) {
-    static int s_prevSt = -1; static bool s_have = false; static ResumeRec s_rec; static long long s_until = 0, s_next = 0;
+    static int s_prevSt = -1; static bool s_have = false; static ResumeRec s_rec; static long long s_until = 0, s_next = 0, s_st6 = 0, s_spawnMs = 0;
+    if (s_spawnMs && NowMs() - s_spawnMs > 10000) { s_spawnMs = 0; if (g_LocalWalker) { const std::string t = ResumeTryPath(); if (!t.empty()) remove(t.c_str()); LOGI("[WALKER] devam basarili (isaretci silindi)"); } }
     if (st == 6 && s_prevSt != 6 && s_prevSt != 7) {                           // yeni oyun dunyasi
-        s_have = !g_IsClient.load() && !g_ClientPlaying.load() && ResumeRead(&s_rec); s_until = NowMs() + 25000; s_next = 0;
+        s_have = !g_IsClient.load() && !g_ClientPlaying.load() && ResumeRead(&s_rec); s_until = NowMs() + 40000; s_next = 0;
         if (s_have) LOGI("[WALKER] devam kaydi var: yaya=(%.1f,%.1f) arac=(%.1f,%.1f)", s_rec.wx, s_rec.wy, s_rec.vx, s_rec.vy);
     }
+    if (st == 6 && s_prevSt != 6) s_st6 = NowMs();
     s_prevSt = st;
     if (!s_have || st != 6 || g_LocalWalker || g_Stash.had || g_Disabled) return;
     const long long now = NowMs();
     if (now > s_until) { s_have = false; LOGI("[WALKER] devam kaydi: eslesen arac bulunamadi (zaman asimi)"); return; }
     if (now < s_next) return; s_next = now + 250;
     if (g_IsClient.load() || g_ClientPlaying.load()) { s_have = false; return; }
-    if (SavePending(game) || VehicleCount(game) >= 30) return;
+    // oyun tam yerlesene kadar bekle: durum 6'da >=4 sn, pencere yok, kayit/yukleme gorevi yok, varliklar hazir, kareler saglikli
+    if (now - s_st6 < 4000 || *(volatile int*)(game + 0x68) != 0 || SavePending(game) || !g_AssetsReady || VehicleCount(game) == 0 || VehicleCount(game) >= 30) return;
     const uintptr_t act = LocalActiveVehiclePtr(game); if (!act || IsWalker(act)) return;
     float x, y, a; if (!BodyPose(act, &x, &y, &a)) return;
     if (sqrtf((x - s_rec.vx) * (x - s_rec.vx) + (y - s_rec.vy) * (y - s_rec.vy)) > 3.0f) return;   // henuz yuklenmedi ya da baska kayit
     s_have = false;
+    { const std::string t = ResumeTryPath(); if (!t.empty()) { FILE* tf = fopen(t.c_str(), "wb"); if (tf) { fputs("1", tf); fclose(tf); } } }
     const float pos[3] = {s_rec.wx, 0.0f, s_rec.wy};
     uint32_t ab; memcpy(&ab, &s_rec.wa, 4);
     const uint32_t idx = SpawnWalker(game, pos, ab, true);
-    if (idx >= VehicleCount(game)) return;
+    if (idx >= VehicleCount(game)) { const std::string t = ResumeTryPath(); if (!t.empty()) remove(t.c_str()); return; }
     g_LastVehicle = act; g_HeadYaw = g_HeadPitch = 0; g_DesInit = false; g_JoyX = g_JoyY = 0;
     SetActiveByPtr(game, RawVehicleSlot(game, idx));
-    g_OnFoot = true; SoundTick(game);
+    g_OnFoot = true; SoundTick(game); s_spawnMs = NowMs();
     LOGI("[WALKER] devam: yaya kayitli yerde yeniden dogdu (%.1f,%.1f)", s_rec.wx, s_rec.wy);
 }
 // Kayit/menu bitti mi? Bittiyse yayayi ayni yerde geri olustur. Her karede (OnGameFrame) ve kayittan hemen sonra cagrilir.
@@ -3192,17 +3221,84 @@ static void DrawSkyGL(uintptr_t game) {
     if (eDepth) glEnable(GL_DEPTH_TEST); if (eBlend) glEnable(GL_BLEND); if (eCull) glEnable(GL_CULL_FACE); if (eScis) glEnable(GL_SCISSOR_TEST); if (eSten) glEnable(GL_STENCIL_TEST);
     glBlendFuncSeparate((GLenum)bsr, (GLenum)bdr, (GLenum)bsa, (GLenum)bda); glBlendEquationSeparate((GLenum)beR, (GLenum)beA);
 }
-static uint64_t my_OpenQueues(void* self) {
-    const uint64_t r = orig_OpenQueues ? orig_OpenQueues(self) : 0;
-    if (g_SkyWanted && !g_SkyGLFail && g_EngineInstance) DrawSkyGL(g_EngineInstance);
-    return r;
+// v10: GOT YAMASI. Eski yontem (Substrate ile GLESHandheldRenderDevice::openQueues kancasi) "riskli prologue" nedeniyle atlaniyordu -> gokyuzu/daglar hic cizilmiyordu.
+// Artik libapp.so'nun glClear / glViewport ice aktarim (PLT) girdileri dogrudan degistirilir (fonksiyon govdesine dokunulmaz).
+// openQueues = bindFramebuffer + glClear(0x4100) + glViewport(0,0,w,h): glClear(0x4100) gorulunce "silahlanir", hemen ardindaki glViewport'tan sonra gokyuzu cizilir.
+typedef void (*GlClear_t)(GLbitfield);
+typedef void (*GlViewport_t)(GLint, GLint, GLsizei, GLsizei);
+static GlClear_t orig_glClear_p = nullptr; static GlViewport_t orig_glViewport_p = nullptr;
+static volatile bool g_SkyArm = false;
+static void my_glClear_sky(GLbitfield m) {
+    if (orig_glClear_p) orig_glClear_p(m);
+    if (m == 0x4100u) { g_SkyArm = true; ++g_SkyStatClear; }
+}
+static void my_glViewport_sky(GLint x, GLint y, GLsizei w, GLsizei h) {
+    if (orig_glViewport_p) orig_glViewport_p(x, y, w, h);
+    if (g_SkyArm) {
+        g_SkyArm = false; ++g_SkyStatVp;
+        if (g_SkyWanted && !g_SkyGLFail && g_EngineInstance && w > 0 && h > 0) { DrawSkyGL(g_EngineInstance); ++g_SkyStatDraw; }
+    }
+}
+struct GotPatchCtx { const char* lib; int patched; };
+static int GotPatchCb(struct dl_phdr_info* info, size_t, void* data) {
+    GotPatchCtx* c = (GotPatchCtx*)data;
+    if (!info->dlpi_name || !strstr(info->dlpi_name, c->lib)) return 0;
+    const uintptr_t base = (uintptr_t)info->dlpi_addr;
+    const ElfW(Dyn)* dyn = nullptr;
+    for (int i = 0; i < info->dlpi_phnum; ++i) if (info->dlpi_phdr[i].p_type == PT_DYNAMIC) dyn = (const ElfW(Dyn)*)(base + info->dlpi_phdr[i].p_vaddr);
+    if (!dyn) return 1;
+    uintptr_t symtab = 0, strtab = 0, jmprel = 0, rel = 0; size_t pltsz = 0, relsz = 0;
+#if defined(__LP64__)
+    typedef ElfW(Rela) GotRel; const int kRelTag = DT_RELA, kRelSzTag = DT_RELASZ;
+#else
+    typedef ElfW(Rel) GotRel; const int kRelTag = DT_REL, kRelSzTag = DT_RELSZ;
+#endif
+    for (; dyn->d_tag != DT_NULL; ++dyn) {
+        const uintptr_t v = (uintptr_t)dyn->d_un.d_ptr; const uintptr_t fv = (v >= base) ? v : base + v;   // bionic bazen goreli, bazen mutlak adres tutar
+        if (dyn->d_tag == DT_SYMTAB) symtab = fv; else if (dyn->d_tag == DT_STRTAB) strtab = fv;
+        else if (dyn->d_tag == DT_JMPREL) jmprel = fv; else if (dyn->d_tag == DT_PLTRELSZ) pltsz = (size_t)v;
+        else if (dyn->d_tag == kRelTag) rel = fv; else if (dyn->d_tag == kRelSzTag) relsz = (size_t)v;
+    }
+    if (!symtab || !strtab) return 1;
+    struct Tab { uintptr_t at; size_t sz; } tabs[2] = {{jmprel, pltsz}, {rel, relsz}};
+    for (int t = 0; t < 2; ++t) {
+        const GotRel* r = (const GotRel*)tabs[t].at; if (!r) continue;
+        const size_t n = tabs[t].sz / sizeof(GotRel);
+        for (size_t i = 0; i < n; ++i) {
+            const uint32_t si = (uint32_t)ELFW(R_SYM)(r[i].r_info); if (!si) continue;
+            const ElfW(Sym)* sy = (const ElfW(Sym)*)symtab + si;
+            const char* nm = (const char*)strtab + sy->st_name;
+            void* repl = nullptr; void** origSlot = nullptr;
+            if (strcmp(nm, "glClear") == 0) { repl = (void*)my_glClear_sky; origSlot = (void**)&orig_glClear_p; }
+            else if (strcmp(nm, "glViewport") == 0) { repl = (void*)my_glViewport_sky; origSlot = (void**)&orig_glViewport_p; }
+            if (!repl) continue;
+            void** got = (void**)(base + r[i].r_offset);
+            if (*got == repl) continue;
+            const uintptr_t pg = (uintptr_t)got & ~(uintptr_t)4095;
+            if (mprotect((void*)pg, 4096, PROT_READ | PROT_WRITE) != 0) { LOGI("[SKY] mprotect basarisiz (%s) errno=%d", nm, errno); continue; }
+            if (!*origSlot) *origSlot = *got;
+            *got = repl; ++c->patched;
+            mprotect((void*)pg, 4096, PROT_READ);
+            LOGI("[SKY] GOT yamasi: %s @%p orijinal=%p", nm, (void*)got, *origSlot);
+        }
+    }
+    return 1;
+}
+static void SkyInstallHooks() {
+    GotPatchCtx c = {"libapp.so", 0};
+    typedef int (*DlIter_t)(int (*)(struct dl_phdr_info*, size_t, void*), void*);
+    DlIter_t it = (DlIter_t)dlsym(RTLD_DEFAULT, "dl_iterate_phdr");
+    if (it) it(GotPatchCb, &c); else LOGI("[SKY] dl_iterate_phdr bulunamadi");
+    g_SkyHooked = (c.patched >= 2 && orig_glClear_p && orig_glViewport_p);
+    LOGI("[SKY] kanca durumu: yama=%d glClear=%p glViewport=%p -> %s", c.patched, (void*)orig_glClear_p, (void*)orig_glViewport_p, g_SkyHooked ? "GOT kancasi AKTIF" : "KANCA YOK (yedek: temizleme rengi)");
 }
 // Yedek yontem (GL gokyuzu kapaliysa): oyunun kalici temizleme rengini gun saatine gore ayarla; aractayken eski renge don.
 typedef void (*ClearColor_t)(float, float, float, float);
 static ClearColor_t fnClearColor = nullptr;
 static void SkyTick(uintptr_t game) {
     static bool s_applied = false;
-    if (!orig_OpenQueues) g_SkyGLFail = true;                                  // openQueues kancasi takilamadiysa yedek yonteme gec
+    if (!g_SkyHooked) g_SkyGLFail = true;                                      // kanca takilamadiysa yedek yonteme gec
+    { static long long s_sl = 0; const long long nw = NowMs(); if (nw - s_sl > 6000) { s_sl = nw; LOGI("[SKY] kanca=%d glClear=%d viewport=%d cizim=%d istek=%d hata=%d dokuID=%u kamera_yasi=%lld ms", (int)g_SkyHooked, g_SkyStatClear, g_SkyStatVp, g_SkyStatDraw, (int)g_SkyWanted, (int)g_SkyGLFail, (unsigned)s_skyTex, (long long)(nw - g_CamMs.load())); } }
     if (!fnClearColor) {
         fnClearColor = (ClearColor_t)dlsym(RTLD_DEFAULT, "glClearColor");
         if (!fnClearColor) { void* h = dlopen("libGLESv2.so", RTLD_NOW); if (h) fnClearColor = (ClearColor_t)dlsym(h, "glClearColor"); }
@@ -3243,6 +3339,33 @@ static void HudTick(uintptr_t game) {
         s_hidden = false;
     }
 }
+// v10: oyun dugmesinin EKRANDAKI merkezi. Dugme tanimi (0xB0 bayt): +0x20 x, +0x24 y (0..1), +0x28/+0x2c boyut, +0x30 hizalama bayragi, +0x44 capa bayragi.
+// Capa (FUN_0003e960): bit1 = x merkez, bit2 = x sag kenar; bit4 = y merkez, bit5 = y alt kenar. Hizalama (applyScreenAlign): olcek manager+0x5c6c (x) / +0x5c70 (y).
+// Merkez capali dugmede ekran merkezi dogrudan hizalanmis x/y'dir; degilse yaricap R ile tahmin edilir.
+static float HudAlignX(const uint8_t* gm, float x, uint32_t fl) {
+    const float sx = *(const float*)(gm + 0x5c6c);
+    if ((fl & 1u) || !(sx > 0.2f && sx < 5.f)) return x;
+    if (fl & 4u) return (x - 0.5f) * sx + 0.5f;
+    if (fl & 8u) return (x - 1.0f) * sx + 1.0f;
+    return x * sx;
+}
+static float HudAlignY(const uint8_t* gm, float y, uint32_t fl) {
+    const float sy = *(const float*)(gm + 0x5c70);
+    if ((fl & 0x10u) || !(sy > 0.2f && sy < 5.f)) return y;
+    if (fl & 0x40u) return (y - 0.5f) * sy + 0.5f;
+    if (fl & 0x80u) return (y - 1.0f) * sy + 1.0f;
+    return y * sy;
+}
+static bool HudBtnCenter(const uint8_t* gm, int idx, float xAdd, float W, float H, float R, float* cx, float* cy) {
+    const uint8_t* e = gm + (size_t)idx * 0xB0;                                // alan ofsetleri manager'a gore (decompile: this + idx*0xB0 + 0x20 ...)
+    const float bx = *(const float*)(e + 0x20) + xAdd, by = *(const float*)(e + 0x24);
+    const uint32_t fl = *(const uint32_t*)(e + 0x30), an = *(const uint32_t*)(e + 0x44);
+    if (!(bx > -0.5f && bx < 2.0f && by > -0.5f && by < 2.0f)) return false;
+    float px = HudAlignX(gm, bx, fl) * W, py = HudAlignY(gm, by, fl) * H;
+    if (an & 2u) { /* x merkez */ } else if (an & 4u) px -= R; else px += R;
+    if (an & 0x10u) { /* y merkez */ } else if (an & 0x20u) py -= R; else py += R;
+    *cx = px; *cy = py; return true;
+}
 // Alt satirdaki son oyun dugmesinin hemen sagi: Enter/Exit dugmesi buraya gelir (dugme sayisi 3-4-5 olsa da ust uste binmez).
 static bool HudRowNext(uintptr_t game, float W, float H, float R, float* cx, float* cy) {
     const uint8_t* gm = (const uint8_t*)(game + 0x2c88);
@@ -3253,11 +3376,28 @@ static bool HudRowNext(uintptr_t game, float W, float H, float R, float* cx, flo
     if (last < 0 || last >= cnt) return false;
     const float xl = *(const float*)(gm + (size_t)last * 0xB0 + 0x20), sp = *(const float*)(gm + 0x5910);
     if (!(xl > 0.05f && xl < 1.0f && sp > 0.03f && sp < 0.3f)) return false;
-    float x = (xl + sp) * W + R; if (x > W - R * 1.2f) x = W - R * 1.2f;
-    *cx = x; *cy = H * 0.92f;
-    static long long s_l = 0; const long long now = NowMs();
-    if (now - s_l > 8000) { s_l = now; LOGI("[WALKER] HUD satiri: n=%d son=%d x=%.3f aralik=%.3f -> dugme (%.0f,%.0f) R=%.0f ekran=%.0fx%.0f", n, last, xl, sp, x, *cy, R, W, H); }
+    float x = 0, y = 0;
+    if (!HudBtnCenter(gm, last, sp, W, H, R, &x, &y)) return false;           // v10: bir sonraki yuva = son dugmenin merkezi + aralik (ayni capa/hizalama)
+    if (x > W - R * 1.2f) x = W - R * 1.2f;
+    if (!(y > H * 0.6f && y < H * 0.99f)) y = H * 0.92f;
+    *cx = x; *cy = y;
+    static long long s_l = 0; const long long now = NowMs(); if (now - s_l > 8000) { s_l = now; LOGI("[WALKER] HUD satiri: n=%d son=%d x=%.3f aralik=%.3f capa=%08x hiz=%08x -> dugme (%.0f,%.0f) R=%.0f ekran=%.0fx%.0f", n, last, xl, sp, *(const uint32_t*)(gm + (size_t)last * 0xB0 + 0x44), *(const uint32_t*)(gm + (size_t)last * 0xB0 + 0x30), x, y, R, W, H); }
     return true;
+}
+// v10: dokunma noktasi oyunun kendi (gorunen) alt satir dugmelerinden birinin uzerinde mi? Evetse dokunma oyuna gecer (yayadayken de calissinlar).
+static bool GameHudHit(uintptr_t game, float x, float y, float W, float H) {
+    if (!game) return false;
+    const uint8_t* gm = (const uint8_t*)(game + 0x2c88);
+    const int cnt = *(const int*)(gm + 4), n = *(const int*)(gm + 0x59A8);
+    if (cnt <= 0 || cnt > 200 || n < 1 || n > 40) return false;
+    const float R = H * 0.053f;
+    for (int i = 0; i < n; ++i) {
+        const int idx = *(const int*)(gm + 0x59AC + i * 4); if (idx < 0 || idx >= cnt) continue;
+        if (*(const uint8_t*)(gm + (size_t)idx * 0xB0 + 0x0C) & 0x80) continue;      // gizli (yayadayken gizlenen kaydiricilar dahil)
+        float cx, cy; if (!HudBtnCenter(gm, idx, 0.f, W, H, R, &cx, &cy)) continue;
+        if ((x - cx) * (x - cx) + (y - cy) * (y - cy) <= (R * 1.25f) * (R * 1.25f)) return true;
+    }
+    return false;
 }
 
 static void OnGameFrame(uintptr_t game) {
@@ -3319,7 +3459,7 @@ static void OnGameFrame(uintptr_t game) {
         TryResume(game, st);                                                   // v10: yukleme sonrasi yaya olarak devam
         g_OnFoot = g_LocalWalker && st == 6 && LocalActiveVehiclePtr(game) == g_LocalWalker;   // v9: menude/magazada dokunmalar yutulmasin
         g_Dialog = (st == 6 && sub != 0);                                      // v10: oyun penceresi (fiyat/gorev/onay) acik: dokunmalar oyuna, yaya arayuzu gizli
-        g_SkyWanted = (st == 6) && !g_Disabled;                                // v10: gokyuzu + daglar her arac icin
+        g_SkyWanted = g_OnFoot && !g_Disabled;                                 // gokyuzu + daglar sadece YAYADAYKEN (istek)
         if (!g_OnFoot || g_Dialog) { g_JoyX = g_JoyY = 0; g_JoyActive = false; if (!g_OnFoot) g_Run = false; }
         SoundTick(game);
         HudTick(game);
@@ -7511,8 +7651,11 @@ static bool ProcessPackets(uint8_t* buf, size_t& buffered, int peerId, std::vect
             {
                 std::lock_guard<std::mutex> lock(g_ChatMutex);
                 g_ChatMessages.push_back(formatted);
+                bool found = false;
+                for (size_t bi = 0; bi < g_ChatBubbles.size(); ++bi) if (g_ChatBubbles[bi].name == pkt.senderName) { g_ChatBubbles[bi].text = pkt.chatData; g_ChatBubbles[bi].ms = NowMs(); found = true; break; }
+                if (!found) { ChatBubbleRec br; br.name = pkt.senderName; br.text = pkt.chatData; br.ms = NowMs(); g_ChatBubbles.push_back(br); }
             }
-            ShowNativeToast(formatted);
+            if (g_ChatUnread.load() < 1000) g_ChatUnread.fetch_add(1);          // v10: toast yok; sohbet butonunda kirmizi rozet
         } else if (type == PACKET_VEHICLE_POSITION) {
             VehiclePositionPacket pkt;
             memcpy(&pkt, buf, sizeof(pkt));
@@ -9137,6 +9280,7 @@ static void DrawPlayerNameTags(const ImVec2& screen) {
 
     int nids[MAX_PLAYERS];
     std::string names[MAX_PLAYERS];
+    std::vector<std::string> members[MAX_PLAYERS];                    // v10: her aracin icindeki oyuncu adlari (mesaj balonu icin)
     int cnt = 0;
     const uint8_t me = g_LocalPlayerId.load();
     const long long now = NowMs();
@@ -9156,8 +9300,17 @@ static void DrawPlayerNameTags(const ImVec2& screen) {
         if (slot < 0) { slot = cnt++; nids[slot] = snapNid[p]; names[slot].clear(); }
         if (!names[slot].empty()) names[slot] += ", ";
         names[slot] += nm;
+        members[slot].push_back(nm);
     }
     if (cnt == 0) return;
+    std::vector<ChatBubbleRec> bubbles;                               // son 3 sn icindeki mesajlar
+    {
+        std::lock_guard<std::mutex> lock(g_ChatMutex);
+        for (size_t bi = g_ChatBubbles.size(); bi-- > 0;) {
+            if (now - g_ChatBubbles[bi].ms > 3000) g_ChatBubbles.erase(g_ChatBubbles.begin() + bi);
+            else bubbles.push_back(g_ChatBubbles[bi]);
+        }
+    }
 
     ImDrawList* d = ImGui::GetForegroundDrawList();
     ImFont* font = ImGui::GetFont();
@@ -9166,7 +9319,7 @@ static void DrawPlayerNameTags(const ImVec2& screen) {
         const uintptr_t v = GetVehicleFromIndex(game, (uint16_t)nids[k]);
         if (v == 0) continue;
         const float wx = *(float*)(v + 0x18 + 0x30);
-        const float wy = *(float*)(v + 0x18 + 0x34) + (WK::IsWalker(v) ? 2.5f : 4.2f);   // arac govdesinin ustu (yayada baston ustu)
+        const float wy = *(float*)(v + 0x18 + 0x34) + (WK::IsWalker(v) ? 1.85f : 4.2f);  // arac govdesinin ustu / yayada kafanin ustu (v10: yayada daha asagida)
         const float wz = *(float*)(v + 0x18 + 0x38);
         if (!(wx == wx) || !(wy == wy) || !(wz == wz)) continue;
         const float vx = V[0] * wx + V[4] * wy + V[8] * wz + V[12];
@@ -9198,6 +9351,24 @@ static void DrawPlayerNameTags(const ImVec2& screen) {
         d->AddTriangleFilled(ImVec2(sx - fs * 0.30f, b.y - 1.0f), ImVec2(sx + fs * 0.30f, b.y - 1.0f),
                              ImVec2(sx, b.y + fs * 0.32f), IM_COL32(0, 0, 0, 150));
         d->AddText(font, fs, ImVec2(a.x + padX, a.y + padY), IM_COL32(255, 255, 255, 240), names[k].c_str());
+        // v10: bu aractaki oyuncunun 3 sn icindeki mesaji, isim etiketinin ustunde balon olarak
+        const ChatBubbleRec* bub = nullptr;
+        for (size_t bi = 0; bi < bubbles.size() && !bub; ++bi)
+            for (size_t mi = 0; mi < members[k].size(); ++mi) if (members[k][mi] == bubbles[bi].name) { bub = &bubbles[bi]; break; }
+        if (bub) {
+            std::string txt = bub->text; if (txt.size() > 90) { txt.resize(87); txt += "..."; }
+            const long long age = now - bub->ms;
+            const float al = age > 2500 ? (float)(3000 - age) / 500.0f : 1.0f;            // son yarim saniyede solar
+            const int a8 = (int)(235.0f * (al < 0 ? 0 : al));
+            const float bfs = fs * 0.92f, wrapW = screen.x * 0.34f;
+            const ImVec2 bts = font->CalcTextSizeA(bfs, FLT_MAX, wrapW, txt.c_str(), nullptr, nullptr);
+            const float bpx = bfs * 0.6f, bpy = bfs * 0.4f;
+            const float bBottom = a.y - fs * 0.28f;
+            ImVec2 ba(sx - bts.x * 0.5f - bpx, bBottom - bts.y - bpy * 2.0f), bb(sx + bts.x * 0.5f + bpx, bBottom);
+            d->AddRectFilled(ba, bb, IM_COL32(255, 255, 255, a8), bfs * 0.5f);
+            d->AddRect(ba, bb, IM_COL32(60, 60, 60, a8), bfs * 0.5f, 0, 1.5f);
+            d->AddText(font, bfs, ImVec2(ba.x + bpx, ba.y + bpy), IM_COL32(25, 25, 25, a8 + 20 > 255 ? 255 : a8 + 20), txt.c_str(), nullptr, wrapW);
+        }
     }
 }
 
@@ -9649,6 +9820,19 @@ void DrawImGui() {
                              ImVec2(cx - vr * 0.02f, cy + vr * 0.15f), white);
         for (int i = -1; i <= 1; ++i)
             d->AddCircleFilled(ImVec2(cx + i * vr * 0.24f, cy - vr * 0.09f), vr * 0.07f, dark, 12);
+        {   // v10: okunmamis mesaj rozeti (kirmizi nokta + sayi, 9'dan fazlasi "+9")
+            const int unread = g_ChatUnread.load();
+            if (unread > 0) {
+                const float brd = r * 0.40f; const ImVec2 bc(cx + r * 0.74f, cy - r * 0.74f);
+                d->AddCircleFilled(ImVec2(bc.x, bc.y + brd * 0.08f), brd * 1.12f, IM_COL32(0, 0, 0, 90), 24);
+                d->AddCircleFilled(bc, brd, IM_COL32(226, 34, 34, 255), 24);
+                d->AddCircle(bc, brd, IM_COL32(255, 255, 255, 235), 24, brd * 0.14f);
+                char nb[8]; if (unread > 9) snprintf(nb, sizeof nb, "+9"); else snprintf(nb, sizeof nb, "%d", unread);
+                ImFont* bf = ImGui::GetFont(); const float bfs = brd * (unread > 9 ? 1.05f : 1.30f);
+                const ImVec2 ts = bf->CalcTextSizeA(bfs, FLT_MAX, 0.0f, nb);
+                d->AddText(bf, bfs, ImVec2(bc.x - ts.x * 0.5f, bc.y - ts.y * 0.5f), IM_COL32(255, 255, 255, 255), nb);
+            }
+        }
 
         // A raw DOWN only arms the button. The menu opens after UP, provided release
         // is still inside the hitbox; this prevents instant activation on touch-down.
@@ -9672,6 +9856,7 @@ void DrawImGui() {
         s_HudChatPressArmed = false;
     }
 
+    if (g_IsMultiplayerMenuActive) g_ChatUnread.store(0);                      // v10: sohbet acikken okunmamis yok
     // Diger oyuncularin araclari uzerinde isim etiketleri (kendi aracin haric)
     if (g_OnlineMode && !g_IsMultiplayerMenuActive) DrawPlayerNameTags(screen);
     TickRender();                                                              // TANI: cizim thread'i canli mi (watchdog)
@@ -10601,7 +10786,7 @@ void* my_renderStartMenuMain(void* thiz, void* p1, void* p2, void* p3) {
 // ========================================================================
 __attribute__((constructor))
 void ModMain() {
-    LOGI(">>> MULTIPLAYER MOD STARTING <<< build=shopfix-43+walker-v10");
+    LOGI(">>> MULTIPLAYER MOD STARTING <<< build=shopfix-44+walker-v11");
 
     ResetVehicleSyncState();
     std::thread(StartPONGResponderThread).detach();
