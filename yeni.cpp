@@ -1,3 +1,85 @@
+// ########################################################################
+// FARMING SIMULATOR 12 - MULTIPLAYER MOD (yeni.cpp)
+// ------------------------------------------------------------------------
+// ICINDEKILER - bir bolume gitmek icin arama kutusuna kimligi yazin, ornek:  [S25]  veya  [W12]
+// ------------------------------------------------------------------------
+//   [S01] GLOBAL VARIABLES
+//   [S02] JNI_OnLoad
+//   [S03] NATIVE ANDROID TOAST NOTIFICATION (JNI)
+//   [S04] HELPER FUNCTIONS
+//   [S05] ORIGINAL FUNCTION POINTERS
+//   [S06] VEHICLE / MULTIPLAYER SYNCHRONIZATION
+//   [S07] PROTOKOL: PAKET KIMLIKLERI + ZAMANLAMA / YUMUSATMA SABITLERI
+//   [S08] PROTOKOL: PAKET YAPILARI (sabit boyutlu, static_assert ile korunur)
+//   [S09] OYUNCU ISIMLERI (id -> ad, benzersizlestirme, ilk paket)
+//   [S10] ARAC SENKRON DURUMU: sahiplik / uzak hedef / yerel ornek yapilari
+//   [S11] AG YARDIMCILARI: soket, aci farki, durum temizleme, host esleme tablosu
+//   [S12] ARAC TOPOLOJISI: yeni/silinen arac tespiti, netId duyurusu, yaya ileri bildirimleri
+//   [S13] KANCA YARDIMCILARI (HookChecked) + Game::removeVehicle kancasi
+//   [S14] ARAC OLAYLARI: uzaktan gelen ekleme / silme uygulama
+//   [S15] SAHIPLIK (authority): talep / atama / birakma / paket kuyruklari
+//   [S16] BOX2D YARDIMCILARI: govdeyi gecici sensor yapma
+//   [S17] OLAY PAKETLERI: romork / alet / tarla / balya / harita saati
+//   [S18] SENKRON AYARLARI + ARAC / ROMORK / ALET HAVUZ ERISIMI
+//   [S19] WK MODULU: YAYA (aractan in / araca bin)  -  alt bolumler [W01]..[W22]
+//       [W01] AYARLAR
+//       [W02] OFFSETLER
+//       [W03] MATEMATIK (4x4 kolon-major)
+//       [W04] DURUM
+//       [W05] CANLI LOG PANELI (libmultiplayermod.so + libapp.so)
+//       [W06] TANI: TAKILMA IZLEYICISI
+//       [W07] SEMBOL TIPLERI
+//       [W08] YARDIMCILAR
+//       [W09] VARLIKLAR (GL thread'inde)
+//       [W10] OLUSTURMA (desc'i gecici yamala)
+//       [W11] IN / BIN (OYUN thread'i)
+//       [W12] Vehicle::update ARDINDAN (sizin my_Vehicle_update'ten cagrilir)
+//       [W13] v7: BIRINCI SAHIS GORUS KESME (CULL) DUZELTMESI
+//       [W14] v8: YAYA DOKUNMATIK KONTROL (joystick + bakis + Enter Vehicle)
+//       [W15] CIZIM
+//       [W16] GENEL API
+//       [W17] KURTARMA + ORNEKLEYICI (v4)
+//       [W18] v9: KAYIT / MENU / CIKIS GUVENLIGI
+//       [W19] v10: OYUNA YAYA OLARAK DEVAM
+//       [W20] v8: SES (motor)
+//       [W21] v9: GOKYUZU (GL thread)
+//       [W22] v9: OYUN HUD'I (kaydiricilar gizle + alt satir konumu)
+//   [S20] ROMORK / ALET: paket kuyruklari, takma-cikarma ve doluluk takibi
+//   [S21] ARAC DURUMLARI: kombine, yapay zeka (AI) ve alet bayraklari
+//   [S22] KORNA: uzak korna sesi (mesafeye gore)
+//   [S23] ROMORK / ALET HAVUZU: izleme + uzaktan uygulama
+//   [S24] TARLA ISLEMI (FIELD_OP): uzaktan gelen islemi uygulama
+//   [S25] GERI DONUS TETIKLEYICISI (oyun bosluktan sonra ilk kez calisti)
+//   [S26] UZAK ROMORK / ALET OLAYLARI: uygulama
+//   [S27] YEREL ROMORK / ALET DURUMU: yakalama ve yayinlama
+//   [S28] YEREL ARAC DURUMU: yakalama ve yayinlama (yaya dahil)
+//   [S29] UZAK ARAC / ROMORK UYGULAMA: hiz, konum, yumusatma
+//   [S30] GELEN PAKET ISLEYICILERI: kayit, oturum, oyuncu bilgisi, sahiplik
+//   [S31] NETWORK FUNCTIONS
+//   [S32] ANDROID KLAVYE / SOHBET GONDERME / DOKU YUKLEME
+//   [S33] YARDIMCI: yeni baglanana sahiplik tablosu gonder
+//   [S34] NETWORK THREADS
+//   [S35] PAKET ISLEME (client ve host ortak)
+//   [S36] GIDEN PAKET HAZIRLAMA (BuildOutgoing)
+//   [S37] CLIENT AG DONGUSU (TCP: host'a guvenilir kanal, UDP: arac goruntuleri)
+//   [S38] HOST AG DONGUSU (en fazla MAX_PLAYERS-1 client; yildiz topoloji, host iletir)
+//   [S39] LAN KESFI + TCP BAGLANTI IPLIKLERI
+//   [S40] HOOKS AND RENDERING
+//   [S41] GAME-STYLE MENU UI HELPERS
+//   [S42] YAZI CUBUGU: klavyenin ustunde yazilan metin
+//   [S43] MODE SELECT MENU  (Offline / LAN / Server)
+//   [S44] MULTIPLAYER MENUSU: oda tablosu, takma ad alani
+//   [S45] MENU NAVIGASYONU (geri / oda kapat / oyuna gec)
+//   [S46] ANA IMGUI KARESI: menuler, sohbet dugmesi + rozet, isim etiketleri, yaya arayuzu
+//   [S47] RENDER HOOKS
+//   [S48] OYUN DONGUSU KANCALARI: Game::update / updateStateBase
+//   [S49] OTOMATIK GIRIS / BASLIK ENJEKSIYONLARI
+//   [S50] MISAFIR (client): satin alma engeli + magaza secimi onarimi
+//   [S51] OYUN GUI KANCALARI: updateGUI, renderMenu, renderStartMenuMain
+//   [S52] MAIN MOD INITIALIZER
+// ------------------------------------------------------------------------
+// ########################################################################
+
 #include <jni.h>
 #include <android/log.h>
 #include <android/input.h>
@@ -52,7 +134,7 @@ static bool SendAllBytes(int socketFd, const void* data, size_t size);
 #define TCP_SYNC_PORT 8889
 
 // ========================================================================
-// GLOBAL VARIABLES
+// [S01] GLOBAL VARIABLES
 // ========================================================================
 JavaVM* g_GlobalJavaVM = nullptr; 
 
@@ -323,7 +405,7 @@ static std::atomic<int> g_KeyboardFieldMode(0); // 0=none, 1=nickname, 2=chat
 static const float kTypingBarBottom = 0.38f;
 
 // ========================================================================
-// JNI_OnLoad
+// [S02] JNI_OnLoad
 // ========================================================================
 JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM* vm, void* reserved) {
     g_GlobalJavaVM = vm;
@@ -332,7 +414,7 @@ JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM* vm, void* reserved) {
 }
 
 // ========================================================================
-// NATIVE ANDROID TOAST NOTIFICATION (JNI)
+// [S03] NATIVE ANDROID TOAST NOTIFICATION (JNI)
 // ========================================================================
 void ShowNativeToast(std::string message) {
     std::thread([message]() {
@@ -378,7 +460,7 @@ void ShowNativeToast(std::string message) {
 }
 
 // ========================================================================
-// HELPER FUNCTIONS
+// [S04] HELPER FUNCTIONS
 // ========================================================================
 uintptr_t GetLibraryBase(const char* libName) {
     FILE* fp = fopen("/proc/self/maps", "r");
@@ -487,7 +569,7 @@ void AutoStartGameForClient() {
 }
 
 // ========================================================================
-// ORIGINAL FUNCTION POINTERS
+// [S05] ORIGINAL FUNCTION POINTERS
 // ========================================================================
 typedef void* (*renderMenu_t)(void* thiz, void* p1, void* p2, void* p3);
 renderMenu_t orig_renderMenu = nullptr;
@@ -576,7 +658,7 @@ typedef void (*GameUpdateStateBase_t)(void* thiz, float param_1, uint32_t param_
 GameUpdateStateBase_t orig_GameUpdateStateBase = nullptr;
 
 // ========================================================================
-// VEHICLE / MULTIPLAYER SYNCHRONIZATION
+// [S06] VEHICLE / MULTIPLAYER SYNCHRONIZATION
 // ========================================================================
 struct TestB2Vec2 {
     float x;
@@ -591,6 +673,9 @@ VehicleGetPosition_t g_VehicleGetPosition = nullptr;
 VehicleGetOrientation_t g_VehicleGetOrientation = nullptr;
 b2BodySetTransform_t g_b2BodySetTransform = nullptr;
 
+// ========================================================================
+// [S07] PROTOKOL: PAKET KIMLIKLERI + ZAMANLAMA / YUMUSATMA SABITLERI
+// ========================================================================
 static const uint8_t PACKET_SESSION_WELCOME = 1;
 static const uint8_t PACKET_CHAT = 2;
 static const uint8_t PACKET_VEHICLE_POSITION = 3;
@@ -676,6 +761,9 @@ static const float REMOTE_MAX_SPEED = 60.0f;             // faster than this = b
 static const float CLAIM_POSITION_EPSILON = 0.05f;
 static const float CLAIM_ANGLE_EPSILON = 0.02f;
 
+// ========================================================================
+// [S08] PROTOKOL: PAKET YAPILARI (sabit boyutlu, static_assert ile korunur)
+// ========================================================================
 #pragma pack(push, 1)
 
 struct SessionWelcomePacket {
@@ -817,6 +905,9 @@ static_assert(sizeof(VehicleReleasePacket) == 8, "VehicleReleasePacket size mism
 static_assert(sizeof(VehicleSpawnPacket) == 22, "VehicleSpawnPacket size mismatch");
 static_assert(sizeof(VehicleRemovePacket) == 4, "VehicleRemovePacket size mismatch");
 
+// ========================================================================
+// [S09] OYUNCU ISIMLERI (id -> ad, benzersizlestirme, ilk paket)
+// ========================================================================
 static std::atomic<uint8_t> g_LocalPlayerId(0xFF);
 static char g_PlayerNames[4][32] = {{0}};
 static std::mutex g_PlayerNamesMutex;
@@ -891,6 +982,9 @@ static void SendLocalPlayerInfo() {
 
 static std::atomic<uint32_t> g_LocalClaimSequence(0);
 
+// ========================================================================
+// [S10] ARAC SENKRON DURUMU: sahiplik / uzak hedef / yerel ornek yapilari
+// ========================================================================
 struct VehicleAuthorityState {
     uint8_t ownerId;
     uint32_t generation;
@@ -1185,6 +1279,9 @@ static void MoneyFrame(uintptr_t g) {
     }
 }
 
+// ========================================================================
+// [S11] AG YARDIMCILARI: soket, aci farki, durum temizleme, host esleme tablosu
+// ========================================================================
 static void PushVehicleOp(PendingVehicleOp op) {
     LOGI("[VEHNET] olay alindi: kind=%d netId=%u origin=%u (armed=%d)", (int)op.kind, (unsigned)op.netId,
          (unsigned)op.originId, (int)g_VehNetArmed.load());
@@ -1296,6 +1393,9 @@ static void BuildHostNetMap(uintptr_t game) {
     g_NetMapDirty.store(false);
 }
 
+// ========================================================================
+// [S12] ARAC TOPOLOJISI: yeni/silinen arac tespiti, netId duyurusu, yaya ileri bildirimleri
+// ========================================================================
 // Game::addVehicle KANCALANMIYOR (orig_Game_addVehicle = oyunun kendi fonksiyonu, sadece cagrilir).
 // Satin alinan araci, oyunun arac dizisindeki degisiklikten (netId'si olmayan yeni adres) buluruz.
 // Boylece Substrate'in fonksiyon basini tasima hatasi riski tamamen ortadan kalkar.
@@ -1466,6 +1566,9 @@ static void RefreshVehicleTopology(uintptr_t game) {
     if (g_IsHost.load() && g_NetMapDirty.load()) BuildHostNetMap(game);
 }
 
+// ========================================================================
+// [S13] KANCA YARDIMCILARI (HookChecked) + Game::removeVehicle kancasi
+// ========================================================================
 // ---- Kanca guvenligi: Substrate (Thumb) fonksiyonun ilk 8-10 baytini kendi alanina TASIR. ----
 // Bu baytlarda PC'ye bagli bir talimat (ldr rX,[pc,#..], adr, add rX,pc, dal) varsa tasinirken
 // bozulur ve kanca takili fonksiyon rastgele bellege erisip oyunu cokertir.
@@ -1565,6 +1668,9 @@ typedef int (*Vehicle_detach_t)(void* vehicle, void* world);
 static Vehicle_detach_t g_VehicleDetachToolFn = nullptr;
 static Vehicle_detach_t g_VehicleDetachTrailerFn = nullptr;
 
+// ========================================================================
+// [S14] ARAC OLAYLARI: uzaktan gelen ekleme / silme uygulama
+// ========================================================================
 // Diger cihazlardan gelen arac ekle/sil olaylarini oyun thread'inde uygular.
 static void ApplyPendingVehicleOps(uintptr_t game) {
     if (game == 0 || !g_IsConnected.load()) return;
@@ -1670,6 +1776,9 @@ static void ApplyPendingVehicleOps(uintptr_t game) {
     }
 }
 
+// ========================================================================
+// [S15] SAHIPLIK (authority): talep / atama / birakma / paket kuyruklari
+// ========================================================================
 static bool GetVehicleOwner(uint16_t vehicleId, uint8_t* outOwner) {
     if (vehicleId >= VEHICLE_SLOT_LIMIT) return false;
 
@@ -1913,6 +2022,9 @@ static uintptr_t g_AttSensorBody[2][256];                     // [alet?1:0][sira
 static uint32_t  g_AttSensorMask[2][256];                     // sensor yapmadan once SENSOR OLMAYAN fixture'lar (bit = fixture sirasi)
 static uint64_t  g_AttSensorMs[2][256];
 
+// ========================================================================
+// [S16] BOX2D YARDIMCILARI: govdeyi gecici sensor yapma
+// ========================================================================
 // Govdenin sensor OLMAYAN butun fixture'larini sensor yapar; hangilerini degistirdigini maske olarak dondurur.
 static uint32_t B2BodyMakeSensor(uintptr_t body) {
     if (!body) return 0;
@@ -1937,6 +2049,9 @@ static void B2BodyRestoreSensor(uintptr_t body, uint32_t mask) {
     if (*(int*)body != 0) { *(uint16_t*)(body + 4) |= 2; *(float*)(body + 0x90) = 0.0f; }
 }
 
+// ========================================================================
+// [S17] OLAY PAKETLERI: romork / alet / tarla / balya / harita saati
+// ========================================================================
 // ---- Romork takma/cikarma olayi ve varlik durumu (doluluk, bicer) paketleri ----
 struct __attribute__((packed)) TrailerAttachPacket {
     uint8_t type;
@@ -2007,6 +2122,9 @@ struct __attribute__((packed)) FieldOwnPacket {
     uint8_t idx;            // tarla kaydi sirasi (Map + idx*100 + 0x2c = sahiplik bayti)
     uint8_t owned;
 };
+// ========================================================================
+// [S18] SENKRON AYARLARI + ARAC / ROMORK / ALET HAVUZ ERISIMI
+// ========================================================================
 static const uint32_t kBaleMax = 50;                              // oyunun balya havuzu (Game+0x388, sayac Game+900)
 static std::vector<BaleOpPacket> g_PendingBaleOps;                // g_VehicleEventMutex ile korunur
 static std::vector<float> g_PendingBaleList;                      // host'un son tam listesi (x,y,a,...); g_VehicleEventMutex
@@ -2084,11 +2202,14 @@ static uintptr_t LocalActiveVehiclePtr(uintptr_t game) {
     return ai < VehicleCount(game) ? RawVehicleSlot(game, ai) : 0;
 }
 
+// ========================================================================
+// [S19] WK MODULU: YAYA (aractan in / araca bin)  -  alt bolumler [W01]..[W22]
+// ========================================================================
 // ---- WALKER (aractan inme) modulu. Gerekenler yukarida tanimli: HookChecked, SetRemoteBodyVelocity (ileri bildirim), orig_Game_addVehicle, ...
-// ===== walker_module.inc (tek dosya olsun diye buraya gomuldu) =====
+// ---- WK modulu basi ----
 // ============================================================================
-// walker_module.inc  (v2)  --  "ARACTAN IN" / "ARACA BIN"           FS12 Android / libapp.so
-// yeni_a1003e.cpp icin UYARLANDI. Entegrasyon: walker_integration.patch (9 kucuk ekleme).
+// WK MODULU: "ARACTAN IN" / "ARACA BIN" (yaya)  --  FS12 Android / libapp.so
+// Tek dosyaya gomulu modul (eskiden ayri walker_module.inc). Yaya bu dosyada WK ad alaninda yasar; dis kod WK:: ile kullanir.
 // ----------------------------------------------------------------------------
 // FIKIR: Yaya = oyunun kendi Vehicle'i (temel arac tipinin desc'i gecici yamali). Boylece
 //   kamera, aktif arac degistirme, netId, sahiplik, konum/hiz senkronu (MP kodunuz) HAZIR calisir.
@@ -2120,7 +2241,7 @@ static uintptr_t LocalActiveVehiclePtr(uintptr_t game) {
 
 namespace WK {
 
-// ------------------------------- AYARLAR -------------------------------
+// ------------------------------- [W01] AYARLAR -------------------------------
 // Dosyalar oyunun assets\objects klasorunde; oyunun kendi yukleyicisi "objects/..." goreli yolunu kullanir [D].
 static const char* const PART_FILE[6] = {"objects/walker_torso.p3d", "objects/walker_head.p3d", "objects/walker_armL.p3d",
                                          "objects/walker_armR.p3d", "objects/walker_legL.p3d", "objects/walker_legR.p3d"};
@@ -2130,7 +2251,6 @@ enum Part { P_TORSO, P_HEAD, P_ARM_L, P_ARM_R, P_LEG_L, P_LEG_R, P_COUNT };
 static const int      BASE_TYPE      = 0;      // [!] klonlanacak EntityManager::VEHICLES tipi (en kucuk / en sorunsuz arac)
 static const float    WALK_SPEED     = 3.3f;   // m/s (v9: 2.2 -> 3.3, cok yavasti)
 static const float    RUN_SPEED      = 6.2f;   // m/s (kosma dugmesi)
-static const float    TURN_RATE      = 3.0f;   // rad/s
 static const float    TURN_SIGN      = +1.0f;  // duzeltme: sol/sağ direksiyon işareti ters çevrildi
 static const float    ENTER_RADIUS   = 7.0f;   // uzak inis konumundan da araca tekrar binebilmek icin (m)
 static const float    EXIT_DIST      = 3.8f;   // inince aracin YANINA (sag/sol, bos olan taraf) koyma mesafesi (m); hitbox yamasi kapaliysa 5.5 yapin
@@ -2181,7 +2301,7 @@ static const float EYE_HEIGHT   = 1.66f;
 #define WK_TURN_MAXW 14.0f           // en fazla donus hizi (rad/s)
 #endif
 
-// ------------------------------- OFFSETLER -------------------------------
+// ------------------------------- [W02] OFFSETLER -------------------------------
 static const uintptr_t G_ACTIVE = 0xA8, G_STATE = 0x64, G_ENTITYMGR = 0x708;           // [D] aktif arac idx / oyun durumu (6=oyun) / EntityManager
 static const uintptr_t G_SYSDEV = 0x74, G_RENDERDEV = 0x78;                            // [D] Game::init'te EntityManager::init'e verilen aygitlar
 static const uintptr_t EM_DESC0 = 8, DESC_STRIDE = 0x22C;                              // [D] desc = em + 8 + tip*0x22C
@@ -2191,7 +2311,7 @@ static const uintptr_t V_BODY_MAT = 0x18, V_BODY_MESH = 0x58, V_PHYS_BODY = 0x52
 static const uintptr_t V_CAM_WORLD = 0x4E0;                                            // [D] Game::updateStateBase bunu okur
 static const uintptr_t B_X = 0x0C, B_Y = 0x10, B_ANGLE = 0x40, B_VX = 0x44, B_VY = 0x48; // [K] b2Body (sizin kodunuzdaki duzen)
 
-// ------------------------------- MATEMATIK (4x4 kolon-major) -------------------------------
+// ------------------------------- [W03] MATEMATIK (4x4 kolon-major) -------------------------------
 struct M4 { float m[16]; };
 static M4 Id() { M4 r; memset(&r, 0, sizeof r); r.m[0] = r.m[5] = r.m[10] = r.m[15] = 1.f; return r; }
 static M4 Mul(const M4& a, const M4& b) {
@@ -2210,7 +2330,7 @@ static M4 AroundPivot(const M4& body, const float p[3], const M4& rot) {
 }
 static inline float BitsToFloat(uint32_t u) { float f; memcpy(&f, &u, 4); return f; }
 
-// ------------------------------- DURUM -------------------------------
+// ------------------------------- [W04] DURUM -------------------------------
 struct Walker { uintptr_t p; float phase, amp; long long lastMs; };
 static std::mutex g_Mu;
 static std::vector<Walker> g_Walkers;          // TUM yayalar (yerel + uzak). Dizi KAYAR, bu yuzden pointer ile takip.
@@ -2250,7 +2370,7 @@ static void SkyTick(uintptr_t game);                               // asagida: y
 static uint32_t* g_Mesh[P_COUNT];              // oyunun IndexedTriangleMesh nesnesi: P[0]=vertexBuf, P[1]=indexBuf [D: enqueueRender]
 static uint32_t  g_TexObj[4] = {0, 0, 0, 0};   // Texture nesnesi = 4 bayt (GL handle) [D: EntityManager'da Texture dizisi 4'er bayt]
 
-// ------------------------------- CANLI LOG PANELI (libmultiplayermod.so + libapp.so) -------------------------------
+// ------------------------------- [W05] CANLI LOG PANELI (libmultiplayermod.so + libapp.so) -------------------------------
 // Ayni surecin logcat ciktisini (--pid) okuyup ekranda gosterir. Sol altta "LOG" dugmesi; filtre dugmesi: Hepsi / Mod / libapp.
 // Not: logcat kullanilamazsa panelde hata satiri gorunur (cihaz/ROM kisiti) -> adb ile alinan log gecerlidir.
 namespace LL {
@@ -2331,7 +2451,7 @@ static void Draw(const ImVec2& screen) {
 }
 } // namespace LL
 
-// ------------------------------- TANI: TAKILMA IZLEYICISI -------------------------------
+// ------------------------------- [W06] TANI: TAKILMA IZLEYICISI -------------------------------
 // Oyun ya da cizim thread'i 2 sn'den uzun takilirsa logcat'e "son asama" yazar: donmanin NEREDE oldugunu gosterir.
 //   logcat: adb logcat -d | Select-String "WALKER|MultiplayerMod"
 static const char* volatile g_StageGame = "-";
@@ -2353,7 +2473,7 @@ static void WatchdogThread() {
     }
 }
 
-// ------------------------------- SEMBOL TIPLERI -------------------------------
+// ------------------------------- [W07] SEMBOL TIPLERI -------------------------------
 // DUZELTME: IndexedTriangleMesh::load bir UYE fonksiyondur: ilk arguman 'this' = 8 baytlik {vertexBuf, indexBuf} nesnesi [D: libapp_so.c 5962, 23546].
 typedef void*    (*MeshLoad_t)(void* self, const char* path, void* sys, void* dev);                       // IndexedTriangleMesh::load(this, const char*, SysDev*, RenderDev*) [D]
 typedef uint32_t (*TexLoad_t)(void* tex, const char* path, void* sys, void* dev, uint32_t keep, uint32_t loc); // Texture::load [D]
@@ -2380,7 +2500,7 @@ static uint32_t g_MeshObj[P_COUNT][2];         // her parca icin IndexedTriangle
 static bool     g_MeshOk[P_COUNT];
 static const uintptr_t G_SHADER = 0xA340;      // [D] Game::init -> EntityManagerDesc+0x10 = *(Game+0xA340): arac mesh'lerinin shader numarasi
 
-// ------------------------------- YARDIMCILAR -------------------------------
+// ------------------------------- [W08] YARDIMCILAR -------------------------------
 static bool IsWalker(uintptr_t p) {
     if (!p) return false;
     std::lock_guard<std::mutex> lk(g_Mu);
@@ -2406,7 +2526,7 @@ static void SetActiveByPtr(uintptr_t game, uintptr_t veh) {
     StageG("SetActive:bitti");
 }
 
-// ------------------------------- VARLIKLAR (GL thread'inde) -------------------------------
+// ------------------------------- [W09] VARLIKLAR (GL thread'inde) -------------------------------
 // Oyunun KENDI yukleyicileri kullanilir; dosyalar assets\objects'te. Aygit gostericileri Game+0x74/+0x78 [D].
 static void EnsureAssets(uintptr_t game) {
     if (g_AssetsReady) return;
@@ -2439,7 +2559,7 @@ static void EnsureAssets(uintptr_t game) {
     g_AssetsReady = (g_TexObj[0] != 0);
 }
 
-// ------------------------------- OLUSTURMA (desc'i gecici yamala) -------------------------------
+// ------------------------------- [W10] OLUSTURMA (desc'i gecici yamala) -------------------------------
 // Vehicle::load desc gostericisini SAKLAMAZ, mesh/fixture/tekerlek bilgisini kopyalar [D] -> yedekle/yamala/ekle/geri yukle.
 // Hem yerel inis hem uzaktan SPAWN (NET_TYPE) buradan gecer. orig_Game_addVehicle sizin kodunuzda HOOK'suz ham fonksiyondur [K].
 static uint32_t SpawnWalker(uintptr_t game, const float* pos3, uint32_t angleBits, bool local) {
@@ -2475,7 +2595,7 @@ static uint32_t AddVehicleForNet(void* game, int type, const float* pos, uint32_
     return orig_Game_addVehicle(game, type, pos, angleBits, 0);
 }
 
-// ------------------------------- IN / BIN (OYUN thread'i) -------------------------------
+// ------------------------------- [W11] IN / BIN (OYUN thread'i) -------------------------------
 static void DoExit(uintptr_t game) {
     StageG("DoExit:basla");
     const uintptr_t cur = LocalActiveVehiclePtr(game);
@@ -2541,7 +2661,7 @@ static void DoEnter(uintptr_t game, bool ignoreRadius) {
     SetActiveByPtr(game, best);                                                // dizi kaydi: indeksi yeniden hesapla
 }
 
-// ------------------------------- Vehicle::update ARDINDAN (sizin my_Vehicle_update'ten cagrilir) -------------------------------
+// ------------------------------- [W12] Vehicle::update ARDINDAN (sizin my_Vehicle_update'ten cagrilir) -------------------------------
 // a,b,c = Vehicle::update'in 3 float argumani (bit deseni). Anlamlari decompile'da KAYIP [!]. Tahmin: a=dt, b=direksiyon, c=gaz.
 // DEBUG_INPUT ile joystick oynatip logcat'ten teyit edin, sonra asagidaki 2 satiri duzeltin.
 static void AfterVehicleUpdate(uintptr_t self, uint32_t ua, uint32_t ub, uint32_t uc, uint32_t ud) {
@@ -2593,7 +2713,7 @@ static void AfterVehicleUpdate(uintptr_t self, uint32_t ua, uint32_t ub, uint32_
     }
 }
 
-// ------------------------------- v7: BIRINCI SAHIS GORUS KESME (CULL) DUZELTMESI -------------------------------
+// ------------------------------- [W13] v7: BIRINCI SAHIS GORUS KESME (CULL) DUZELTMESI -------------------------------
 // Bulgu (decompile): Game::updateStateBase -> RenderArgs::update(view, camWorld) kamera ustunden yer duzlemindeki "gorunur taban" alanini
 // hesaplar (RenderArgs+0xC4..: kamera frustumunun yer ile kesisimi; Map::cullScene arazi/nesne hucrelerini buna gore secer).
 // Yatay bakan birinci sahis kamerasinda ust isin yere hic inmez -> taban alani cokup ILERISI HIC OLUSTURULMAZ.
@@ -2667,7 +2787,7 @@ static void my_RAUpdate(void* self, const float* view, const float* cam) {
     orig_RAUpdate(self, view, cam);
 }
 
-// ------------------------------- v8: YAYA DOKUNMATIK KONTROL (joystick + bakis + Enter Vehicle) -------------------------------
+// ------------------------------- [W14] v8: YAYA DOKUNMATIK KONTROL (joystick + bakis + Enter Vehicle) -------------------------------
 // Yayadayken traktor kontrolleri iptal: ust seritin (y < %12) disindaki TUM dokunmalar yutulur (gaz/direksiyon/korna oyuna ulasmaz).
 //   sol taraf (x < %45) : yuzen joystick  -> ileri/geri/yan yurume
 //   diger yerler        : surukleme       -> bakis (govde istenen yone doner, bkz. AfterVehicleUpdate)
@@ -2766,7 +2886,7 @@ static void StripWalkerVehicleHud(uintptr_t self) {
     *(float*)(self + 0x444) = 0.0f;  // yakıt kapasitesi: HUD yakıt oranını kapat
 }
 
-// ------------------------------- CIZIM -------------------------------
+// ------------------------------- [W15] CIZIM -------------------------------
 static void DrawWalker(uintptr_t self, void* dev) {
     if (!g_AssetsReady || !fnDraw || !fnBind) return;                          // hazir degilse hicbir sey cizme (temel arac gorunmesin)
     StageR("DrawWalker:basla");
@@ -2823,7 +2943,7 @@ static uint64_t my_VehEmis(void* self, void* ra, void* dev, uint32_t a, uint32_t
 WK_SUPPRESS(VehTransp) WK_SUPPRESS(VehUV) WK_SUPPRESS(VehEnv)
 // Emissive: imza decompile'dan (libapp_so.c 18003) okundu -> my_VehEmis (yukarida) bastirir.
 
-// ------------------------------- GENEL API -------------------------------
+// ------------------------------- [W16] GENEL API -------------------------------
 static void* Sym(void* lib, const char* mangled, const char* prefix) {
     void* p = (lib && mangled && *mangled) ? dlsym(lib, mangled) : nullptr;
     if (!p && prefix) p = FindElfSymbolByPrefix("libapp.so", prefix);
@@ -2864,7 +2984,7 @@ static void Init(void* appLib) {
     { static bool s_wd = false; if (!s_wd) { s_wd = true; std::thread(WatchdogThread).detach(); LOGI("[WALKER] watchdog basladi"); } }
 }
 // Oyun thread'i: her karede (my_GameUpdate'ten)
-// ------------------------------- KURTARMA + ORNEKLEYICI (v4) -------------------------------
+// ------------------------------- [W17] KURTARMA + ORNEKLEYICI (v4) -------------------------------
 // Yayayi, "aractan inme" kosulu aramadan kaldirir (yavas kare korumasi): once hedef araca gec, sonra yayayi sil.
 static void HardRemoveLocalWalker(uintptr_t game) {
     const uintptr_t w = g_LocalWalker; if (!w) return;
@@ -2944,7 +3064,7 @@ static void RemoveWalkerKeepActive(uintptr_t game, uintptr_t w) {
     LOGI("[WALKER] araca binildi -> yaya silindi (aktif arac=%p)", (void*)act);
 }
 
-// ------------------------------- v9: KAYIT / MENU / CIKIS GUVENLIGI -------------------------------
+// ------------------------------- [W18] v9: KAYIT / MENU / CIKIS GUVENLIGI -------------------------------
 // Vehicle::serialize tipi this+0x10'dan yazar -> yaya kayda "temel traktor" olarak girer (cikip tekrar girince traktor, client'ta traktor).
 // Ayrica magazada yaya "traktor" olarak listelenir ve satilarak para alinabilirdi. Bu yuzden yaya su durumlarda GEÇICI olarak
 // kaldirilip (araca geri bindirilir) isi bitince ayni yerde yeniden olusturulur ("stash"):
@@ -2953,7 +3073,7 @@ static void RemoveWalkerKeepActive(uintptr_t game, uintptr_t w) {
 struct SaveStash { bool had; float x, y, a; uintptr_t veh; long long ms; };
 static SaveStash g_Stash = {false, 0, 0, 0, 0, 0};
 static inline bool SavePending(uintptr_t game) { return *(volatile uint8_t*)(game + 0xa374 + 0x78) != 0; }   // SaveGames+0x78 = gorev suruyor [D: startTask/processWorkerTask]
-// ------------------------------- v10: OYUNA YAYA OLARAK DEVAM -------------------------------
+// ------------------------------- [W19] v10: OYUNA YAYA OLARAK DEVAM -------------------------------
 // Kayit, yayayi aracina geri bindirerek yazilir (yukaridaki neden). Oyundan cikip tekrar girince oyuncu yine aracin yaninda yaya olsun diye
 // yaya konumu + o andaki arac konumu bir dosyaya yazilir (profil klasorunde walker_resume.txt). Yuklemeden sonra aktif arac, dosyadaki arac konumuyla
 // ~3 m icinde eslesirse yaya ayni yerde yeniden dogar. Oyuncu aracina binince (Enter) dosya silinir. Client'ta kullanilmaz.
@@ -3056,7 +3176,7 @@ static void my_SwitchToState(void* game) {
     if (orig_SwitchToState) orig_SwitchToState(game);
 }
 
-// ------------------------------- v8: SES (motor) -------------------------------
+// ------------------------------- [W20] v8: SES (motor) -------------------------------
 // VehicleSound master sesi 0'lanir (setVehicleState her kare sesi bununla carpar [D: this+0x124]); yayadan inince eski deger geri yazilir.
 static void SoundTick(uintptr_t game) {
     static bool s_muted = false; static uint32_t s_saved = 0x3f800000u;
@@ -3070,7 +3190,7 @@ static void SoundTick(uintptr_t game) {
     }
 }
 
-// ------------------------------- v9: GOKYUZU (GL thread) -------------------------------
+// ------------------------------- [W21] v9: GOKYUZU (GL thread) -------------------------------
 // Oyunun ana temizleme rengi (zeytin yesili) arazi bitince gorunur. Yayadayken Game'in kare baslangicindaki GLESHandheldRenderDevice::openQueues
 // (glClear + glViewport) ARDINDAN, sahne cizilmeden once tam ekran bir "gokyuzu" cizilir (derinlik yazilmaz -> sahne her seyin onunde kalir):
 // gun saatine gore gradyan, gunes/ay, yildizlar (gece), bulutlar ve ufuktaki daglar (buton_texture.h icindeki mountain_png_data).
@@ -3239,6 +3359,11 @@ static void my_glViewport_sky(GLint x, GLint y, GLsizei w, GLsizei h) {
         if (g_SkyWanted && !g_SkyGLFail && g_EngineInstance && w > 0 && h > 0) { DrawSkyGL(g_EngineInstance); ++g_SkyStatDraw; }
     }
 }
+#if defined(__LP64__)
+#define WK_R_SYM(i) ELF64_R_SYM(i)         // eski NDK'lerde ELFW() yok: elf.h makrolari dogrudan kullanilir
+#else
+#define WK_R_SYM(i) ELF32_R_SYM(i)
+#endif
 struct GotPatchCtx { const char* lib; int patched; };
 static int GotPatchCb(struct dl_phdr_info* info, size_t, void* data) {
     GotPatchCtx* c = (GotPatchCtx*)data;
@@ -3265,7 +3390,7 @@ static int GotPatchCb(struct dl_phdr_info* info, size_t, void* data) {
         const GotRel* r = (const GotRel*)tabs[t].at; if (!r) continue;
         const size_t n = tabs[t].sz / sizeof(GotRel);
         for (size_t i = 0; i < n; ++i) {
-            const uint32_t si = (uint32_t)ELFW(R_SYM)(r[i].r_info); if (!si) continue;
+            const uint32_t si = (uint32_t)WK_R_SYM(r[i].r_info); if (!si) continue;
             const ElfW(Sym)* sy = (const ElfW(Sym)*)symtab + si;
             const char* nm = (const char*)strtab + sy->st_name;
             void* repl = nullptr; void** origSlot = nullptr;
@@ -3311,7 +3436,7 @@ static void SkyTick(uintptr_t game) {
     }
 }
 
-// ------------------------------- v9: OYUN HUD'I (kaydiricilar gizle + alt satir konumu) -------------------------------
+// ------------------------------- [W22] v9: OYUN HUD'I (kaydiricilar gizle + alt satir konumu) -------------------------------
 // GenericGUIManager = Game+0x2c88 [D: renderBaseMenu cagrisi]. Dugme dizisi manager+8 + i*0xB0: +0x0C bayrak (bit7 = CIZME), +0x20 x (0..1).
 // Alt satir: sayac manager+0x59A8, liste manager+0x59AC (dugme indisleri), aralik manager+0x5910.
 // Sol (direksiyon) kaydirici = indisler @0x5994/5998/599C/59A0, sag (gaz/fren) kaydirici = indisler @0x59B8/0x59BC [D: updateBaseMenu/ctor].
@@ -3469,7 +3594,6 @@ static void OnGameFrame(uintptr_t game) {
 }
 // Kayit oncesi/oturum bitisinde cagirin: yayayi kaldirip aracina geri bindirir (yoksa Vehicle::serialize yayayi
 // "temel arac" olarak kayda yazar). Su an HICBIR YERDEN CAGRILMIYOR [!]: kayit kancasina baglamak sizin kararinizdir.
-static void ForceReturnToVehicle(uintptr_t game) { DoEnter(game, true); }
 // Dokunma surukleme (ornegin ekranin sag yarisi): kafayi cevirir. Sizin dokunma kodunuzdan cagrilir.
 static void AddLook(float dYawRight, float dPitch) {                      // v8: yaw "saga +" istenen yone eklenir (govde buna doner), pitch kameraya
     g_DesYaw += dYawRight; g_HeadPitch += dPitch;
@@ -3566,8 +3690,11 @@ using WK::StageG;
 using WK::StageR;
 using WK::TickRender;
 
-// ===== walker_module.inc sonu =====
+// ---- WK modulu sonu ----
 
+// ========================================================================
+// [S20] ROMORK / ALET: paket kuyruklari, takma-cikarma ve doluluk takibi
+// ========================================================================
 static void QueueTrailerPosition(uint32_t idx, uint32_t type, float x, float y, float angle, bool moving, bool tool = false) {
     if (!g_IsConnected.load() || idx >= (tool ? 64u : 256u) || type > 0x3F) return;
     const uint8_t ownerId = g_LocalPlayerId.load();
@@ -3902,6 +4029,9 @@ static void ApplyToolAttach(uintptr_t game, const TrailerAttachPacket& pk, void*
     LOGI("[TOOL] uzaktan takma uygulandi: alet=%u arac=%u", (unsigned)pk.trIdx, (unsigned)pk.vehNetId);
 }
 
+// ========================================================================
+// [S21] ARAC DURUMLARI: kombine, yapay zeka (AI) ve alet bayraklari
+// ========================================================================
 static uint8_t LocalVehicleFlags(uintptr_t v) {
     uint8_t f = 0;
     if (*(uint8_t*)(v + 0x328) && *(uint8_t*)(v + 0x498)) f |= 1;            // bicer calisiyor / kesici inik
@@ -4111,6 +4241,9 @@ static AudioSetVol_t g_AudioSetVolFn = nullptr;       // AudioSource::setVolume(
 static const uintptr_t kHornSourceOff = 0xA468;       // Game+0xA468 = korna AudioSource
 static const float kHornFullDist = 12.0f, kHornMaxDist = 150.0f;
 
+// ========================================================================
+// [S22] KORNA: uzak korna sesi (mesafeye gore)
+// ========================================================================
 // 0 = duyulmaz, 1 = tam ses. Bilgi yoksa 1.
 static float RemoteHornGain(uintptr_t game) {
     const int origin = g_RemoteHornOrigin.load();
@@ -4282,6 +4415,9 @@ static void TimeSyncFrame(uintptr_t game, uint32_t st) {
     }
 }
 
+// ========================================================================
+// [S23] ROMORK / ALET HAVUZU: izleme + uzaktan uygulama
+// ========================================================================
 static void PoolPollFrame(uintptr_t game) {
     if (game == 0) return;
     if (!g_VehNetArmed.load() || !g_IsConnected.load()) { g_PoolSnapValid = false; return; }
@@ -4387,6 +4523,9 @@ typedef void (*Map_updateFields_t)(void* map, uint32_t f1, uint32_t f2, uint32_t
 static Map_updateFields_t orig_Map_updateFields = nullptr;
 static void* g_MapUpdateFieldsRaw = nullptr;
 
+// ========================================================================
+// [S24] TARLA ISLEMI (FIELD_OP): uzaktan gelen islemi uygulama
+// ========================================================================
 static void ApplyPendingFieldOps(uintptr_t game) {
     std::vector<FieldOpPacket> ops;
     {
@@ -6114,6 +6253,9 @@ static void WorldSyncFrame(uintptr_t game) {
     }
 }
 
+// ========================================================================
+// [S25] GERI DONUS TETIKLEYICISI (oyun bosluktan sonra ilk kez calisti)
+// ========================================================================
 // Oyun thread'i, durum 6, her karede.
 static void ResumeSyncFrame(uintptr_t game) {
     if (g_RestResendAll.exchange(false)) SendRestPoses(game);
@@ -6129,6 +6271,9 @@ static void OnGameResumed(long long gapMs) {
     if (!g_IsHost.load()) g_SyncRequestOut.store(true);
 }
 
+// ========================================================================
+// [S26] UZAK ROMORK / ALET OLAYLARI: uygulama
+// ========================================================================
 // Diger cihazdan gelen romork takma/cikarma ve durum paketlerini oyun thread'inde uygular.
 static void ApplyPendingTrailerEvents(uintptr_t game, uint8_t localOwner, uint64_t nowMs) {
     std::vector<TrailerAttachPacket> attaches;
@@ -6359,6 +6504,9 @@ static void ApplyPendingTrailerEvents(uintptr_t game, uint8_t localOwner, uint64
     }
 }
 
+// ========================================================================
+// [S27] YEREL ROMORK / ALET DURUMU: yakalama ve yayinlama
+// ========================================================================
 // Bir araca bagli romork/aletin konumunu YAYINLAYAN cihaz tek olmali (hem gonderen hem alan ayni kurali kullanir):
 //  1) Aracin sahibi (authority) varsa o cihaz.
 //  2) Sahipsizse ve araci yerelde aktif kullaniyorsam: daha dusuk numarali baska oyuncu de ayni aractaysa o, degilse ben.
@@ -6506,6 +6654,9 @@ static void CaptureAndQueueLocalTrailerStates(uintptr_t game, uint8_t localOwner
     }
 }
 
+// ========================================================================
+// [S28] YEREL ARAC DURUMU: yakalama ve yayinlama (yaya dahil)
+// ========================================================================
 static void CaptureAndQueueLocalVehicleState(uintptr_t game) {
     if (game == 0 || !g_IsConnected.load()) return;
     if (!g_VehicleGetPosition || !g_VehicleGetOrientation) return;
@@ -6678,6 +6829,9 @@ static void PredictRemotePose(const VehicleRemoteState& s, uint64_t nowMs,
     *angle = s.angle + s.angularVelocity * age;
 }
 
+// ========================================================================
+// [S29] UZAK ARAC / ROMORK UYGULAMA: hiz, konum, yumusatma
+// ========================================================================
 // Box2D 2.1 b2Body layout, checked against b2Body::SetLinearVelocity / SetTransform in the
 // decompile: +0x00 type, +0x04 flags (bit 1 = awake), +0x44/+0x48 linear velocity,
 // +0x4C angular velocity, +0x90 sleep time. Giving the remote body its real speed keeps
@@ -6902,6 +7056,9 @@ static void ApplyRemoteVehicleStates(uintptr_t game) {
     ApplyRemoteAttachablePoses(game, localOwner, nowMs, decay, true);
 }
 
+// ========================================================================
+// [S30] GELEN PAKET ISLEYICILERI: kayit, oturum, oyuncu bilgisi, sahiplik
+// ========================================================================
 static void HandleSaveChunk(const SaveChunkPacket& p) {
     if (g_IsHost.load()) return;
     if (p.total == 0 || p.total > 4u * 1024u * 1024u || p.len > SAVE_CHUNK_DATA ||
@@ -7304,7 +7461,7 @@ static void ResetVehicleSyncState() {
 }
 
 // ========================================================================
-// NETWORK FUNCTIONS
+// [S31] NETWORK FUNCTIONS
 // ========================================================================
 bool IsNetworkAvailable() {
     int sock = socket(AF_INET, SOCK_DGRAM, 0);
@@ -7374,6 +7531,9 @@ bool IsLocalIP(const std::string& ip) {
     return isLocal;
 }
 
+// ========================================================================
+// [S32] ANDROID KLAVYE / SOHBET GONDERME / DOKU YUKLEME
+// ========================================================================
 // ------------------------------------------------------------------------
 // Soft keyboard. The game view has no text editor, so the keyboard is toggled
 // through InputMethodManager and Android delivers the letters as key events
@@ -7479,6 +7639,9 @@ GLuint LoadTextureFromPNGArray(const unsigned char* png_data, int data_len) {
     return LoadTextureFromPNGArrayEx(png_data, data_len, &g_ButtonOrigWidth, &g_ButtonOrigHeight);
 }
 
+// ========================================================================
+// [S33] YARDIMCI: yeni baglanana sahiplik tablosu gonder
+// ========================================================================
 // Send the current authority table to a newly connected client.
 static void QueueAllCurrentAuthorities() {
     if (!g_IsHost.load() || !g_IsConnected.load()) return;
@@ -7507,9 +7670,9 @@ static void QueueAllCurrentAuthorities() {
 }
 
 // ========================================================================
-// NETWORK THREADS
+// [S34] NETWORK THREADS
 // ========================================================================
-// PAKET ISLEME (client ve host ortak)
+// [S35] PAKET ISLEME (client ve host ortak)
 // ========================================================================
 static void AppendBytes(std::vector<uint8_t>& dst, const void* data, size_t size) {
     const uint8_t* p = (const uint8_t*)data;
@@ -7937,6 +8100,9 @@ static bool ProcessPackets(uint8_t* buf, size_t& buffered, int peerId, std::vect
     return true;
 }
 
+// ========================================================================
+// [S36] GIDEN PAKET HAZIRLAMA (BuildOutgoing)
+// ========================================================================
 // Bu cihazin gonderecegi her seyi (sohbet, sahiplik, arac anlik goruntusu) tek tamponda toplar.
 static void BuildOutgoing(std::vector<uint8_t>& out, std::vector<uint8_t>* fast = nullptr) {
     FieldSnapPauseTick();                                   // oyun durduysa son tarla durumunu yolla (duraklama devri)
@@ -8104,7 +8270,7 @@ static void AppendAuthorityTable(std::vector<uint8_t>& out) {
 }
 
 // ========================================================================
-// CLIENT AG DONGUSU (TCP: host'a guvenilir kanal, UDP: arac goruntuleri)
+// [S37] CLIENT AG DONGUSU (TCP: host'a guvenilir kanal, UDP: arac goruntuleri)
 // ========================================================================
 void NetworkLoop() {
     fcntl(g_TcpSocket, F_SETFL, O_NONBLOCK);
@@ -8237,7 +8403,7 @@ void NetworkLoop() {
 }
 
 // ========================================================================
-// HOST AG DONGUSU (en fazla MAX_PLAYERS-1 client; yildiz topoloji, host iletir)
+// [S38] HOST AG DONGUSU (en fazla MAX_PLAYERS-1 client; yildiz topoloji, host iletir)
 // ========================================================================
 struct HostPeer {
     int fd;
@@ -8647,6 +8813,9 @@ static void HostNetworkLoop(int serverFd, int gen) {
     if (udpFd >= 0) close(udpFd);
 }
 
+// ========================================================================
+// [S39] LAN KESFI + TCP BAGLANTI IPLIKLERI
+// ========================================================================
 void StartPONGResponderThread() {
     // Ag kopsa / soket hata verse bile islemciyi bos donguyle yememesi icin: hata olursa
     // bekle ve soketi yeniden ac. recvfrom zaman asimli, bos beklemez.
@@ -8837,7 +9006,7 @@ void TCPClientThread(std::string hostIP) {
 }
 
 // ========================================================================
-// HOOKS AND RENDERING
+// [S40] HOOKS AND RENDERING
 // ========================================================================
 int32_t my_AInputQueue_getEvent(void* queue, AInputEvent** outEvent) {
     int32_t result;
@@ -9005,7 +9174,7 @@ int32_t my_AInputQueue_getEvent(void* queue, AInputEvent** outEvent) {
 }
 
 // ========================================================================
-// GAME-STYLE MENU UI HELPERS
+// [S41] GAME-STYLE MENU UI HELPERS
 // ========================================================================
 static ImTextureID ToImGuiTexture(GLuint texture) {
     return (ImTextureID)(intptr_t)texture;
@@ -9040,24 +9209,6 @@ static void InitGameUIFont() {
     if (g_GameUIFont == nullptr) {
         g_GameUIFont = io.Fonts->AddFontDefault();
     }
-}
-
-static bool IsInsideGameButtonTexture(ImVec2 pos, ImVec2 size, bool rightAligned) {
-    const ImVec2 mouse = ImGui::GetIO().MousePos;
-    if (mouse.x < pos.x || mouse.x > pos.x + size.x ||
-        mouse.y < pos.y || mouse.y > pos.y + size.y) {
-        return false;
-    }
-
-    float u = (mouse.x - pos.x) / std::max(1.0f, size.x);
-    float v = (mouse.y - pos.y) / std::max(1.0f, size.y);
-    if (rightAligned) u = 1.0f - u;
-
-    if (v < 0.245f || v > 0.765f) return false;
-    const float t = (v - 0.245f) / (0.765f - 0.245f);
-    const float left = 0.006f;
-    const float right = 0.990f - 0.080f * t;
-    return u >= left && u <= right;
 }
 
 // Oyunun kendi buton tiklama sesi (buton.p1d): AudioSource::play(vol, pitch, loop).
@@ -9242,9 +9393,6 @@ static void DrawHeaderDarkening(const ImVec2& screen) {
 }
 
 // ========================================================================
-// TYPING BAR (shows the text being typed, just above the soft keyboard)
-// ========================================================================
-// ========================================================================
 // OYUNCU ISIM ETIKETLERI: diger oyuncularin bulundugu araclarin ustunde isimleri gosterilir
 // (kendi icinde bulundugun arac haric). Kamera gorunum matrisi RenderArgs::update'ten (her karede) alinir,
 // izdusum matrisi Game+0xA2B0 (oyun ici) / +0xA270'tedir; ikisi de GL sutun-sirali. Oyuncu hangi aracin icinde
@@ -9372,6 +9520,9 @@ static void DrawPlayerNameTags(const ImVec2& screen) {
     }
 }
 
+// ========================================================================
+// [S42] YAZI CUBUGU: klavyenin ustunde yazilan metin
+// ========================================================================
 static void DrawTypingBar(const ImVec2& screen) {
     static bool s_barFocused = false;
     static bool s_btnHeld = false;       // parmak TAMAM'in uzerinde: bu sirada yazi kutusu odagi geri istenmez (tiklamayi iptal ederdi)
@@ -9466,7 +9617,10 @@ static void DrawTypingBar(const ImVec2& screen) {
 }
 
 // ========================================================================
-// MODE SELECT MENU  (Offline / LAN / Server)
+// [S43] MODE SELECT MENU  (Offline / LAN / Server)
+// ========================================================================
+// ========================================================================
+// [S44] MULTIPLAYER MENUSU: oda tablosu, takma ad alani
 // ========================================================================
 // Kullanici adi alani. editable=false ise salt-okunur (dokunma / klavye yok).
 // Oda tablosu: oda adi, oyuncu sayisi ve oyuncu satirlari (Host / Client).
@@ -9639,6 +9793,9 @@ static int DrawChoiceMenu(const char* windowId, const char* title,
     return clicked;
 }
 
+// ========================================================================
+// [S45] MENU NAVIGASYONU (geri / oda kapat / oyuna gec)
+// ========================================================================
 static void GameGoBackToTitle() {
     if (g_EngineInstance == 0) return;
     uintptr_t dev = *(uintptr_t*)(g_EngineInstance + 0x7c);
@@ -9691,6 +9848,9 @@ static void MpProceedToGame() {
     g_PendingTouchDown.store(false);
 }
 
+// ========================================================================
+// [S46] ANA IMGUI KARESI: menuler, sohbet dugmesi + rozet, isim etiketleri, yaya arayuzu
+// ========================================================================
 void DrawImGui() {
     static bool s_HudChatPressArmed = false;
     LoadOrCreateProfile();
@@ -10192,7 +10352,7 @@ void DrawImGui() {
 }
 
 // ========================================================================
-// RENDER HOOKS
+// [S47] RENDER HOOKS
 // ========================================================================
 // ========================================================================
 // ORTAK PARA: "HAYALET" VARLIKLARIN PARA DEGISIMINI GERI AL
@@ -10433,6 +10593,9 @@ static void my_Map_updateFields(void* map, uint32_t f1, uint32_t f2, uint32_t f3
     QueueFieldOp(wt, wf, pts);
 }
 
+// ========================================================================
+// [S48] OYUN DONGUSU KANCALARI: Game::update / updateStateBase
+// ========================================================================
 void my_GameUpdate(void* thiz, float param_1) {
     // v4: Game::update'in param_1'i SANIYE cinsinden kare suresidir (this+0x58 ona toplanip 120/300 s ile karsilastiriliyor).
     // Oyun bunu sinirlamiyor: tek bir uzun takilma, sonraki karelerin dt'sini de uzatip KALICI ~13 sn'lik karelere donusuyordu.
@@ -10566,6 +10729,9 @@ void my_GameUpdateStateBase(void* thiz, float param_1, uint32_t param_2, uint32_
 // yukleme akisini calistirip durum 6'ya (oyun) gecer.
 static void* g_SwitchToStateStart = nullptr;   // Game::switchToStateStart() (dlsym)
 
+// ========================================================================
+// [S49] OTOMATIK GIRIS / BASLIK ENJEKSIYONLARI
+// ========================================================================
 // Client oyundan basliga atilir: oyunun kendi "ayarlar -> Exit (kaydetmeden)" akisi calistirilir.
 static void KickToTitleInject() {
     const long long until = g_KickUntilMs.load();
@@ -10631,6 +10797,9 @@ static void AutoStartInject() {
     }
 }
 
+// ========================================================================
+// [S50] MISAFIR (client): satin alma engeli + magaza secimi onarimi
+// ========================================================================
 // Oyunun kendi koduna gore (GenericGUIManager::updateGuiButtons, case 0x20/0x21/0x22) magaza
 // alim/satim olaylarinda (0x19..0x1d) urun numarasi GUI yoneticisinin +0x583c alanindan
 // Game+0x9c24'e yazilir. Logda Game+0x9c24'un bu olaylarda hep 0x42800000 (float 64.0)
@@ -10703,6 +10872,9 @@ static void RepairShopClick(void* gui, const char* where) {
 }
 static void GuardShopSelection(void* gui) { RepairShopClick(gui, "updateGUI"); }
 
+// ========================================================================
+// [S51] OYUN GUI KANCALARI: updateGUI, renderMenu, renderStartMenuMain
+// ========================================================================
 void* my_updateGUI(void* thiz, void* p1, void* p2, void* p3, void* p4) {
     g_HUDInstance = (uintptr_t)thiz;
 
@@ -10782,11 +10954,11 @@ void* my_renderStartMenuMain(void* thiz, void* p1, void* p2, void* p3) {
 }
 
 // ========================================================================
-// MAIN MOD INITIALIZER
+// [S52] MAIN MOD INITIALIZER
 // ========================================================================
 __attribute__((constructor))
 void ModMain() {
-    LOGI(">>> MULTIPLAYER MOD STARTING <<< build=shopfix-44+walker-v11");
+    LOGI(">>> MULTIPLAYER MOD STARTING <<< build=shopfix-45+walker-v11b");
 
     ResetVehicleSyncState();
     std::thread(StartPONGResponderThread).detach();
