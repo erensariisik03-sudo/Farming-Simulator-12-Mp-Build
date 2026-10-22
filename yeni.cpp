@@ -2926,7 +2926,9 @@ static void DrawWalker(uintptr_t self, void* dev) {
     for (int i = 0; i < P_COUNT; ++i) if (g_Mesh[i] && !(hideHead && i == P_HEAD)) fnDraw(dev, mats[i].m, g_Mesh[i][0], g_Mesh[i][1]);
     StageR("DrawWalker:bitti");
 }
+static void ApplySunLight(void* dev);                                       // [W21] gunes yonune gore isik (yayadayken)
 static void my_VehRender(void* self, void* ra, void* dev, uint32_t p3) {
+    if (g_SkyWanted) ApplySunLight(dev);
     if (IsWalker((uintptr_t)self)) { DrawWalker((uintptr_t)self, dev); return; }
     StageR("VehRender(normal)");
     orig_VehRender(self, ra, dev, p3);
@@ -3118,6 +3120,7 @@ static void PreSave(uintptr_t game) {
 }
 // v10: oyuna yeni girildiginde (yukleme sonrasi) kayitli yaya konumunu geri yukle. Her karede cagrilir.
 static void TryResume(uintptr_t game, int st) {
+    static float s_bestDist = 1e9f;
     static int s_prevSt = -1; static bool s_have = false; static ResumeRec s_rec; static long long s_until = 0, s_next = 0, s_st6 = 0, s_spawnMs = 0;
     if (s_spawnMs && NowMs() - s_spawnMs > 10000) { s_spawnMs = 0; if (g_LocalWalker) { const std::string t = ResumeTryPath(); if (!t.empty()) remove(t.c_str()); LOGI("[WALKER] devam basarili (isaretci silindi)"); } }
     if (st == 6 && s_prevSt != 6 && s_prevSt != 7) {                           // yeni oyun dunyasi
@@ -3128,14 +3131,24 @@ static void TryResume(uintptr_t game, int st) {
     s_prevSt = st;
     if (!s_have || st != 6 || g_LocalWalker || g_Stash.had || g_Disabled) return;
     const long long now = NowMs();
-    if (now > s_until) { s_have = false; LOGI("[WALKER] devam kaydi: eslesen arac bulunamadi (zaman asimi)"); return; }
+    if (now > s_until) { s_have = false; LOGI("[WALKER] devam kaydi: eslesen arac bulunamadi (zaman asimi) varlik=%d en_yakin_arac=%.1f m", (int)g_AssetsReady, (double)s_bestDist); return; }
     if (now < s_next) return; s_next = now + 250;
     if (g_IsClient.load() || g_ClientPlaying.load()) { s_have = false; return; }
     // oyun tam yerlesene kadar bekle: durum 6'da >=4 sn, pencere yok, kayit/yukleme gorevi yok, varliklar hazir, kareler saglikli
-    if (now - s_st6 < 4000 || *(volatile int*)(game + 0x68) != 0 || SavePending(game) || !g_AssetsReady || VehicleCount(game) == 0 || VehicleCount(game) >= 30) return;
-    const uintptr_t act = LocalActiveVehiclePtr(game); if (!act || IsWalker(act)) return;
-    float x, y, a; if (!BodyPose(act, &x, &y, &a)) return;
-    if (sqrtf((x - s_rec.vx) * (x - s_rec.vx) + (y - s_rec.vy) * (y - s_rec.vy)) > 3.0f) return;   // henuz yuklenmedi ya da baska kayit
+    // v12: hazirlik beklenirken sure akmaz (eskiden coklu oyuncu odasi acikken varliklar yuklenmedigi icin 40 sn sonra kayit yok oluyordu); en fazla 5 dk beklenir
+    if (now - s_st6 < 4000 || *(volatile int*)(game + 0x68) != 0 || SavePending(game) || !g_AssetsReady || VehicleCount(game) == 0 || VehicleCount(game) >= 30) {
+        if (now - s_st6 < 300000) s_until = now + 40000;
+        return;
+    }
+    // kayitli arac konumuna 3 m icindeki yaya olmayan arac (aktif arac olmak zorunda degil)
+    uintptr_t act = 0; s_bestDist = 1e9f;
+    for (uint32_t i = 0; i < VehicleCount(game); ++i) {
+        const uintptr_t v = RawVehicleSlot(game, i); if (!v || IsWalker(v)) continue;
+        float x, y, a; if (!BodyPose(v, &x, &y, &a)) continue;
+        const float d = sqrtf((x - s_rec.vx) * (x - s_rec.vx) + (y - s_rec.vy) * (y - s_rec.vy));
+        if (d < s_bestDist) { s_bestDist = d; if (d <= 3.0f) act = v; }
+    }
+    if (!act) return;                                                          // henuz yuklenmedi ya da baska kayit
     s_have = false;
     { const std::string t = ResumeTryPath(); if (!t.empty()) { FILE* tf = fopen(t.c_str(), "wb"); if (tf) { fputs("1", tf); fclose(tf); } } }
     const float pos[3] = {s_rec.wx, 0.0f, s_rec.wy};
@@ -3221,15 +3234,13 @@ static void ComputeSky(double hour, SkyParams* o) {
     Lerp3(nightZ, dayZ, day, z); Lerp3(z, twZ, tw * 0.50f, o->zn);
 }
 static bool g_SkyGLOk = false, g_SkyGLFail = false;
-static const char* kSkyVS = "attribute vec2 aPos; varying vec2 vP; void main(){ vP = aPos; gl_Position = vec4(aPos, 0.0, 1.0); }";
+static const char* kSkyVS = "attribute vec2 aPos; uniform float uYmin; varying vec2 vP; void main(){ vP = vec2(aPos.x, mix(uYmin, 1.0, aPos.y * 0.5 + 0.5)); gl_Position = vec4(vP, 0.0, 1.0); }";   // v12: dortgen sadece ufuk cizgisinin ustunu kapsar (alt kisim zaten arazi)
 static const char* kSkyFS =
     "#ifdef GL_FRAGMENT_PRECISION_HIGH\nprecision highp float;\n#else\nprecision mediump float;\n#endif\n"
-    "varying vec2 vP; uniform vec3 uR, uU, uF, uHz, uZn, uSun; uniform vec2 uTan; uniform vec4 uP; uniform vec4 uM; uniform sampler2D uTex;\n"
+    "varying vec2 vP; uniform vec3 uR, uU, uF, uHz, uZn, uSun; uniform vec2 uTan; uniform vec4 uP; uniform vec4 uM; uniform sampler2D uTex; uniform sampler2D uNoise;\n"
     "float h31(vec3 p){ p = fract(p * 0.1031); p += dot(p, p.yzx + 33.33); return fract((p.x + p.y) * p.z); }\n"
     "float h21(vec2 p){ vec3 q = fract(vec3(p.xyx) * 0.1031); q += dot(q, q.yzx + 33.33); return fract((q.x + q.y) * q.z); }\n"
-    "float vn(vec2 p){ vec2 i = floor(p); vec2 f = fract(p); f = f * f * (3.0 - 2.0 * f);\n"
-    "  return mix(mix(h21(i), h21(i + vec2(1.0, 0.0)), f.x), mix(h21(i + vec2(0.0, 1.0)), h21(i + vec2(1.0, 1.0)), f.x), f.y); }\n"
-    "float fbm(vec2 p){ float a = 0.5; float s = 0.0; for (int i = 0; i < 4; i++) { s += a * vn(p); p = p * 2.03 + vec2(1.7, 9.2); a *= 0.5; } return s; }\n"
+    "float fbm(vec2 p){ float a = 0.5; float s = 0.0; for (int i = 0; i < 4; i++) { s += a * texture2D(uNoise, p * 0.00390625).r; p = p * 2.03 + vec2(1.7, 9.2); a *= 0.5; } return s; }\n"
     "void main(){\n"
     "  vec3 ray = normalize(uF + vP.x * uTan.x * uR + vP.y * uTan.y * uU);\n"
     "  float e = ray.y; float day = uP.x; float night = uP.y; float tm = uP.z;\n"
@@ -3246,7 +3257,7 @@ static const char* kSkyFS =
     "    vec3 lit = mix(vec3(0.20, 0.22, 0.30), vec3(1.0), day); lit = mix(lit, vec3(1.0, 0.78, 0.60), clamp(1.0 - abs(uSun.y) * 3.0, 0.0, 1.0) * day * 0.6);\n"
     "    vec3 cc = mix(lit * 0.72, lit, smoothstep(0.55, 0.85, n)); col = mix(col, cc, c * 0.9); }\n"
     "  if (uM.z > 0.0) { float az = atan(ray.x, ray.z); float t = az * 0.1591549 * uM.z; float u = abs(mod(t, 2.0) - 1.0); float v = (e - uM.x) / (uM.y - uM.x);\n"
-    "    if (v < 1.0) { float vv = clamp(v, 0.0, 1.0); vec4 m = texture2D(uTex, vec2(u, 1.0 - vv)); vec3 mc = mix(m.rgb, uHz, 0.38); mc *= 0.12 + 0.88 * day; col = mix(col, mc, m.a * smoothstep(0.0, 0.22, v)); } }\n"
+    "    if (v < 1.0) { float vv = clamp(v, 0.0, 1.0); vec4 m = texture2D(uTex, vec2(u, 1.0 - vv)); vec3 mc = mix(m.rgb, uHz, 0.14); mc = mix(vec3(dot(mc, vec3(0.3, 0.59, 0.11))), mc, 1.12); mc *= 0.12 + 0.88 * day; col = mix(col, mc, m.a * smoothstep(0.0, 0.22, v)); } }\n"
     "  gl_FragColor = vec4(col, 1.0);\n"
     "}\n";
 static GLuint SkyCompile(GLenum type, const char* src) {
@@ -3255,7 +3266,36 @@ static GLuint SkyCompile(GLenum type, const char* src) {
     if (!ok) { char log[512]; GLsizei n = 0; glGetShaderInfoLog(sh, sizeof log - 1, &n, log); log[n] = 0; LOGI("[WALKER] gokyuzu shader HATA (%s): %s", type == GL_VERTEX_SHADER ? "vs" : "fs", log); glDeleteShader(sh); return 0; }
     return sh;
 }
-static GLuint s_skyProg = 0, s_skyVbo = 0, s_skyTex = 0; static GLint s_uR, s_uU, s_uF, s_uHz, s_uZn, s_uSun, s_uTan, s_uP, s_uM, s_uTex;
+static GLuint s_skyProg = 0, s_skyVbo = 0, s_skyTex = 0, s_noiseTex = 0; static GLint s_uR, s_uU, s_uF, s_uHz, s_uZn, s_uSun, s_uTan, s_uP, s_uM, s_uTex, s_uNoise, s_uYmin;
+// v12: dag dokusu (1024x78) 2x buyutulur: Catmull-Rom + hafif keskinlestirme (bulaniklik/"soluk" gorunum azalir). Sonuc malloc ile verilir.
+static float CatmullW(float t, int k) {                                        // k = -1,0,1,2 -> agirlik
+    const float t2 = t * t, t3 = t2 * t;
+    switch (k) { case -1: return 0.5f * (-t3 + 2.f * t2 - t); case 0: return 0.5f * (3.f * t3 - 5.f * t2 + 2.f); case 1: return 0.5f * (-3.f * t3 + 4.f * t2 + t); default: return 0.5f * (t3 - t2); }
+}
+static unsigned char* UpscaleSharpen2x(const unsigned char* src, int w, int h, int* ow, int* oh) {
+    const int W = w * 2, H = h * 2;
+    float* tmp = (float*)malloc(sizeof(float) * (size_t)W * h * 4); unsigned char* out = (unsigned char*)malloc((size_t)W * H * 4);
+    if (!tmp || !out) { free(tmp); free(out); return nullptr; }
+    for (int y = 0; y < h; ++y) for (int x = 0; x < W; ++x) {                  // yatay
+        const float fx = (x + 0.5f) * 0.5f - 0.5f; const int ix = (int)floorf(fx); const float t = fx - ix;
+        for (int c = 0; c < 4; ++c) { float a = 0.f; for (int k = -1; k <= 2; ++k) { int xx = ix + k; xx = xx < 0 ? 0 : (xx >= w ? w - 1 : xx); a += CatmullW(t, k) * src[((size_t)y * w + xx) * 4 + c]; } tmp[((size_t)y * W + x) * 4 + c] = a; }
+    }
+    for (int y = 0; y < H; ++y) for (int x = 0; x < W; ++x) {                  // dikey
+        const float fy = (y + 0.5f) * 0.5f - 0.5f; const int iy = (int)floorf(fy); const float t = fy - iy;
+        for (int c = 0; c < 4; ++c) { float a = 0.f; for (int k = -1; k <= 2; ++k) { int yy = iy + k; yy = yy < 0 ? 0 : (yy >= h ? h - 1 : yy); a += CatmullW(t, k) * tmp[((size_t)yy * W + x) * 4 + c]; }
+            out[((size_t)y * W + x) * 4 + c] = (unsigned char)(a < 0.f ? 0.f : (a > 255.f ? 255.f : a)); }
+    }
+    free(tmp);
+    unsigned char* res = (unsigned char*)malloc((size_t)W * H * 4);              // 3x3 unsharp (renk kanallari; alfa aynen)
+    if (!res) { *ow = W; *oh = H; return out; }
+    memcpy(res, out, (size_t)W * H * 4);
+    for (int y = 1; y < H - 1; ++y) for (int x = 1; x < W - 1; ++x) for (int c = 0; c < 3; ++c) {
+        const int i = ((y * W) + x) * 4 + c;
+        const int blur = (4 * out[i] + 2 * (out[i - 4] + out[i + 4] + out[i - W * 4] + out[i + W * 4]) + out[i - 4 - W * 4] + out[i + 4 - W * 4] + out[i - 4 + W * 4] + out[i + 4 + W * 4]) / 16;
+        int v = out[i] + (int)(0.7f * (out[i] - blur)); res[i] = (unsigned char)(v < 0 ? 0 : (v > 255 ? 255 : v));
+    }
+    free(out); *ow = W; *oh = H; return res;
+}
 static bool SkyInitGL() {
     const GLuint vs = SkyCompile(GL_VERTEX_SHADER, kSkyVS), fs = SkyCompile(GL_FRAGMENT_SHADER, kSkyFS);
     if (!vs || !fs) return false;
@@ -3266,18 +3306,49 @@ static bool SkyInitGL() {
     s_uR = glGetUniformLocation(s_skyProg, "uR"); s_uU = glGetUniformLocation(s_skyProg, "uU"); s_uF = glGetUniformLocation(s_skyProg, "uF");
     s_uHz = glGetUniformLocation(s_skyProg, "uHz"); s_uZn = glGetUniformLocation(s_skyProg, "uZn"); s_uSun = glGetUniformLocation(s_skyProg, "uSun");
     s_uTan = glGetUniformLocation(s_skyProg, "uTan"); s_uP = glGetUniformLocation(s_skyProg, "uP"); s_uM = glGetUniformLocation(s_skyProg, "uM"); s_uTex = glGetUniformLocation(s_skyProg, "uTex");
+    s_uNoise = glGetUniformLocation(s_skyProg, "uNoise"); s_uYmin = glGetUniformLocation(s_skyProg, "uYmin");
     static const float quad[8] = {-1.f, -1.f, 1.f, -1.f, -1.f, 1.f, 1.f, 1.f};
     glGenBuffers(1, &s_skyVbo); glBindBuffer(GL_ARRAY_BUFFER, s_skyVbo); glBufferData(GL_ARRAY_BUFFER, sizeof quad, quad, GL_STATIC_DRAW);
     int w = 0, h = 0, ch = 0;
     unsigned char* px = stbi_load_from_memory(mountain_png_data, mountain_png_len, &w, &h, &ch, 4);
     if (px && w > 0 && h > 0) {
+        int w2 = 0, h2 = 0; unsigned char* up = (w <= 1024 && h <= 512) ? UpscaleSharpen2x(px, w, h, &w2, &h2) : nullptr;
+        if (up) { stbi_image_free(px); px = up; w = w2; h = h2; }                // (up malloc ile; asagida free ile birakilir)
+        else up = nullptr;
         glGenTextures(1, &s_skyTex); glBindTexture(GL_TEXTURE_2D, s_skyTex);
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR); glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE); glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
         glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, w, h, 0, GL_RGBA, GL_UNSIGNED_BYTE, px);
-        stbi_image_free(px); LOGI("[WALKER] dag dokusu yuklendi %dx%d", w, h);
+        if (up) free(px); else stbi_image_free(px);
+        LOGI("[WALKER] dag dokusu yuklendi %dx%d%s", w, h, up ? " (2x keskinlestirildi)" : "");
     } else { LOGI("[WALKER] dag dokusu YUKLENEMEDI (dagsiz gokyuzu)"); if (px) stbi_image_free(px); }
+    {   // v12: bulut gurultusu dokusu (256x256, tekrarli, bilineer) -> shader'da 4 doku okumasi (eskiden 16 hash)
+        static unsigned char nz[256 * 256]; uint32_t seed = 0x9E3779B9u;
+        for (int i = 0; i < 256 * 256; ++i) { seed = seed * 1664525u + 1013904223u; nz[i] = (unsigned char)(seed >> 24); }
+        GLint old1 = 0; glActiveTexture(GL_TEXTURE1); glGetIntegerv(GL_TEXTURE_BINDING_2D, &old1);
+        glGenTextures(1, &s_noiseTex); glBindTexture(GL_TEXTURE_2D, s_noiseTex);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR); glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_REPEAT); glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_REPEAT);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_LUMINANCE, 256, 256, 0, GL_LUMINANCE, GL_UNSIGNED_BYTE, nz);
+        glBindTexture(GL_TEXTURE_2D, (GLuint)old1); glActiveTexture(GL_TEXTURE0);
+    }
     return true;
+}
+// v12: gorunen gokyuzu bolgesinin alt siniri (NDC y). Ufuk cizgisinin biraz altina kadar cizilir; daha asagisi arazi. 1'den buyukse hic cizilmez.
+static float SkyElev(const float* R, const float* U, const float* F, float tx, float ty, float x, float y) {
+    const float rx = F[0] + x * tx * R[0] + y * ty * U[0], ry = F[1] + x * tx * R[1] + y * ty * U[1], rz = F[2] + x * tx * R[2] + y * ty * U[2];
+    return ry / sqrtf(rx * rx + ry * ry + rz * rz + 1e-12f);
+}
+static float SkyMinY(const float* R, const float* U, const float* F, float tx, float ty) {
+    const float thr = -0.16f; float best = 2.f;
+    for (int xi = -1; xi <= 1; ++xi) {
+        const float x = (float)xi; float y;
+        if (SkyElev(R, U, F, tx, ty, x, -1.f) >= thr) y = -1.f;
+        else if (SkyElev(R, U, F, tx, ty, x, 1.f) < thr) continue;
+        else { float lo = -1.f, hi = 1.f; for (int it = 0; it < 14; ++it) { const float mid = 0.5f * (lo + hi); if (SkyElev(R, U, F, tx, ty, x, mid) >= thr) hi = mid; else lo = mid; } y = lo; }
+        if (y < best) best = y;
+    }
+    return best < 2.f ? fmaxf(-1.f, best - 0.03f) : 2.f;
 }
 static void DrawSkyGL(uintptr_t game) {
     if (!game) return;
@@ -3320,6 +3391,9 @@ static void DrawSkyGL(uintptr_t game) {
       else if (pj2[5] > 0.3f && pj2[5] < 8.f && pj2[0] > 0.3f && pj2[0] < 8.f) { tanX = 1.f / pj2[0]; tanY = 1.f / pj2[5]; }
       else if (vp[3] > 0) { tanX = tanY * (float)vp[2] / (float)vp[3]; } }
     { static long long s_l = 0; const long long now = NowMs(); if (now - s_l > 10000) { s_l = now; LOGI("[WALKER] gokyuzu GL: saat=%.2f (ham=%.3f) tan=(%.2f,%.2f) vp=%dx%d gunes.y=%.2f gunduz=%.2f", hour, raw, tanX, tanY, vp[2], vp[3], sp.sun[1], sp.day); } }
+    const float yMin = SkyMinY(R, U, F, tanX, tanY);
+    if (yMin >= 1.f) { glBindTexture(GL_TEXTURE_2D, (GLuint)tex0); glActiveTexture((GLenum)atex); return; }   // ufuk ekran disinda (yere bakiliyor): cizilecek gokyuzu yok
+    GLint tex1 = 0; glActiveTexture(GL_TEXTURE1); glGetIntegerv(GL_TEXTURE_BINDING_2D, &tex1); glActiveTexture(GL_TEXTURE0);
     // --- ciz ---
     glDisable(GL_DEPTH_TEST); glDisable(GL_BLEND); glDisable(GL_CULL_FACE); glDisable(GL_SCISSOR_TEST); glDisable(GL_STENCIL_TEST);
     glDepthMask(GL_FALSE); glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
@@ -3329,8 +3403,11 @@ static void DrawSkyGL(uintptr_t game) {
     glUniform2f(s_uTan, tanX, tanY);
     glUniform4f(s_uP, sp.day, sp.night, (float)fmod((double)NowMs() * 0.001, 10000.0), 0.f);
     glUniform4f(s_uM, -0.10f, 0.13f, s_skyTex ? 4.0f : 0.0f, 0.f);
+    glUniform1f(s_uYmin, yMin);
+    glActiveTexture(GL_TEXTURE1); glBindTexture(GL_TEXTURE_2D, s_noiseTex); glUniform1i(s_uNoise, 1);
     glActiveTexture(GL_TEXTURE0); glBindTexture(GL_TEXTURE_2D, s_skyTex); glUniform1i(s_uTex, 0);
     glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+    glActiveTexture(GL_TEXTURE1); glBindTexture(GL_TEXTURE_2D, (GLuint)tex1); glActiveTexture(GL_TEXTURE0);
     // --- durumu geri yaz ---
     glBindBuffer(GL_ARRAY_BUFFER, (GLuint)ab0);
     glVertexAttribPointer(0, sz0, (GLenum)ty0, (GLboolean)nm0, st0, pt0);
@@ -3340,6 +3417,41 @@ static void DrawSkyGL(uintptr_t game) {
     glDepthMask(dmask); glColorMask(cmask[0], cmask[1], cmask[2], cmask[3]);
     if (eDepth) glEnable(GL_DEPTH_TEST); if (eBlend) glEnable(GL_BLEND); if (eCull) glEnable(GL_CULL_FACE); if (eScis) glEnable(GL_SCISSOR_TEST); if (eSten) glEnable(GL_STENCIL_TEST);
     glBlendFuncSeparate((GLenum)bsr, (GLenum)bdr, (GLenum)bsa, (GLenum)bda); glBlendEquationSeparate((GLenum)beR, (GLenum)beA);
+}
+// v12: ISIK YONU. Oyun Environment::render icinde yonlu isigi (cihaz+0x765c, gorunum uzayi, normalize) kendi egrisinden yazar; bu yon benim cizdigim gunesle
+// ilgisizdi (hep ayni taraftan isik). Kare basina bir kez, arac cizimi basladiginda (Environment::render'dan SONRA, kuyruk bosaltilmadan ONCE) yon
+// gunesin yonune cevrilir. Oyunun yazdigi yonun "yukari" bileseninden isaret (isik yonu mu, isiga dogru yon mu) kendiliginden ogrenilir.
+static void ApplySunLight(void* devp) {
+    if (!devp || !g_EngineInstance) return;
+    const long long cm = g_CamMs.load();
+    if (NowMs() - cm > 500) return;
+    static long long s_stamp = 0; if (cm == s_stamp) return; s_stamp = cm;    // kare basina bir kez
+    uint8_t* dev = (uint8_t*)devp;
+    float* dv = (float*)(dev + 0x765c);
+    const float* V = g_CamView;
+    const float R[3] = {V[0], V[4], V[8]}, U[3] = {V[1], V[5], V[9]}, B[3] = {V[2], V[6], V[10]};
+    static float s_sgn = 0.f;
+    const float gx = dv[0], gy = dv[1], gz = dv[2];
+    if (gx == gx && gy == gy && gz == gz && fabsf(gx) < 2.f && fabsf(gy) < 2.f && fabsf(gz) < 2.f) {
+        const float wy = R[1] * gx + U[1] * gy + B[1] * gz;                     // oyunun isik yonunun dunya y bileseni
+        if (fabsf(wy) > 0.2f) {
+            const float ns = wy > 0.f ? 1.f : -1.f;
+            if (ns != s_sgn) { s_sgn = ns; LOGI("[LIGHT] oyun isik yonu dunya=(%.2f,%.2f,%.2f) isaret=%+.0f", R[0] * gx + U[0] * gy + B[0] * gz, wy, R[2] * gx + U[2] * gy + B[2] * gz, (double)ns); }
+        }
+    }
+    if (s_sgn == 0.f) return;                                                  // oyunun yonu anlasilamadi: isige dokunma
+    SkyParams sp; ComputeSky(ReadHour(g_EngineInstance, nullptr), &sp);
+    float hx = sp.sun[0], hz = sp.sun[2]; float el = asinf(fminf(fmaxf(sp.sun[1], -1.f), 1.f));
+    if (el < 0.f) { hx = -hx; hz = -hz; el = -el; }                            // gece: ay tarafindan (yon korunur, oyunun diffuse egrisi zaten karartir)
+    el = fminf(fmaxf(el, 0.35f), 1.0f);                                        // cok dik/cok yatik isik arac yanlarini karartir: 20..57 derece
+    const float hl = sqrtf(hx * hx + hz * hz); if (hl < 1e-4f) return; hx /= hl; hz /= hl;
+    const float ce = cosf(el), se = sinf(el);
+    const float Lx = s_sgn * hx * ce, Ly = s_sgn * se, Lz = s_sgn * hz * ce;   // dunya uzayi
+    float vx = R[0] * Lx + R[1] * Ly + R[2] * Lz, vy = U[0] * Lx + U[1] * Ly + U[2] * Lz, vz = B[0] * Lx + B[1] * Ly + B[2] * Lz;
+    const float vl = sqrtf(vx * vx + vy * vy + vz * vz); if (!(vl > 1e-4f)) return;
+    dv[0] = vx / vl; dv[1] = vy / vl; dv[2] = vz / vl;
+    *(int*)(dev + 0x98) += 1;                                                  // oyunun isik surumu: shader uniform'lari yeniden yuklensin
+    static long long s_ll = 0; const long long nw = NowMs(); if (nw - s_ll > 10000) { s_ll = nw; LOGI("[LIGHT] gunes isigi uygulandi: dunya=(%.2f,%.2f,%.2f) gorunum=(%.2f,%.2f,%.2f) saat=%.2f", Lx, Ly, Lz, dv[0], dv[1], dv[2], ReadHour(g_EngineInstance, nullptr)); }
 }
 // v10: GOT YAMASI. Eski yontem (Substrate ile GLESHandheldRenderDevice::openQueues kancasi) "riskli prologue" nedeniyle atlaniyordu -> gokyuzu/daglar hic cizilmiyordu.
 // Artik libapp.so'nun glClear / glViewport ice aktarim (PLT) girdileri dogrudan degistirilir (fonksiyon govdesine dokunulmaz).
@@ -3543,19 +3655,24 @@ static void OnGameFrame(uintptr_t game) {
         LOGI("[WALKER] kare+%d gap=%lld ms pos=(%.2f,%.2f) aci=%.3f vel=(%.2f,%.2f) sonlu=%d aktif=%u sayi=%u", 20 - g_PostSpawnFrames, gap, x, y, a, vx, vy,
              (int)(x == x && y == y && a == a && vx == vx && vy == vy), *(uint32_t*)(game + G_ACTIVE), VehicleCount(game));
     }
-    {   // v10: baska oyuncunun yayasini "izleme" (arac degistirme dugmesiyle ona gecme) engellenir: aktif arac uzak yaya ise son iyi araca don
-        static uintptr_t s_good = 0; static long long s_logMs = 0;
+    {   // v12: arac degistirme dugmesi baska oyuncunun yayasina denk gelirse o yaya ATLANIR ve ayni yonde siradaki gercek araca gecilir
+        //      (eskiden onceki araca geri aliniyordu -> herkes yayadayken dugme "takiliyor" gibiydi). Oyunun sirasi: +1 / -1 (dairesel) [D: updateGameLogic bit 0x10/0x20].
+        static uintptr_t s_prevAct = 0; static long long s_logMs = 0;
         const uintptr_t act = LocalActiveVehiclePtr(game);
         if (act && IsWalker(act) && act != g_LocalWalker) {
+            const int cnt = (int)VehicleCount(game), ai = SlotIndexOfVehicle(game, act), pi = s_prevAct ? SlotIndexOfVehicle(game, s_prevAct) : -1;
+            int dir = 1; if (pi >= 0 && cnt > 1 && ((pi - 1 + cnt) % cnt) == ai && ((pi + 1) % cnt) != ai) dir = -1;
             uintptr_t tgt = 0;
-            if (s_good && s_good != act && SlotIndexOfVehicle(game, s_good) >= 0 && (!IsWalker(s_good) || s_good == g_LocalWalker)) tgt = s_good;
-            if (!tgt && g_LocalWalker && SlotIndexOfVehicle(game, g_LocalWalker) >= 0) tgt = g_LocalWalker;
-            for (uint32_t i = 0; !tgt && i < VehicleCount(game); ++i) { const uintptr_t v = RawVehicleSlot(game, i); if (v && !IsWalker(v)) tgt = v; }
-            if (tgt) {
-                SetActiveByPtr(game, tgt);
-                if (NowMs() - s_logMs > 3000) { s_logMs = NowMs(); LOGI("[WALKER] baska oyuncunun yayasi izlenemez: aktif arac geri alindi"); }
+            for (int k = 1; ai >= 0 && cnt > 1 && k <= cnt; ++k) {
+                const int j = ((ai + dir * k) % cnt + cnt) % cnt; const uintptr_t v = RawVehicleSlot(game, (uint32_t)j);
+                if (v && (!IsWalker(v) || v == g_LocalWalker)) { tgt = v; break; }
             }
-        } else if (act) s_good = act;
+            if (!tgt && s_prevAct && SlotIndexOfVehicle(game, s_prevAct) >= 0) tgt = s_prevAct;
+            if (tgt) {
+                SetActiveByPtr(game, tgt); s_prevAct = tgt;
+                if (NowMs() - s_logMs > 3000) { s_logMs = NowMs(); LOGI("[WALKER] baska oyuncunun yayasi atlandi: yon=%+d hedef idx=%d", dir, SlotIndexOfVehicle(game, tgt)); }
+            }
+        } else if (act) s_prevAct = act;
     }
     if (WK_AUTORECOVER && g_LocalWalker && gap > WK_SLOW_FRAME_MS) {          // yaya varken bir kare cok uzun surdu
         LOGI("[WALKER] YAVAS KARE: %lld ms (esik %d) -> yaya kaldiriliyor, bu oturumda kapali", gap, (int)WK_SLOW_FRAME_MS);
@@ -3635,6 +3752,12 @@ static void DrawFootUI(uintptr_t game, const ImVec2& screen) {
     g_BtnCX = bx; g_BtnCY = by; g_BtnR = br; g_BtnMode = 2;
     DrawRoundBtn(dl, bx, by, br, "ENTER", 0, false);
     DrawRoundBtn(dl, bx, by - br * 2.25f, br * 0.86f, g_Run ? "RUN ON" : "RUN", 1, g_Run);
+}
+// v12: coklu oyuncu odasi/menusu acikken DrawImGui cagrilmaz -> varliklar yuklenmez -> "yaya olarak devam" bekleyip zaman asimina dusuyordu. GL thread'inden her karede cagrilir.
+static void AssetsTick(uintptr_t game) {
+    if (!game || g_AssetsReady) return;
+    if (*(volatile uint32_t*)(game + G_STATE) != 6) return;
+    EnsureAssets(game);
 }
 // GL thread'i (ImGui kare fonksiyonundan). Etiketler Ingilizce: oyunun yazi tipi Turkce karakter icermeyebilir.
 static void DrawImGui(uintptr_t game, const ImVec2& screen) {
@@ -10020,6 +10143,7 @@ void DrawImGui() {
     // Diger oyuncularin araclari uzerinde isim etiketleri (kendi aracin haric)
     if (g_OnlineMode && !g_IsMultiplayerMenuActive) DrawPlayerNameTags(screen);
     TickRender();                                                              // TANI: cizim thread'i canli mi (watchdog)
+    WK::AssetsTick(g_EngineInstance);                                          // v12: oda menusu acikken de varliklar yuklensin (yaya devam kaydi icin)
     if (!g_IsMultiplayerMenuActive) WK::DrawImGui(g_EngineInstance, screen);   // WALKER: Exit/Enter Vehicle dugmeleri (+ varlik yukleme: GL thread)
     LL::Draw(screen);                                                          // CANLI LOG paneli (libmultiplayermod + libapp)
 
@@ -10958,7 +11082,7 @@ void* my_renderStartMenuMain(void* thiz, void* p1, void* p2, void* p3) {
 // ========================================================================
 __attribute__((constructor))
 void ModMain() {
-    LOGI(">>> MULTIPLAYER MOD STARTING <<< build=shopfix-45+walker-v11b");
+    LOGI(">>> MULTIPLAYER MOD STARTING <<< build=shopfix-46+walker-v12");
 
     ResetVehicleSyncState();
     std::thread(StartPONGResponderThread).detach();
