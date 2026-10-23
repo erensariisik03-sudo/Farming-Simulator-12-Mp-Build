@@ -3164,8 +3164,8 @@ static uint32_t my_GameSerialize(void* thiz, void* slot, unsigned char* buf, con
     ++g_SerCalls;
     const uintptr_t game = g_EngineInstance; const uintptr_t delta = (uintptr_t)thiz - game;
     if (!game || delta >= GAME_OBJ_SIZE || g_CaptureNext.load()) return orig(thiz, slot, buf, junk);
-    uint8_t* sh = nullptr;
-    if (posix_memalign((void**)&sh, 16, GAME_OBJ_SIZE) != 0 || !sh) return orig(thiz, slot, buf, junk);
+    uint8_t* sh = (uint8_t*)malloc(GAME_OBJ_SIZE);                                 // (eski NDK'de posix_memalign yok; malloc 8 bayt hizali, yeterli)
+    if (!sh) return orig(thiz, slot, buf, junk);
     memcpy(sh, (const void*)game, GAME_OBJ_SIZE);
     const uint32_t c0 = *(uint32_t*)(sh + 0xA4), a0 = *(uint32_t*)(sh + G_ACTIVE);
     const int hidden = HideWalkersInShadow(sh);
