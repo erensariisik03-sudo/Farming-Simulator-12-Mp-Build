@@ -144,10 +144,11 @@ static bool SendAllBytes(int socketFd, const void* data, size_t size);
 namespace SL {
 static FILE* g_File = nullptr;
 static int g_Fd = -1;
-static std::mutex g_Mu;
-static std::string g_Dir;
+// NOT: ModMain() kutuphane yuklenirken (init_array) calisir, bu dosyanin statik nesneleri (std::string/vector/mutex) HENUZ kurulmamistir -> sadece duz (POD) degiskenler.
+static pthread_mutex_t g_Mu = PTHREAD_MUTEX_INITIALIZER;
+static char g_DirBuf[512];
 static std::atomic<bool> g_Ready(false);
-static std::vector<std::string> g_Pre;                  // Open() oncesi satirlar
+static char g_PreBuf[96 * 1024]; static size_t g_PreLen = 0;   // Open() oncesi satirlar
 static std::atomic<long long> g_Bytes(0);
 static struct sigaction g_OldSa[8];
 static const int kSigs[5] = { SIGSEGV, SIGABRT, SIGBUS, SIGFPE, SIGILL };
@@ -190,10 +191,12 @@ static void Write(const char* msg) {
     const int n = snprintf(line, sizeof line, "%02d:%02d:%02d.%03d [%d] %s\n", lt.tm_hour, lt.tm_min, lt.tm_sec, (int)(ts.tv_nsec / 1000000), (int)syscall(__NR_gettid), msg);
     if (n <= 0) return;
     const size_t len = (size_t)(n < (int)sizeof line ? n : (int)sizeof line - 1);
-    std::lock_guard<std::mutex> lk(g_Mu);
-    if (g_Bytes.load() > 60LL * 1024 * 1024) return;       // en fazla ~60 MB
-    if (!g_Ready.load()) { if (g_Pre.size() < 400) g_Pre.push_back(std::string(line, len)); return; }
-    RawWrite(line, len);
+    pthread_mutex_lock(&g_Mu);
+    if (g_Bytes.load() <= 60LL * 1024 * 1024) {            // en fazla ~60 MB
+        if (!g_Ready.load()) { if (g_PreLen + len < sizeof g_PreBuf) { memcpy(g_PreBuf + g_PreLen, line, len); g_PreLen += len; } }
+        else RawWrite(line, len);
+    }
+    pthread_mutex_unlock(&g_Mu);
 }
 static void CrashHandler(int sig, siginfo_t* si, void* uc) {
     char buf[256];
@@ -233,29 +236,27 @@ static void Open(const char* buildTag) {
         if (!MkdirP(dir)) continue;
         FILE* f = fopen((dir + "/mod.log").c_str(), "ab");
         if (!f) continue;
-        g_File = f; g_Fd = fileno(f); g_Dir = dir;
+        g_File = f; g_Fd = fileno(f); snprintf(g_DirBuf, sizeof g_DirBuf, "%s", dir.c_str());
     }
     if (!g_File) return;
     {   // info.txt
         char model[PROP_VALUE_MAX] = {0}, rel[PROP_VALUE_MAX] = {0}, brand[PROP_VALUE_MAX] = {0}, abi[PROP_VALUE_MAX] = {0};
         __system_property_get("ro.product.model", model); __system_property_get("ro.build.version.release", rel);
         __system_property_get("ro.product.brand", brand); __system_property_get("ro.product.cpu.abi", abi);
-        FILE* inf = fopen((g_Dir + "/info.txt").c_str(), "wb");
+        FILE* inf = fopen((std::string(g_DirBuf) + "/info.txt").c_str(), "wb");
         if (inf) { fprintf(inf, "build=%s\npaket=%s\ncihaz=%s %s\nandroid=%s\nabi=%s\npid=%d\nbaslangic=%s", buildTag, pkg.c_str(), brand, model, rel, abi, (int)getpid(), ctime(&t)); fclose(inf); }
     }
     {
-        std::lock_guard<std::mutex> lk(g_Mu);
-        char hdr[256]; const int n = snprintf(hdr, sizeof hdr, "=== OTURUM LOGU === build=%s klasor=%s\n", buildTag, g_Dir.c_str());
+        pthread_mutex_lock(&g_Mu);
+        char hdr[700]; const int n = snprintf(hdr, sizeof hdr, "=== OTURUM LOGU === build=%s klasor=%s\n", buildTag, g_DirBuf);
         RawWrite(hdr, (size_t)n);
-        for (size_t i = 0; i < g_Pre.size(); ++i) RawWrite(g_Pre[i].data(), g_Pre[i].size());
-        g_Pre.clear();
+        if (g_PreLen) RawWrite(g_PreBuf, g_PreLen);
+        g_PreLen = 0;
         g_Ready.store(true);
+        pthread_mutex_unlock(&g_Mu);
     }
-    for (int i = 0; i < 5; ++i) {
-        struct sigaction sa; memset(&sa, 0, sizeof sa); sa.sa_sigaction = CrashHandler; sa.sa_flags = SA_SIGINFO; sigemptyset(&sa.sa_mask);
-        sigaction(kSigs[i], &sa, &g_OldSa[i]);
-    }
-    std::thread(LogcatThread, g_Dir + "/logcat.txt").detach();
+    // v13b: sinyal (cokme) isleyicisi KURULMAZ: ART/oyunun kendi SIGSEGV isleyicileriyle cakisabilir. Cokme icin adb logcat kullanin.
+    std::thread(LogcatThread, std::string(g_DirBuf) + "/logcat.txt").detach();
 }
 } // namespace SL
 static void LogF(const char* fmt, ...) __attribute__((format(printf, 1, 2)));
@@ -3176,11 +3177,15 @@ static uint32_t my_GameSerialize(void* thiz, void* slot, unsigned char* buf, con
 }
 static void InstallSerializeWrap(uintptr_t game) {                                 // oyun thread'i: sanal tablo yuvasi bulunana kadar her karede dener (en fazla 900 kare)
     if (g_SerWrapDone || !game) return;
-    if (++g_SerWrapTries > 900) { g_SerWrapDone = true; LOGI("[SAVE] serialize sarmalayici KURULAMADI (geri cagri nesnesi bulunamadi)"); return; }
+    if (*(volatile uint32_t*)(game + G_STATE) != 6) return;                               // sadece oyun icindeyken say/dene
+    if (++g_SerWrapTries > 1800) { g_SerWrapDone = true; LOGI("[SAVE] serialize sarmalayici KURULAMADI (geri cagri nesnesi bulunamadi)"); return; }
+    if (g_SerWrapTries < 150) return;      // v13b: oyun tam yuklenmeden dokunma (ilk karelerde SaveGames hazir degil)
     void* cb = *(void**)(game + 0xa374 + 0x60); if (!cb) return;
-    void** vt = *(void***)cb; if (!vt) return;
-    void* fn = vt[2]; if (!fn) return;
     const uintptr_t delta = (uintptr_t)cb - game;
+    if (delta >= GAME_OBJ_SIZE) { g_SerWrapDone = true; LOGI("[SAVE] serialize sarmalayici KURULMADI: cb=%p oyun nesnesi disinda (game=%p)", cb, (void*)game); return; }   // okunabilir oldugu bilinen bellek disina inme
+    void** vt = *(void***)cb; if (!vt) return;
+    { Dl_info dv; memset(&dv, 0, sizeof dv); if (!dladdr((void*)vt, &dv) || !dv.dli_fname || !strstr(dv.dli_fname, "libapp")) { g_SerWrapDone = true; LOGI("[SAVE] serialize sarmalayici KURULMADI: vtable=%p libapp icinde degil", (void*)vt); return; } }
+    void* fn = vt[2]; if (!fn) return;
     Dl_info di; memset(&di, 0, sizeof di);
     const bool inApp = dladdr(fn, &di) && di.dli_fname && strstr(di.dli_fname, "libapp") != nullptr;
     LOGI("[SAVE] serialize yuvasi: cb=%p game=%p fark=0x%lx vtable=%p fn=%p (%s) libapp=%d", cb, (void*)game, (unsigned long)delta, (void*)vt, fn, di.dli_fname ? di.dli_fname : "?", (int)inApp);
@@ -3191,7 +3196,7 @@ static void InstallSerializeWrap(uintptr_t game) {                              
     const uintptr_t a = (uintptr_t)&vt[2], pg = a & ~(uintptr_t)4095, len = (((a + sizeof(void*) - 1) & ~(uintptr_t)4095) != pg) ? 8192 : 4096;
     if (mprotect((void*)pg, len, PROT_READ | PROT_WRITE) != 0) { LOGI("[SAVE] serialize sarmalayici: mprotect basarisiz errno=%d", errno); g_OrigSerialize = nullptr; return; }
     vt[2] = (void*)my_GameSerialize;
-    mprotect((void*)pg, len, PROT_READ);
+    // NOT: sayfa eski korumasina GERI ALINMAZ (ayni sayfada yazilabilir .data olabilir -> PROT_READ yapmak oyunu aninda cokertirdi). RW kalmasi zararsiz.
     LOGI("[SAVE] serialize sarmalayici KURULDU (yaya = kayda girmez)");
 }
 // ------------------------------- [W19] v10: OYUNA YAYA OLARAK DEVAM -------------------------------
