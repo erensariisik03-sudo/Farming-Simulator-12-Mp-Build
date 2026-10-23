@@ -26,7 +26,7 @@
 //       [W02] OFFSETLER
 //       [W03] MATEMATIK (4x4 kolon-major)
 //       [W04] DURUM
-//       [W05] CANLI LOG PANELI (libmultiplayermod.so + libapp.so)
+//       [S0L] OTURUM LOGU: her acilista ayri klasor (mod.log + logcat.txt + info.txt), ekranda LOG dugmesi YOK
 //       [W06] TANI: TAKILMA IZLEYICISI
 //       [W07] SEMBOL TIPLERI
 //       [W08] YARDIMCILAR
@@ -114,6 +114,13 @@
 #include <math.h>
 #include <algorithm>
 #include <utility>
+#include <stdarg.h>
+#include <dirent.h>
+#include <time.h>
+#include <signal.h>
+#include <ucontext.h>
+#include <sys/syscall.h>
+#include <sys/system_properties.h>
 
 static bool SendAllBytes(int socketFd, const void* data, size_t size);
 
@@ -128,7 +135,137 @@ static bool SendAllBytes(int socketFd, const void* data, size_t size);
 #include "stb_image.h"
 
 #define LOG_TAG "MultiplayerMod"
-#define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
+
+// ========================================================================
+// [S0L] OTURUM LOGU (SL): her oyun acilisinda ayri klasor -> mod.log (tum LOGI satirlari) + logcat.txt (surecin TUM logcat ciktisi) + info.txt
+//   Konum: /storage/emulated/0/Android/data/<paket>/files/MPLogs/<tarih_saat_pPID>/   (olmazsa /data/data/<paket>/files/MPLogs/...)
+//   Son 12 oturum tutulur. Cokme (SIGSEGV/SIGABRT/SIGBUS/SIGFPE/SIGILL) dosyaya "[CRASH]" satiri olarak yazilir. Her satir hemen diske yazilir.
+// ========================================================================
+namespace SL {
+static FILE* g_File = nullptr;
+static int g_Fd = -1;
+static std::mutex g_Mu;
+static std::string g_Dir;
+static std::atomic<bool> g_Ready(false);
+static std::vector<std::string> g_Pre;                  // Open() oncesi satirlar
+static std::atomic<long long> g_Bytes(0);
+static struct sigaction g_OldSa[8];
+static const int kSigs[5] = { SIGSEGV, SIGABRT, SIGBUS, SIGFPE, SIGILL };
+static std::string PkgName() {
+    char pkg[128] = {0};
+    FILE* f = fopen("/proc/self/cmdline", "r");
+    if (f) { if (!fgets(pkg, sizeof(pkg) - 1, f)) pkg[0] = 0; fclose(f); }
+    if (pkg[0] == 0 || strchr(pkg, '/')) return std::string();
+    return std::string(pkg);
+}
+static bool MkdirP(const std::string& path) {
+    std::string cur;
+    for (size_t i = 0; i <= path.size(); ++i) {
+        if (i == path.size() || path[i] == '/') { if (!cur.empty()) mkdir(cur.c_str(), 0777); }
+        if (i < path.size()) cur += path[i];
+    }
+    struct stat st; return stat(path.c_str(), &st) == 0 && S_ISDIR(st.st_mode);
+}
+static void PruneOld(const std::string& root, size_t keep) {
+    DIR* d = opendir(root.c_str()); if (!d) return;
+    std::vector<std::string> names; struct dirent* e;
+    while ((e = readdir(d)) != nullptr) { if (e->d_name[0] >= '0' && e->d_name[0] <= '9') names.push_back(e->d_name); }
+    closedir(d);
+    std::sort(names.begin(), names.end());
+    for (size_t i = 0; names.size() > keep && i < names.size() - keep; ++i) {
+        const std::string dir = root + "/" + names[i];
+        DIR* sd = opendir(dir.c_str());
+        if (sd) { struct dirent* f; while ((f = readdir(sd)) != nullptr) { if (f->d_name[0] == '.') continue; remove((dir + "/" + f->d_name).c_str()); } closedir(sd); }
+        rmdir(dir.c_str());
+    }
+}
+static void RawWrite(const char* line, size_t n) {         // g_Mu altinda
+    if (g_File) { fwrite(line, 1, n, g_File); fflush(g_File); }
+    g_Bytes += (long long)n;
+}
+static void Write(const char* msg) {
+    struct timespec ts; clock_gettime(CLOCK_REALTIME, &ts);
+    struct tm lt; time_t sec = ts.tv_sec; localtime_r(&sec, &lt);
+    char line[1400];
+    const int n = snprintf(line, sizeof line, "%02d:%02d:%02d.%03d [%d] %s\n", lt.tm_hour, lt.tm_min, lt.tm_sec, (int)(ts.tv_nsec / 1000000), (int)syscall(__NR_gettid), msg);
+    if (n <= 0) return;
+    const size_t len = (size_t)(n < (int)sizeof line ? n : (int)sizeof line - 1);
+    std::lock_guard<std::mutex> lk(g_Mu);
+    if (g_Bytes.load() > 60LL * 1024 * 1024) return;       // en fazla ~60 MB
+    if (!g_Ready.load()) { if (g_Pre.size() < 400) g_Pre.push_back(std::string(line, len)); return; }
+    RawWrite(line, len);
+}
+static void CrashHandler(int sig, siginfo_t* si, void* uc) {
+    char buf[256];
+    uintptr_t pc = 0;
+#if defined(__arm__)
+    if (uc) pc = (uintptr_t)((ucontext_t*)uc)->uc_mcontext.arm_pc;
+#endif
+    const int n = snprintf(buf, sizeof buf, "\n[CRASH] sinyal=%d adres=%p pc=%p tid=%d\n", sig, si ? si->si_addr : nullptr, (void*)pc, (int)syscall(__NR_gettid));
+    if (g_Fd >= 0 && n > 0) { ssize_t w = write(g_Fd, buf, (size_t)n); (void)w; fsync(g_Fd); }
+    for (int i = 0; i < 5; ++i) if (kSigs[i] == sig) { sigaction(sig, &g_OldSa[i], nullptr); break; }   // eski isleyiciye (debuggerd) birak
+    if (sig == SIGABRT) raise(sig);
+}
+static void LogcatThread(std::string path) {
+    char cmd[160]; snprintf(cmd, sizeof cmd, "logcat -v threadtime --pid=%d 2>&1", (int)getpid());
+    FILE* out = fopen(path.c_str(), "ab"); if (!out) return;
+    long long total = 0;
+    for (int attempt = 0; attempt < 30 && total < 80LL * 1024 * 1024; ++attempt) {
+        FILE* pf = popen(cmd, "r");
+        if (!pf) { sleep(3); continue; }
+        char buf[1100]; long long n = 0; int c = 0;
+        while (fgets(buf, sizeof buf, pf)) { const size_t l = strlen(buf); fwrite(buf, 1, l, out); n += (long long)l; total += (long long)l; if ((++c & 7) == 0) fflush(out); if (total > 80LL * 1024 * 1024) break; }
+        fflush(out); pclose(pf);
+        sleep(n == 0 ? 5 : 1);
+    }
+    fclose(out);
+}
+static void Open(const char* buildTag) {
+    if (g_Ready.load()) return;
+    const std::string pkg = PkgName(); if (pkg.empty()) return;
+    const std::string roots[3] = { "/storage/emulated/0/Android/data/" + pkg + "/files/MPLogs", "/sdcard/Android/data/" + pkg + "/files/MPLogs", "/data/data/" + pkg + "/files/MPLogs" };
+    time_t t = time(nullptr); struct tm lt; localtime_r(&t, &lt);
+    char name[64]; snprintf(name, sizeof name, "%04d%02d%02d_%02d%02d%02d_p%d", lt.tm_year + 1900, lt.tm_mon + 1, lt.tm_mday, lt.tm_hour, lt.tm_min, lt.tm_sec, (int)getpid());
+    for (int r = 0; r < 3 && !g_File; ++r) {
+        if (!MkdirP(roots[r])) continue;
+        PruneOld(roots[r], 12);
+        const std::string dir = roots[r] + "/" + name;
+        if (!MkdirP(dir)) continue;
+        FILE* f = fopen((dir + "/mod.log").c_str(), "ab");
+        if (!f) continue;
+        g_File = f; g_Fd = fileno(f); g_Dir = dir;
+    }
+    if (!g_File) return;
+    {   // info.txt
+        char model[PROP_VALUE_MAX] = {0}, rel[PROP_VALUE_MAX] = {0}, brand[PROP_VALUE_MAX] = {0}, abi[PROP_VALUE_MAX] = {0};
+        __system_property_get("ro.product.model", model); __system_property_get("ro.build.version.release", rel);
+        __system_property_get("ro.product.brand", brand); __system_property_get("ro.product.cpu.abi", abi);
+        FILE* inf = fopen((g_Dir + "/info.txt").c_str(), "wb");
+        if (inf) { fprintf(inf, "build=%s\npaket=%s\ncihaz=%s %s\nandroid=%s\nabi=%s\npid=%d\nbaslangic=%s", buildTag, pkg.c_str(), brand, model, rel, abi, (int)getpid(), ctime(&t)); fclose(inf); }
+    }
+    {
+        std::lock_guard<std::mutex> lk(g_Mu);
+        char hdr[256]; const int n = snprintf(hdr, sizeof hdr, "=== OTURUM LOGU === build=%s klasor=%s\n", buildTag, g_Dir.c_str());
+        RawWrite(hdr, (size_t)n);
+        for (size_t i = 0; i < g_Pre.size(); ++i) RawWrite(g_Pre[i].data(), g_Pre[i].size());
+        g_Pre.clear();
+        g_Ready.store(true);
+    }
+    for (int i = 0; i < 5; ++i) {
+        struct sigaction sa; memset(&sa, 0, sizeof sa); sa.sa_sigaction = CrashHandler; sa.sa_flags = SA_SIGINFO; sigemptyset(&sa.sa_mask);
+        sigaction(kSigs[i], &sa, &g_OldSa[i]);
+    }
+    std::thread(LogcatThread, g_Dir + "/logcat.txt").detach();
+}
+} // namespace SL
+static void LogF(const char* fmt, ...) __attribute__((format(printf, 1, 2)));
+static void LogF(const char* fmt, ...) {
+    char buf[1024];
+    va_list ap; va_start(ap, fmt); vsnprintf(buf, sizeof buf, fmt, ap); va_end(ap);
+    __android_log_write(ANDROID_LOG_INFO, LOG_TAG, buf);
+    SL::Write(buf);
+}
+#define LOGI(...) LogF(__VA_ARGS__)
 
 #define DISCOVERY_PORT 8888
 #define TCP_SYNC_PORT 8889
@@ -2260,12 +2397,8 @@ static const float    HITBOX_HX = 0.32f, HITBOX_HY = 0.32f;  // insan kutusu (YA
 #ifndef WK_MAX_DT_S
 #define WK_MAX_DT_S 0.25f      // Game::update dt kelepcesi (sn). 0 = kapali. Oyun dt'yi sinirlamiyor: tek takilma kalici uzun kareye doner.
 #endif
-#ifndef WK_AUTORECOVER
-#define WK_AUTORECOVER 1       // yaya varken kare > WK_SLOW_FRAME_MS ise yayayi otomatik kaldir, bu oturumda kapat
-#endif
-#ifndef WK_SLOW_FRAME_MS
-#define WK_SLOW_FRAME_MS 4000
-#endif
+// v13: "yavas kare -> yayayi kaldir / oturumda kapat" mekanizmasi TAMAMEN SILINDI. Kok neden: kare araligi (gap) uygulama arka plandayken,
+//      kayit/menu/ilk yukleme sirasinda da uzuyordu -> yaya haksiz yere iptal oluyordu. Gercek takilmalar artik sadece log dosyasina yazilir.
 #ifndef WK_PROFILER
 #define WK_PROFILER 1          // oyun thread'i takilinca PC/LR ornekleyici ("[PROF]"), sadece ARM Android
 #endif
@@ -2342,7 +2475,6 @@ static bool  g_ReqExit = false, g_ReqEnter = false;
 static bool  g_AssetsReady = false; static long long g_AssetsRetryMs = 0;
 static std::atomic<long long> g_LastFrameMs(0);   // OnGameFrame'in son calisma zamani (ornekleyici de okur)
 static std::atomic<int>       g_GameTid(0);       // oyun thread'inin tid'i
-static bool g_Disabled = false;                    // otomatik kurtarma sonrasi: bu oturumda yaya kapali
 static int  g_PostSpawnFrames = 0;                 // dogustan sonra ayrintili kare logu sayaci
 static float g_FpCam[16]; static volatile uint32_t g_FpStamp = 0;   // v7: son yazilan birinci sahis kamera matrisi (kesme duzeltmesi icin)
 static void AddLook(float dYaw, float dPitch);                     // asagida tanimli
@@ -2369,87 +2501,6 @@ static void SoundTick(uintptr_t game);                             // asagida: y
 static void SkyTick(uintptr_t game);                               // asagida: yayadayken gun saatine gore gokyuzu rengi
 static uint32_t* g_Mesh[P_COUNT];              // oyunun IndexedTriangleMesh nesnesi: P[0]=vertexBuf, P[1]=indexBuf [D: enqueueRender]
 static uint32_t  g_TexObj[4] = {0, 0, 0, 0};   // Texture nesnesi = 4 bayt (GL handle) [D: EntityManager'da Texture dizisi 4'er bayt]
-
-// ------------------------------- [W05] CANLI LOG PANELI (libmultiplayermod.so + libapp.so) -------------------------------
-// Ayni surecin logcat ciktisini (--pid) okuyup ekranda gosterir. Sol altta "LOG" dugmesi; filtre dugmesi: Hepsi / Mod / libapp.
-// Not: logcat kullanilamazsa panelde hata satiri gorunur (cihaz/ROM kisiti) -> adb ile alinan log gecerlidir.
-namespace LL {
-static std::mutex g_Mu;
-static std::vector<std::string> g_Lines;
-static bool g_Started = false, g_Open = false;
-static int g_Filter = 0;                      // 0 = hepsi, 1 = mod (MultiplayerMod/WALKER), 2 = libapp (NativeLog/FMOD/threaded_app)
-static const size_t kMax = 200;
-static void Push(const char* s) {
-    std::lock_guard<std::mutex> lk(g_Mu);
-    g_Lines.push_back(s);
-    if (g_Lines.size() > kMax) g_Lines.erase(g_Lines.begin(), g_Lines.begin() + (g_Lines.size() - kMax));
-}
-static void Reader() {
-    char cmd[128];
-    snprintf(cmd, sizeof cmd, "logcat -v brief --pid=%d 2>&1", (int)getpid());
-    for (int attempt = 0; attempt < 2; ++attempt) {
-        FILE* f = popen(cmd, "r");
-        if (!f) { Push("E/LL: logcat acilamadi (popen)"); return; }
-        char buf[512]; int n = 0;
-        while (fgets(buf, sizeof buf, f)) {
-            size_t l = strlen(buf); while (l && (buf[l - 1] == '\n' || buf[l - 1] == '\r')) buf[--l] = 0;
-            if (!l) continue;
-            ++n; Push(buf);
-        }
-        pclose(f);
-        if (n == 0) Push("W/LL: logcat bos dondu, 3 sn sonra yeniden denenecek");
-        else Push("W/LL: logcat akisi kapandi, yeniden baglaniliyor");
-        sleep(3);
-    }
-}
-static void Start() {
-    if (g_Started) return; g_Started = true;
-    std::thread(Reader).detach();
-}
-static bool Match(const std::string& s) {
-    if (g_Filter == 0) return true;
-    if (g_Filter == 1) return s.find("MultiplayerMod") != std::string::npos || s.find("WALKER") != std::string::npos;
-    return s.find("NativeLog") != std::string::npos || s.find("FMOD") != std::string::npos || s.find("threaded_app") != std::string::npos
-        || s.find("libapp") != std::string::npos;
-}
-static void Draw(const ImVec2& screen) {
-    ImGui::SetNextWindowPos(ImVec2(screen.x * 0.01f, screen.y * 0.99f), ImGuiCond_Always, ImVec2(0.0f, 1.0f));
-    ImGui::Begin("##llbtn", nullptr, ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoScrollbar |
-                 ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoFocusOnAppearing | ImGuiWindowFlags_NoBackground);
-    if (ImGui::Button(g_Open ? "LOG x" : "LOG", ImVec2(screen.x * 0.07f, screen.y * 0.06f))) g_Open = !g_Open;
-    ImGui::End();
-    if (!g_Open) return;
-    ImGui::SetNextWindowPos(ImVec2(screen.x * 0.01f, screen.y * 0.02f), ImGuiCond_Always);
-    ImGui::SetNextWindowSize(ImVec2(screen.x * 0.62f, screen.y * 0.78f), ImGuiCond_Always);
-    ImGui::SetNextWindowBgAlpha(0.65f);
-    ImGui::Begin("##llwin", nullptr, ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoCollapse |
-                 ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoFocusOnAppearing);
-    static const char* kNames[3] = { "Filtre: Hepsi", "Filtre: Mod (MultiplayerMod/WALKER)", "Filtre: libapp" };
-    if (ImGui::Button(kNames[g_Filter])) g_Filter = (g_Filter + 1) % 3;
-    ImGui::SameLine();
-    if (ImGui::Button("Temizle")) { std::lock_guard<std::mutex> lk(g_Mu); g_Lines.clear(); }
-    ImGui::Separator();
-    ImGui::BeginChild("##llscroll", ImVec2(0, 0), false);
-    ImGui::PushTextWrapPos(0.0f);
-    {
-        std::lock_guard<std::mutex> lk(g_Mu);
-        for (size_t i = 0; i < g_Lines.size(); ++i) {
-            const std::string& s = g_Lines[i];
-            if (!Match(s)) continue;
-            ImVec4 col(0.85f, 0.85f, 0.85f, 1.0f);
-            if (s.find("WATCHDOG") != std::string::npos || (s.size() > 1 && s[0] == 'E' && s[1] == '/')) col = ImVec4(1.0f, 0.35f, 0.35f, 1.0f);
-            else if (s.find("WALKER") != std::string::npos) col = ImVec4(0.4f, 0.9f, 1.0f, 1.0f);
-            else if (s.size() > 1 && s[0] == 'W' && s[1] == '/') col = ImVec4(1.0f, 0.85f, 0.3f, 1.0f);
-            else if (s.find("MultiplayerMod") != std::string::npos) col = ImVec4(0.6f, 1.0f, 0.6f, 1.0f);
-            ImGui::TextColored(col, "%s", s.c_str());
-        }
-    }
-    ImGui::PopTextWrapPos();
-    if (ImGui::GetScrollY() >= ImGui::GetScrollMaxY() - 4.0f) ImGui::SetScrollHereY(1.0f);   // sondaysa otomatik kay
-    ImGui::EndChild();
-    ImGui::End();
-}
-} // namespace LL
 
 // ------------------------------- [W06] TANI: TAKILMA IZLEYICISI -------------------------------
 // Oyun ya da cizim thread'i 2 sn'den uzun takilirsa logcat'e "son asama" yazar: donmanin NEREDE oldugunu gosterir.
@@ -2600,7 +2651,7 @@ static void DoExit(uintptr_t game) {
     StageG("DoExit:basla");
     const uintptr_t cur = LocalActiveVehiclePtr(game);
     LOGI("[WALKER] DoExit: cur=%p walker=%d localWalker=%p count=%u", (void*)cur, (int)(cur && IsWalker(cur)), (void*)g_LocalWalker, VehicleCount(game));
-    if (g_Disabled || !cur || IsWalker(cur) || g_LocalWalker || VehicleCount(game) >= 30) return;
+    if (!cur || IsWalker(cur) || g_LocalWalker || VehicleCount(game) >= 30) return;
     float x, y, a; if (!BodyPose(cur, &x, &y, &a)) return;
     LOGI("[WALKER] DoExit: arac pozu x=%.2f y=%.2f a=%.3f", x, y, a);
     // v7: ARACIN YANINA in (on/arka degil). Yon, govde matrisinin ileri ekseninden (M[8],M[10]) bulunur -> aci sozlesmesinden bagimsiz.
@@ -2926,9 +2977,9 @@ static void DrawWalker(uintptr_t self, void* dev) {
     for (int i = 0; i < P_COUNT; ++i) if (g_Mesh[i] && !(hideHead && i == P_HEAD)) fnDraw(dev, mats[i].m, g_Mesh[i][0], g_Mesh[i][1]);
     StageR("DrawWalker:bitti");
 }
-static void ApplySunLight(void* dev);                                       // [W21] gunes yonune gore isik (yayadayken)
+static void CaptureGameLight(void* dev);                                    // [W21] v13: oyunun kendi isik yonunu OKU (degistirmez)
 static void my_VehRender(void* self, void* ra, void* dev, uint32_t p3) {
-    if (g_SkyWanted) ApplySunLight(dev);
+    CaptureGameLight(dev);
     if (IsWalker((uintptr_t)self)) { DrawWalker((uintptr_t)self, dev); return; }
     StageR("VehRender(normal)");
     orig_VehRender(self, ra, dev, p3);
@@ -3075,6 +3126,74 @@ static void RemoveWalkerKeepActive(uintptr_t game, uintptr_t w) {
 struct SaveStash { bool had; float x, y, a; uintptr_t veh; long long ms; };
 static SaveStash g_Stash = {false, 0, 0, 0, 0, 0};
 static inline bool SavePending(uintptr_t game) { return *(volatile uint8_t*)(game + 0xa374 + 0x78) != 0; }   // SaveGames+0x78 = gorev suruyor [D: startTask/processWorkerTask]
+// v13: HAYALET TRAKTOR KOK COZUMU. Oyunun otomatik kaydi (SaveGames cmd 3, sync=0) serialize'i ayri bir ISCI THREAD'inde calistirir [D: processWorkerTask];
+// o sirada uzak oyuncularin yayalari (gercek Vehicle nesneleri) arac dizisinde durur -> kayda "traktor" olarak yazilir -> host oyunu kapatip
+// acinca clientlerin cikmadan onceki yerlerinde traktor cikar. Oyun nesnesini calisirken degistirmek (iscide) oyun thread'iyle yarisir; bu yuzden
+// Game'in GOLGE KOPYASI (sizeof(Game)=0xa4e0 [D: Game operator_new]) alinip yayalar SADECE kopyanin arac tablosundan cikarilir, serialize kopyadan okunur.
+// Gercek oyun nesnesine hic dokunulmaz. Kanca: AppSaveGameCallbackInterface sanal tablosu, yuva 2 (+8) = serialize [D: processWorkerTask]. (Gecici kayit/client
+// blob'u -g_CaptureNext- aynen birakilir: client'in indeks/netId esleme tablosu host dizisiyle ayni siradadir.)
+static const size_t GAME_OBJ_SIZE = 0xa4e0;
+typedef uint32_t (*GameSerialize_t)(void* thiz, void* slot, unsigned char* buf, const char* junk);
+static GameSerialize_t g_OrigSerialize = nullptr;
+static bool g_SerWrapDone = false; static int g_SerWrapTries = 0;
+static volatile int g_SerCalls = 0, g_SerHiddenTotal = 0;
+static int HideWalkersInShadow(uint8_t* sh) {
+    std::lock_guard<std::mutex> lk(g_Mu);
+    if (g_Walkers.empty()) return 0;
+    uint32_t cnt = *(uint32_t*)(sh + 0xA4); if (cnt > 60) cnt = 60;                // 0xAC..0x19C: en fazla 61 yuva [D: Game duzeni]
+    const uint32_t act = *(uint32_t*)(sh + G_ACTIVE);
+    uintptr_t* tab = (uintptr_t*)(sh + 0xAC);
+    uintptr_t keep[64]; uint32_t n = 0; int newAct = -1;
+    for (uint32_t i = 0; i < cnt; ++i) {
+        const uintptr_t pv = tab[i]; bool w = false;
+        for (size_t k = 0; k < g_Walkers.size(); ++k) if (g_Walkers[k].p == pv) { w = true; break; }
+        if (w) continue;
+        if (i == act) newAct = (int)n;
+        keep[n++] = pv;
+    }
+    if (n == cnt || n == 0) return 0;                                              // yaya yok / hepsi yaya: dokunma
+    if (newAct < 0) { newAct = 0; for (uint32_t j = 0; j < n; ++j) if (keep[j] == g_LastVehicle) newAct = (int)j; }   // aktif yaya idiyse: indigi arac
+    for (uint32_t i = 0; i < n; ++i) tab[i] = keep[i];
+    for (uint32_t i = n; i < cnt; ++i) tab[i] = 0;
+    *(uint32_t*)(sh + 0xA4) = n; *(uint32_t*)(sh + G_ACTIVE) = (uint32_t)newAct;
+    return (int)(cnt - n);
+}
+static uint32_t my_GameSerialize(void* thiz, void* slot, unsigned char* buf, const char* junk) {
+    GameSerialize_t orig = g_OrigSerialize;
+    if (!orig) return 0;
+    ++g_SerCalls;
+    const uintptr_t game = g_EngineInstance; const uintptr_t delta = (uintptr_t)thiz - game;
+    if (!game || delta >= GAME_OBJ_SIZE || g_CaptureNext.load()) return orig(thiz, slot, buf, junk);
+    uint8_t* sh = nullptr;
+    if (posix_memalign((void**)&sh, 16, GAME_OBJ_SIZE) != 0 || !sh) return orig(thiz, slot, buf, junk);
+    memcpy(sh, (const void*)game, GAME_OBJ_SIZE);
+    const uint32_t c0 = *(uint32_t*)(sh + 0xA4), a0 = *(uint32_t*)(sh + G_ACTIVE);
+    const int hidden = HideWalkersInShadow(sh);
+    if (hidden > 0) { g_SerHiddenTotal += hidden; LOGI("[SAVE] kayit: %d yaya kayittan cikarildi (golge kopya), arac %u -> %u, aktif %u -> %u", hidden, c0, *(uint32_t*)(sh + 0xA4), a0, *(uint32_t*)(sh + G_ACTIVE)); }
+    const uint32_t r = orig((void*)(sh + delta), slot, buf, junk);
+    free(sh);
+    return r;
+}
+static void InstallSerializeWrap(uintptr_t game) {                                 // oyun thread'i: sanal tablo yuvasi bulunana kadar her karede dener (en fazla 900 kare)
+    if (g_SerWrapDone || !game) return;
+    if (++g_SerWrapTries > 900) { g_SerWrapDone = true; LOGI("[SAVE] serialize sarmalayici KURULAMADI (geri cagri nesnesi bulunamadi)"); return; }
+    void* cb = *(void**)(game + 0xa374 + 0x60); if (!cb) return;
+    void** vt = *(void***)cb; if (!vt) return;
+    void* fn = vt[2]; if (!fn) return;
+    const uintptr_t delta = (uintptr_t)cb - game;
+    Dl_info di; memset(&di, 0, sizeof di);
+    const bool inApp = dladdr(fn, &di) && di.dli_fname && strstr(di.dli_fname, "libapp") != nullptr;
+    LOGI("[SAVE] serialize yuvasi: cb=%p game=%p fark=0x%lx vtable=%p fn=%p (%s) libapp=%d", cb, (void*)game, (unsigned long)delta, (void*)vt, fn, di.dli_fname ? di.dli_fname : "?", (int)inApp);
+    g_SerWrapDone = true;
+    if (fn == (void*)my_GameSerialize) return;
+    if (!inApp || delta >= GAME_OBJ_SIZE) { LOGI("[SAVE] serialize sarmalayici KURULMADI (beklenmeyen yuva)"); return; }
+    g_OrigSerialize = (GameSerialize_t)fn;
+    const uintptr_t a = (uintptr_t)&vt[2], pg = a & ~(uintptr_t)4095, len = (((a + sizeof(void*) - 1) & ~(uintptr_t)4095) != pg) ? 8192 : 4096;
+    if (mprotect((void*)pg, len, PROT_READ | PROT_WRITE) != 0) { LOGI("[SAVE] serialize sarmalayici: mprotect basarisiz errno=%d", errno); g_OrigSerialize = nullptr; return; }
+    vt[2] = (void*)my_GameSerialize;
+    mprotect((void*)pg, len, PROT_READ);
+    LOGI("[SAVE] serialize sarmalayici KURULDU (yaya = kayda girmez)");
+}
 // ------------------------------- [W19] v10: OYUNA YAYA OLARAK DEVAM -------------------------------
 // Kayit, yayayi aracina geri bindirerek yazilir (yukaridaki neden). Oyundan cikip tekrar girince oyuncu yine aracin yaninda yaya olsun diye
 // yaya konumu + o andaki arac konumu bir dosyaya yazilir (profil klasorunde walker_resume.txt). Yuklemeden sonra aktif arac, dosyadaki arac konumuyla
@@ -3108,7 +3227,7 @@ static bool ResumeRead(ResumeRec* r) {
     r->wx = (float)a; r->wy = (float)b; r->wa = (float)c; r->vx = (float)d; r->vy = (float)e; return true;
 }
 static void PreSave(uintptr_t game) {
-    if (!game || !g_LocalWalker || g_Disabled) return;
+    if (!game || !g_LocalWalker) return;
     float x, y, a; if (!BodyPose(g_LocalWalker, &x, &y, &a)) return;
     g_Stash.had = true; g_Stash.x = x; g_Stash.y = y; g_Stash.a = a; g_Stash.ms = NowMs();
     LOGI("[WALKER] stash: yaya araca geri aliniyor (%.1f,%.1f)", x, y);
@@ -3129,7 +3248,7 @@ static void TryResume(uintptr_t game, int st) {
     }
     if (st == 6 && s_prevSt != 6) s_st6 = NowMs();
     s_prevSt = st;
-    if (!s_have || st != 6 || g_LocalWalker || g_Stash.had || g_Disabled) return;
+    if (!s_have || st != 6 || g_LocalWalker || g_Stash.had) return;
     const long long now = NowMs();
     if (now > s_until) { s_have = false; LOGI("[WALKER] devam kaydi: eslesen arac bulunamadi (zaman asimi) varlik=%d en_yakin_arac=%.1f m", (int)g_AssetsReady, (double)s_bestDist); return; }
     if (now < s_next) return; s_next = now + 250;
@@ -3164,7 +3283,7 @@ static void TryResume(uintptr_t game, int st) {
 static void PostSave(uintptr_t game) {
     if (!g_Stash.had || !game) return;
     const int st = *(volatile int*)(game + G_STATE);
-    if (st != 6 || SavePending(game) || g_LocalWalker || g_Disabled) return;   // henuz degil (st 7 = menu acik, gorev suruyor...)
+    if (st != 6 || SavePending(game) || g_LocalWalker) return;   // henuz degil (st 7 = menu acik, gorev suruyor...)
     if (NowMs() - g_Stash.ms < 400) return;
     g_Stash.had = false;
     const uintptr_t act = LocalActiveVehiclePtr(game);
@@ -3218,15 +3337,17 @@ static double ReadHour(uintptr_t game, double* rawOut) {
     if (rawOut) *rawOut = v;
     return h;
 }
-static void ComputeSky(double hour, SkyParams* o) {
+static void ComputeSky(double hour, SkyParams* o, const float* gT = nullptr) {
     const float pi = 3.14159265f;
-    const float ang = (float)((hour - 6.0) / 12.0 * pi);                       // 6:00 dogus, 12:00 tepe, 18:00 batis
-    const float sn = sinf(ang);
+    const float ang = (float)((hour - 6.0) / 12.0 * pi);                       // 6:00 dogus, 12:00 tepe, 18:00 batis (YEDEK: oyunun isigi yoksa)
+    float sn = sinf(ang);
     float sx = cosf(ang), sy = sn, sz = 0.35f; const float l = sqrtf(sx * sx + sy * sy + sz * sz);
     o->sun[0] = sx / l; o->sun[1] = sy / l; o->sun[2] = sz / l;
+    if (gT) { sn = fminf(sn, gT[1]); o->sun[0] = gT[0]; o->sun[1] = gT[1]; o->sun[2] = gT[2]; }   // v13: gunes = oyunun isik yonu (golgelerle ayni); gece/gunduz: saat ve isik yonundan kucuk olan
     const float day = Sstep(-0.10f, 0.30f, sn);
     const float tw = expf(-powf(sn / 0.20f, 2.f));                             // gun dogumu/batimi (turuncu) agirligi
     o->day = day; o->night = 1.f - Sstep(-0.18f, 0.02f, sn);
+    if (gT && day <= 0.03f && gT[1] > -0.05f) { o->sun[0] = -gT[0]; o->sun[1] = -gT[1]; o->sun[2] = -gT[2]; }   // gece oyun isigi hala ustteyse: ay o yonde (gunes ufkun altina)
     static const float dayH[3] = {0.74f, 0.84f, 0.93f}, dayZ[3] = {0.30f, 0.52f, 0.84f}, nightH[3] = {0.05f, 0.06f, 0.13f}, nightZ[3] = {0.01f, 0.015f, 0.05f};
     static const float orange[3] = {0.98f, 0.60f, 0.34f}, twZ[3] = {0.30f, 0.33f, 0.58f};
     float h[3], z[3];
@@ -3236,18 +3357,42 @@ static void ComputeSky(double hour, SkyParams* o) {
 static bool g_SkyGLOk = false, g_SkyGLFail = false;
 static const char* kSkyVS = "attribute vec2 aPos; uniform float uYmin; varying vec2 vP; void main(){ vP = vec2(aPos.x, mix(uYmin, 1.0, aPos.y * 0.5 + 0.5)); gl_Position = vec4(vP, 0.0, 1.0); }";   // v12: dortgen sadece ufuk cizgisinin ustunu kapsar (alt kisim zaten arazi)
 static const char* kSkyFS =
-    "#ifdef GL_FRAGMENT_PRECISION_HIGH\nprecision highp float;\n#else\nprecision mediump float;\n#endif\n"
-    "varying vec2 vP; uniform vec3 uR, uU, uF, uHz, uZn, uSun; uniform vec2 uTan; uniform vec4 uP; uniform vec4 uM; uniform sampler2D uTex; uniform sampler2D uNoise;\n"
+    "#ifdef GL_FRAGMENT_PRECISION_HIGH\n"
+    "precision highp float;\n"
+    "#else\n"
+    "precision mediump float;\n"
+    "#endif\n"
+    "varying vec2 vP;\n"
+    "uniform vec3 uR, uU, uF, uHz, uZn, uSun;\n"
+    "uniform vec2 uTan;\n"
+    "uniform vec4 uP;\n"
+    "uniform vec4 uM;\n"
+    "uniform sampler2D uTex;\n"
+    "uniform sampler2D uNoise;\n"
     "float h31(vec3 p){ p = fract(p * 0.1031); p += dot(p, p.yzx + 33.33); return fract((p.x + p.y) * p.z); }\n"
-    "float h21(vec2 p){ vec3 q = fract(vec3(p.xyx) * 0.1031); q += dot(q, q.yzx + 33.33); return fract((q.x + q.y) * q.z); }\n"
-    "float fbm(vec2 p){ float a = 0.5; float s = 0.0; for (int i = 0; i < 4; i++) { s += a * texture2D(uNoise, p * 0.00390625).r; p = p * 2.03 + vec2(1.7, 9.2); a *= 0.5; } return s; }\n"
+    "float fbm(vec2 p){ float a = 0.5; float s = 0.0; for (int i = 0; i < 4; i++) { s += a * texture2D(uNoise, p * 0.00390625).r; p = p * 2.0 + vec2(1.7, 9.2); a *= 0.5; } return s; }\n"
+    "vec3 ridge(float a, float s){\n"
+    "  float h = 0.0; float d = 0.0; float dl = 0.0; float amp = 0.55; float f = 3.5; float ph = s;\n"
+    "  for (int i = 0; i < 5; i++) {\n"
+    "    float x = f * a + ph; float sn = sin(x); float cs = cos(x);\n"
+    "    float dd = amp * f * sign(sn) * cs;\n"
+    "    h += amp * (1.0 - abs(sn)); d -= dd; if (i < 2) dl -= dd;\n"
+    "    amp *= 0.52; f = f * 2.0 + 0.5; ph = ph * 1.7 + 2.3;\n"
+    "  }\n"
+    "  return vec3(h, d, dl);\n"
+    "}\n"
+    "vec3 rockTex(float az, float e, float off){\n"
+    "  float u = abs(mod((az + e * 0.35) * uM.x * 0.001162791 + off, 2.0) - 1.0) * 0.8398;\n"
+    "  float v = abs(mod(e * uM.x * 0.017857143 + off * 0.37, 2.0) - 1.0);\n"
+    "  return texture2D(uTex, vec2(u, 1.0 - 0.70 * v)).rgb;\n"
+    "}\n"
     "void main(){\n"
     "  vec3 ray = normalize(uF + vP.x * uTan.x * uR + vP.y * uTan.y * uU);\n"
     "  float e = ray.y; float day = uP.x; float night = uP.y; float tm = uP.z;\n"
     "  vec3 col = mix(uHz, uZn, pow(clamp(e, 0.0, 1.0), 0.5));\n"
     "  if (e < 0.0) col = uHz * 0.92;\n"
     "  float sd = max(dot(ray, uSun), 0.0);\n"
-    "  col += vec3(1.0, 0.85, 0.6) * (pow(sd, 900.0) * 1.6 + pow(sd, 24.0) * 0.25) * smoothstep(-0.05, 0.08, uSun.y);\n"
+    "  col += vec3(1.0, 0.85, 0.6) * (pow(sd, 900.0) * 1.6 + pow(sd, 24.0) * 0.25) * smoothstep(-0.05, 0.08, uSun.y) * smoothstep(0.03, 0.12, day);\n"
     "  float md = max(dot(ray, -uSun), 0.0);\n"
     "  col = mix(col, vec3(0.92, 0.94, 1.0), smoothstep(0.99965, 0.9998, md) * night * step(0.0, -uSun.y));\n"
     "  col += vec3(0.5, 0.6, 0.9) * pow(md, 40.0) * 0.08 * night;\n"
@@ -3256,8 +3401,39 @@ static const char* kSkyFS =
     "  if (e > 0.01) { vec2 uv = ray.xz / (e + 0.18) * 1.1 + vec2(tm * 0.012, tm * 0.004); float n = fbm(uv); float c = smoothstep(0.50, 0.80, n) * smoothstep(0.01, 0.22, e);\n"
     "    vec3 lit = mix(vec3(0.20, 0.22, 0.30), vec3(1.0), day); lit = mix(lit, vec3(1.0, 0.78, 0.60), clamp(1.0 - abs(uSun.y) * 3.0, 0.0, 1.0) * day * 0.6);\n"
     "    vec3 cc = mix(lit * 0.72, lit, smoothstep(0.55, 0.85, n)); col = mix(col, cc, c * 0.9); }\n"
-    "  if (uM.z > 0.0) { float az = atan(ray.x, ray.z); float t = az * 0.1591549 * uM.z; float u = abs(mod(t, 2.0) - 1.0); float v = (e - uM.x) / (uM.y - uM.x);\n"
-    "    if (v < 1.0) { float vv = clamp(v, 0.0, 1.0); vec4 m = texture2D(uTex, vec2(u, 1.0 - vv)); vec3 mc = mix(m.rgb, uHz, 0.14); mc = mix(vec3(dot(mc, vec3(0.3, 0.59, 0.11))), mc, 1.12); mc *= 0.12 + 0.88 * day; col = mix(col, mc, m.a * smoothstep(0.0, 0.22, v)); } }\n"
+    "  if (e < 0.165 && e > -0.06) {\n"
+    "    float az = atan(ray.x, ray.z); float px = uM.y;\n"
+    "    float rel = atan(uSun.x, uSun.z) - az; float sel = uSun.y; float cel = sqrt(max(1.0 - sel * sel, 0.0));\n"
+    "    vec3 L = normalize(vec3(sin(rel) * cel, clamp(sel, 0.15, 1.0), -cos(rel) * cel));\n"
+    "    float warm = clamp(1.0 - abs(uSun.y) * 3.0, 0.0, 1.0) * day;\n"
+    "    vec3 sunC = mix(vec3(1.0), vec3(1.0, 0.72, 0.50), warm); float I = 0.10 + 0.90 * day;\n"
+    "    float nv = fbm(vec2(az, e) * 40.7437);\n"
+    "    float bf = smoothstep(-0.06, -0.02, e);\n"
+    "    vec3 rf = ridge(az, 1.7); float topF = 0.045 + 0.100 * rf.x; float slF = 0.100 * rf.y; float shF = 0.100 * rf.z;\n"
+    "    float covF = clamp((topF - e) / (px * (1.0 + abs(slF)) * 0.9 + 0.0004) * 0.5 + 0.5, 0.0, 1.0) * bf;\n"
+    "    if (covF > 0.0) {\n"
+    "      float sx = shF * 3.0; vec3 n = normalize(vec3(-sx / (1.0 + abs(sx)), 0.60, 0.80)); float lam = max(dot(n, L), 0.0);\n"
+    "      vec3 base = (uM.z > 0.5) ? rockTex(az, e, 0.13) : vec3(0.36, 0.28, 0.22);\n"
+    "      vec3 lt = base * vec3(0.94, 0.97, 1.06) * (0.30 + 0.85 * lam) * (0.85 + 0.30 * nv) * sunC;\n"
+    "      float hz = 0.50 - 0.38 * smoothstep(0.0, 0.12, e);\n"
+    "      vec3 mc = mix(lt * I, uHz, hz);\n"
+    "      float sn = smoothstep(0.114, 0.128, e + (nv - 0.5) * 0.018) * step(0.0, e);\n"
+    "      vec3 snowC = vec3(0.90, 0.93, 0.98) * (0.50 + 0.55 * lam) * sunC * I;\n"
+    "      mc = mix(mc, mix(snowC, uHz, hz * 0.6), sn);\n"
+    "      col = mix(col, mc, covF);\n"
+    "    }\n"
+    "    vec3 rn = ridge(az * 3.0 + 0.4, 5.1); float topN = 0.004 + 0.052 * rn.x; float slN = 0.104 * rn.y; float shN = 0.104 * rn.z;\n"
+    "    float covN = clamp((topN - e) / (px * (1.0 + abs(slN)) * 0.9 + 0.0004) * 0.5 + 0.5, 0.0, 1.0) * bf;\n"
+    "    if (covN > 0.0) {\n"
+    "      float sx = shN * 1.5; vec3 n = normalize(vec3(-sx / (1.0 + abs(sx)), 0.75, 0.65)); float lam = max(dot(n, L), 0.0);\n"
+    "      vec3 base = (uM.z > 0.5) ? rockTex(az, e, 0.61) : vec3(0.36, 0.28, 0.22);\n"
+    "      float gr = 0.65 - 0.40 * smoothstep(0.015, 0.05, e);\n"
+    "      base = mix(base, vec3(0.30, 0.38, 0.16) * (0.70 + 0.60 * nv), gr);\n"
+    "      vec3 lt = base * (0.30 + 0.85 * lam) * (0.85 + 0.30 * nv) * sunC;\n"
+    "      vec3 mc = mix(lt * I, uHz, 0.16);\n"
+    "      col = mix(col, mc, covN);\n"
+    "    }\n"
+    "  }\n"
     "  gl_FragColor = vec4(col, 1.0);\n"
     "}\n";
 static GLuint SkyCompile(GLenum type, const char* src) {
@@ -3267,36 +3443,10 @@ static GLuint SkyCompile(GLenum type, const char* src) {
     return sh;
 }
 static GLuint s_skyProg = 0, s_skyVbo = 0, s_skyTex = 0, s_noiseTex = 0; static GLint s_uR, s_uU, s_uF, s_uHz, s_uZn, s_uSun, s_uTan, s_uP, s_uM, s_uTex, s_uNoise, s_uYmin;
-// v12: dag dokusu (1024x78) 2x buyutulur: Catmull-Rom + hafif keskinlestirme (bulaniklik/"soluk" gorunum azalir). Sonuc malloc ile verilir.
-static float CatmullW(float t, int k) {                                        // k = -1,0,1,2 -> agirlik
-    const float t2 = t * t, t3 = t2 * t;
-    switch (k) { case -1: return 0.5f * (-t3 + 2.f * t2 - t); case 0: return 0.5f * (3.f * t3 - 5.f * t2 + 2.f); case 1: return 0.5f * (-3.f * t3 + 4.f * t2 + t); default: return 0.5f * (t3 - t2); }
-}
-static unsigned char* UpscaleSharpen2x(const unsigned char* src, int w, int h, int* ow, int* oh) {
-    const int W = w * 2, H = h * 2;
-    float* tmp = (float*)malloc(sizeof(float) * (size_t)W * h * 4); unsigned char* out = (unsigned char*)malloc((size_t)W * H * 4);
-    if (!tmp || !out) { free(tmp); free(out); return nullptr; }
-    for (int y = 0; y < h; ++y) for (int x = 0; x < W; ++x) {                  // yatay
-        const float fx = (x + 0.5f) * 0.5f - 0.5f; const int ix = (int)floorf(fx); const float t = fx - ix;
-        for (int c = 0; c < 4; ++c) { float a = 0.f; for (int k = -1; k <= 2; ++k) { int xx = ix + k; xx = xx < 0 ? 0 : (xx >= w ? w - 1 : xx); a += CatmullW(t, k) * src[((size_t)y * w + xx) * 4 + c]; } tmp[((size_t)y * W + x) * 4 + c] = a; }
-    }
-    for (int y = 0; y < H; ++y) for (int x = 0; x < W; ++x) {                  // dikey
-        const float fy = (y + 0.5f) * 0.5f - 0.5f; const int iy = (int)floorf(fy); const float t = fy - iy;
-        for (int c = 0; c < 4; ++c) { float a = 0.f; for (int k = -1; k <= 2; ++k) { int yy = iy + k; yy = yy < 0 ? 0 : (yy >= h ? h - 1 : yy); a += CatmullW(t, k) * tmp[((size_t)yy * W + x) * 4 + c]; }
-            out[((size_t)y * W + x) * 4 + c] = (unsigned char)(a < 0.f ? 0.f : (a > 255.f ? 255.f : a)); }
-    }
-    free(tmp);
-    unsigned char* res = (unsigned char*)malloc((size_t)W * H * 4);              // 3x3 unsharp (renk kanallari; alfa aynen)
-    if (!res) { *ow = W; *oh = H; return out; }
-    memcpy(res, out, (size_t)W * H * 4);
-    for (int y = 1; y < H - 1; ++y) for (int x = 1; x < W - 1; ++x) for (int c = 0; c < 3; ++c) {
-        const int i = ((y * W) + x) * 4 + c;
-        const int blur = (4 * out[i] + 2 * (out[i - 4] + out[i + 4] + out[i - W * 4] + out[i + W * 4]) + out[i - 4 - W * 4] + out[i + 4 - W * 4] + out[i - 4 + W * 4] + out[i + 4 + W * 4]) / 16;
-        int v = out[i] + (int)(0.7f * (out[i] - blur)); res[i] = (unsigned char)(v < 0 ? 0 : (v > 255 ? 255 : v));
-    }
-    free(out); *ow = W; *oh = H; return res;
-}
-static bool SkyInitGL() {
+// v13: dag dokusu artik BUYUTULMEZ: "kaya yuzeyi" olarak sadece 1:1.35 piksel yogunlukla (hic buyutme/bulaniklik yok) siklikla ayna-tekrarli ornekleniyor.
+//      Dag SILUETI dokudan degil, shader'da analitik (sin-ridge) cizilir -> kenarlar piksel basamagi degil, kenar yumusatmali (AA).
+static int g_SkyInitStage = 0;                                                  // 0 yok, 1 program hazir, 2 dokular hazir
+static bool SkyInitProgram() {
     const GLuint vs = SkyCompile(GL_VERTEX_SHADER, kSkyVS), fs = SkyCompile(GL_FRAGMENT_SHADER, kSkyFS);
     if (!vs || !fs) return false;
     s_skyProg = glCreateProgram(); glAttachShader(s_skyProg, vs); glAttachShader(s_skyProg, fs);
@@ -3309,31 +3459,70 @@ static bool SkyInitGL() {
     s_uNoise = glGetUniformLocation(s_skyProg, "uNoise"); s_uYmin = glGetUniformLocation(s_skyProg, "uYmin");
     static const float quad[8] = {-1.f, -1.f, 1.f, -1.f, -1.f, 1.f, 1.f, 1.f};
     glGenBuffers(1, &s_skyVbo); glBindBuffer(GL_ARRAY_BUFFER, s_skyVbo); glBufferData(GL_ARRAY_BUFFER, sizeof quad, quad, GL_STATIC_DRAW);
+    return true;
+}
+static void SkyInitTextures() {
     int w = 0, h = 0, ch = 0;
     unsigned char* px = stbi_load_from_memory(mountain_png_data, mountain_png_len, &w, &h, &ch, 4);
     if (px && w > 0 && h > 0) {
-        int w2 = 0, h2 = 0; unsigned char* up = (w <= 1024 && h <= 512) ? UpscaleSharpen2x(px, w, h, &w2, &h2) : nullptr;
-        if (up) { stbi_image_free(px); px = up; w = w2; h = h2; }                // (up malloc ile; asagida free ile birakilir)
-        else up = nullptr;
+        glActiveTexture(GL_TEXTURE0);
         glGenTextures(1, &s_skyTex); glBindTexture(GL_TEXTURE_2D, s_skyTex);
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR); glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE); glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
         glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, w, h, 0, GL_RGBA, GL_UNSIGNED_BYTE, px);
-        if (up) free(px); else stbi_image_free(px);
-        LOGI("[WALKER] dag dokusu yuklendi %dx%d%s", w, h, up ? " (2x keskinlestirildi)" : "");
-    } else { LOGI("[WALKER] dag dokusu YUKLENEMEDI (dagsiz gokyuzu)"); if (px) stbi_image_free(px); }
-    {   // v12: bulut gurultusu dokusu (256x256, tekrarli, bilineer) -> shader'da 4 doku okumasi (eskiden 16 hash)
+        stbi_image_free(px);
+        LOGI("[WALKER] kaya dokusu yuklendi %dx%d", w, h);
+    } else { LOGI("[WALKER] kaya dokusu YUKLENEMEDI (duz renkli daglar)"); if (px) stbi_image_free(px); }
+    {   // bulut gurultusu dokusu (256x256, tekrarli, bilineer): bulutlar + dag yuzeyi detayi
         static unsigned char nz[256 * 256]; uint32_t seed = 0x9E3779B9u;
         for (int i = 0; i < 256 * 256; ++i) { seed = seed * 1664525u + 1013904223u; nz[i] = (unsigned char)(seed >> 24); }
-        GLint old1 = 0; glActiveTexture(GL_TEXTURE1); glGetIntegerv(GL_TEXTURE_BINDING_2D, &old1);
+        glActiveTexture(GL_TEXTURE1);
         glGenTextures(1, &s_noiseTex); glBindTexture(GL_TEXTURE_2D, s_noiseTex);
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR); glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_REPEAT); glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_REPEAT);
         glTexImage2D(GL_TEXTURE_2D, 0, GL_LUMINANCE, 256, 256, 0, GL_LUMINANCE, GL_UNSIGNED_BYTE, nz);
-        glBindTexture(GL_TEXTURE_2D, (GLuint)old1); glActiveTexture(GL_TEXTURE0);
+        glActiveTexture(GL_TEXTURE0);
     }
-    return true;
 }
+// GL durumu: cizimden/baslatmadan once kaydedilir, sonra birebir geri yazilir (oyunun cihaz onbellegi bozulmasin).
+struct SkyGlSave {
+    GLint prog = 0, abuf = 0, ebuf = 0, atex = 0, tex0 = 0, tex1 = 0, vp[4] = {0, 0, 0, 0}, sc[4] = {0, 0, 0, 0}, bsr = 0, bdr = 0, bsa = 0, bda = 0, beR = 0, beA = 0;
+    GLint en0 = 0, ab0 = 0, sz0 = 4, ty0 = GL_FLOAT, st0 = 0, nm0 = 0; GLvoid* pt0 = nullptr; GLboolean dmask = GL_TRUE, cmask[4] = {1, 1, 1, 1};
+    GLboolean eDepth = 0, eBlend = 0, eCull = 0, eScis = 0, eSten = 0;
+    void Save() {
+        glGetIntegerv(GL_CURRENT_PROGRAM, &prog); glGetIntegerv(GL_ARRAY_BUFFER_BINDING, &abuf); glGetIntegerv(GL_ELEMENT_ARRAY_BUFFER_BINDING, &ebuf);
+        glGetIntegerv(GL_ACTIVE_TEXTURE, &atex);
+        glActiveTexture(GL_TEXTURE0); glGetIntegerv(GL_TEXTURE_BINDING_2D, &tex0);
+        glActiveTexture(GL_TEXTURE1); glGetIntegerv(GL_TEXTURE_BINDING_2D, &tex1);
+        glActiveTexture(GL_TEXTURE0);
+        glGetIntegerv(GL_VIEWPORT, vp); glGetIntegerv(GL_SCISSOR_BOX, sc);
+        eDepth = glIsEnabled(GL_DEPTH_TEST); eBlend = glIsEnabled(GL_BLEND); eCull = glIsEnabled(GL_CULL_FACE); eScis = glIsEnabled(GL_SCISSOR_TEST); eSten = glIsEnabled(GL_STENCIL_TEST);
+        glGetBooleanv(GL_DEPTH_WRITEMASK, &dmask); glGetBooleanv(GL_COLOR_WRITEMASK, cmask);
+        glGetIntegerv(GL_BLEND_SRC_RGB, &bsr); glGetIntegerv(GL_BLEND_DST_RGB, &bdr); glGetIntegerv(GL_BLEND_SRC_ALPHA, &bsa); glGetIntegerv(GL_BLEND_DST_ALPHA, &bda);
+        glGetIntegerv(GL_BLEND_EQUATION_RGB, &beR); glGetIntegerv(GL_BLEND_EQUATION_ALPHA, &beA);
+        glGetVertexAttribiv(0, GL_VERTEX_ATTRIB_ARRAY_ENABLED, &en0); glGetVertexAttribiv(0, GL_VERTEX_ATTRIB_ARRAY_BUFFER_BINDING, &ab0);
+        glGetVertexAttribiv(0, GL_VERTEX_ATTRIB_ARRAY_SIZE, &sz0); glGetVertexAttribiv(0, GL_VERTEX_ATTRIB_ARRAY_TYPE, &ty0);
+        glGetVertexAttribiv(0, GL_VERTEX_ATTRIB_ARRAY_NORMALIZED, &nm0); glGetVertexAttribiv(0, GL_VERTEX_ATTRIB_ARRAY_STRIDE, &st0);
+        glGetVertexAttribPointerv(0, GL_VERTEX_ATTRIB_ARRAY_POINTER, &pt0);
+    }
+    void Restore() {
+        glBindBuffer(GL_ARRAY_BUFFER, (GLuint)ab0);
+        glVertexAttribPointer(0, sz0, (GLenum)ty0, (GLboolean)nm0, st0, pt0);
+        if (!en0) glDisableVertexAttribArray(0);
+        glBindBuffer(GL_ARRAY_BUFFER, (GLuint)abuf); glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, (GLuint)ebuf);
+        glActiveTexture(GL_TEXTURE1); glBindTexture(GL_TEXTURE_2D, (GLuint)tex1);
+        glActiveTexture(GL_TEXTURE0); glBindTexture(GL_TEXTURE_2D, (GLuint)tex0);
+        glActiveTexture((GLenum)atex); glUseProgram((GLuint)prog);
+        glDepthMask(dmask); glColorMask(cmask[0], cmask[1], cmask[2], cmask[3]);
+        glScissor(sc[0], sc[1], sc[2], sc[3]);
+        if (eDepth) glEnable(GL_DEPTH_TEST); else glDisable(GL_DEPTH_TEST);
+        if (eBlend) glEnable(GL_BLEND); else glDisable(GL_BLEND);
+        if (eCull) glEnable(GL_CULL_FACE); else glDisable(GL_CULL_FACE);
+        if (eScis) glEnable(GL_SCISSOR_TEST); else glDisable(GL_SCISSOR_TEST);
+        if (eSten) glEnable(GL_STENCIL_TEST); else glDisable(GL_STENCIL_TEST);
+        glBlendFuncSeparate((GLenum)bsr, (GLenum)bdr, (GLenum)bsa, (GLenum)bda); glBlendEquationSeparate((GLenum)beR, (GLenum)beA);
+    }
+};
 // v12: gorunen gokyuzu bolgesinin alt siniri (NDC y). Ufuk cizgisinin biraz altina kadar cizilir; daha asagisi arazi. 1'den buyukse hic cizilmez.
 static float SkyElev(const float* R, const float* U, const float* F, float tx, float ty, float x, float y) {
     const float rx = F[0] + x * tx * R[0] + y * ty * U[0], ry = F[1] + x * tx * R[1] + y * ty * U[1], rz = F[2] + x * tx * R[2] + y * ty * U[2];
@@ -3350,108 +3539,102 @@ static float SkyMinY(const float* R, const float* U, const float* F, float tx, f
     }
     return best < 2.f ? fmaxf(-1.f, best - 0.03f) : 2.f;
 }
-static void DrawSkyGL(uintptr_t game) {
-    if (!game) return;
-    // --- GL durumunu kaydet ---
-    GLint prog = 0, abuf = 0, ebuf = 0, atex = 0, tex0 = 0, vp[4] = {0, 0, 0, 0}, bsr = 0, bdr = 0, bsa = 0, bda = 0, beR = 0, beA = 0;
-    GLint en0 = 0, ab0 = 0, sz0 = 4, ty0 = GL_FLOAT, st0 = 0; GLint nm0 = 0; GLvoid* pt0 = nullptr; GLboolean dmask = GL_TRUE, cmask[4] = {1, 1, 1, 1};
-    glGetIntegerv(GL_CURRENT_PROGRAM, &prog); glGetIntegerv(GL_ARRAY_BUFFER_BINDING, &abuf); glGetIntegerv(GL_ELEMENT_ARRAY_BUFFER_BINDING, &ebuf);
-    glGetIntegerv(GL_ACTIVE_TEXTURE, &atex); glActiveTexture(GL_TEXTURE0); glGetIntegerv(GL_TEXTURE_BINDING_2D, &tex0); glGetIntegerv(GL_VIEWPORT, vp);
-    const GLboolean eDepth = glIsEnabled(GL_DEPTH_TEST), eBlend = glIsEnabled(GL_BLEND), eCull = glIsEnabled(GL_CULL_FACE), eScis = glIsEnabled(GL_SCISSOR_TEST), eSten = glIsEnabled(GL_STENCIL_TEST);
-    glGetBooleanv(GL_DEPTH_WRITEMASK, &dmask); glGetBooleanv(GL_COLOR_WRITEMASK, cmask);
-    glGetIntegerv(GL_BLEND_SRC_RGB, &bsr); glGetIntegerv(GL_BLEND_DST_RGB, &bdr); glGetIntegerv(GL_BLEND_SRC_ALPHA, &bsa); glGetIntegerv(GL_BLEND_DST_ALPHA, &bda);
-    glGetIntegerv(GL_BLEND_EQUATION_RGB, &beR); glGetIntegerv(GL_BLEND_EQUATION_ALPHA, &beA);
-    glGetVertexAttribiv(0, GL_VERTEX_ATTRIB_ARRAY_ENABLED, &en0); glGetVertexAttribiv(0, GL_VERTEX_ATTRIB_ARRAY_BUFFER_BINDING, &ab0);
-    glGetVertexAttribiv(0, GL_VERTEX_ATTRIB_ARRAY_SIZE, &sz0); glGetVertexAttribiv(0, GL_VERTEX_ATTRIB_ARRAY_TYPE, &ty0);
-    glGetVertexAttribiv(0, GL_VERTEX_ATTRIB_ARRAY_NORMALIZED, &nm0); glGetVertexAttribiv(0, GL_VERTEX_ATTRIB_ARRAY_STRIDE, &st0);
-    glGetVertexAttribPointerv(0, GL_VERTEX_ATTRIB_ARRAY_POINTER, &pt0);
-    // --- ilk kullanimda kaynaklari olustur ---
-    if (!g_SkyGLOk) {
-        if (!SkyInitGL()) { g_SkyGLFail = true; LOGI("[WALKER] gokyuzu GL kapandi (derleme hatasi): temizleme rengine donuldu"); }
-        else g_SkyGLOk = true;
-        glBindTexture(GL_TEXTURE_2D, (GLuint)tex0); glActiveTexture((GLenum)atex); glBindBuffer(GL_ARRAY_BUFFER, (GLuint)abuf); glUseProgram((GLuint)prog);
-        if (!g_SkyGLOk) return;
-    }
-    double raw = 0; const double hour = ReadHour(game, &raw);
-    SkyParams sp; ComputeSky(hour, &sp);
-    // v10: bakis yonu GERCEK kameradan (RenderArgs::update'e giden gorunum matrisi): dunya yonleri = gorunum matrisinin satirlari (isim etiketleriyle ayni sozlesme)
-    float R[3], U[3], F[3];
-    if (NowMs() - g_CamMs.load() <= 500) {
-        const float* V = g_CamView;
-        R[0] = V[0]; R[1] = V[4]; R[2] = V[8];  U[0] = V[1]; U[1] = V[5]; U[2] = V[9];  F[0] = -V[2]; F[1] = -V[6]; F[2] = -V[10];
-    } else {                                                                   // kanca henuz veri vermediyse: aktif aracin kamera dunya matrisi
-        const uintptr_t av = LocalActiveVehiclePtr(game); if (!av) { glBindTexture(GL_TEXTURE_2D, (GLuint)tex0); glActiveTexture((GLenum)atex); return; }
-        const float* C = (const float*)(av + V_CAM_WORLD);
-        R[0] = C[0]; R[1] = C[1]; R[2] = C[2];  U[0] = C[4]; U[1] = C[5]; U[2] = C[6];  F[0] = -C[8]; F[1] = -C[9]; F[2] = -C[10];
-    }
-    for (int i = 0; i < 3; ++i) if (!(R[i] == R[i]) || !(U[i] == U[i]) || !(F[i] == F[i])) { glBindTexture(GL_TEXTURE_2D, (GLuint)tex0); glActiveTexture((GLenum)atex); return; }
-    float tanX = 0.80f, tanY = 0.50f;
-    { const float* pj = (const float*)(game + 0xa2b0); const float* pj2 = (const float*)(game + 0xa270);
-      if (pj[5] > 0.3f && pj[5] < 8.f && pj[0] > 0.3f && pj[0] < 8.f) { tanX = 1.f / pj[0]; tanY = 1.f / pj[5]; }
-      else if (pj2[5] > 0.3f && pj2[5] < 8.f && pj2[0] > 0.3f && pj2[0] < 8.f) { tanX = 1.f / pj2[0]; tanY = 1.f / pj2[5]; }
-      else if (vp[3] > 0) { tanX = tanY * (float)vp[2] / (float)vp[3]; } }
-    { static long long s_l = 0; const long long now = NowMs(); if (now - s_l > 10000) { s_l = now; LOGI("[WALKER] gokyuzu GL: saat=%.2f (ham=%.3f) tan=(%.2f,%.2f) vp=%dx%d gunes.y=%.2f gunduz=%.2f", hour, raw, tanX, tanY, vp[2], vp[3], sp.sun[1], sp.day); } }
-    const float yMin = SkyMinY(R, U, F, tanX, tanY);
-    if (yMin >= 1.f) { glBindTexture(GL_TEXTURE_2D, (GLuint)tex0); glActiveTexture((GLenum)atex); return; }   // ufuk ekran disinda (yere bakiliyor): cizilecek gokyuzu yok
-    GLint tex1 = 0; glActiveTexture(GL_TEXTURE1); glGetIntegerv(GL_TEXTURE_BINDING_2D, &tex1); glActiveTexture(GL_TEXTURE0);
-    // --- ciz ---
+// v13: OYUNUN KENDI ISIGI. Environment::render yonlu isigi (cihaz+0x765c, gorunum uzayi, birim) kendi egrisinden yazar. Artik o isik DEGISTIRILMEZ
+//      (v12'de yayadayken kendi gunesimle eziyordum -> golgeler arac/yaya arasinda ters oluyordu). Sadece OKUNUR: dunya uzayinda "isiga dogru" T = -d_w
+//      (olcum: ogle vakti d_w = (0,-1,0), yani isik asagi dogru ilerliyor). Gokyuzundeki gunes/ay bu yonde cizilir.
+static float g_GameLightT[3] = {0.f, 1.f, 0.f};
+static volatile long long g_GameLightMs = 0;
+static void CaptureGameLight(void* devp) {
+    if (!devp) return;
+    const long long cm = g_CamMs.load(); const long long now = NowMs();
+    if (now - cm > 500) return;
+    static long long s_stamp = 0; if (cm == s_stamp) return; s_stamp = cm;     // kare basina bir kez
+    const float* dv = (const float*)((const uint8_t*)devp + 0x765c);
+    const float gx = dv[0], gy = dv[1], gz = dv[2];
+    if (!(gx == gx && gy == gy && gz == gz) || fabsf(gx) > 2.f || fabsf(gy) > 2.f || fabsf(gz) > 2.f) return;
+    const float gl = sqrtf(gx * gx + gy * gy + gz * gz); if (gl < 0.5f || gl > 1.5f) return;
+    const float* V = g_CamView;
+    const float dx = V[0] * gx + V[1] * gy + V[2] * gz, dy = V[4] * gx + V[5] * gy + V[6] * gz, dz = V[8] * gx + V[9] * gy + V[10] * gz;   // dunya = R*dv.x + U*dv.y + B*dv.z
+    const float dl = sqrtf(dx * dx + dy * dy + dz * dz); if (!(dl > 1e-4f)) return;
+    g_GameLightT[0] = -dx / dl; g_GameLightT[1] = -dy / dl; g_GameLightT[2] = -dz / dl; g_GameLightMs = now;
+    static long long s_ll = 0; if (now - s_ll > 20000) { s_ll = now; LOGI("[LIGHT] oyun isigi: isiga dogru dunya=(%.2f,%.2f,%.2f) saat=%.2f", g_GameLightT[0], g_GameLightT[1], g_GameLightT[2], g_EngineInstance ? ReadHour(g_EngineInstance, nullptr) : -1.0); }
+}
+// Cizim cekirdegi: GL durumu cagiran tarafindan kaydedilip geri yazilir. warm=true: 1x1 piksellik isinma cizimi (surucunun shader'i ilk cizimde derlemesini onceden yaptirir).
+static void SkyDrawCore(const float* R, const float* U, const float* F, const SkyParams& sp, float tanX, float tanY, float yMin, float vpH, bool warm) {
     glDisable(GL_DEPTH_TEST); glDisable(GL_BLEND); glDisable(GL_CULL_FACE); glDisable(GL_SCISSOR_TEST); glDisable(GL_STENCIL_TEST);
+    if (warm) { glEnable(GL_SCISSOR_TEST); glScissor(0, 0, 1, 1); }
     glDepthMask(GL_FALSE); glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
     glUseProgram(s_skyProg);
     glBindBuffer(GL_ARRAY_BUFFER, s_skyVbo); glEnableVertexAttribArray(0); glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 0, (const void*)0);
     glUniform3fv(s_uR, 1, R); glUniform3fv(s_uU, 1, U); glUniform3fv(s_uF, 1, F); glUniform3fv(s_uHz, 1, sp.hz); glUniform3fv(s_uZn, 1, sp.zn); glUniform3fv(s_uSun, 1, sp.sun);
     glUniform2f(s_uTan, tanX, tanY);
     glUniform4f(s_uP, sp.day, sp.night, (float)fmod((double)NowMs() * 0.001, 10000.0), 0.f);
-    glUniform4f(s_uM, -0.10f, 0.13f, s_skyTex ? 4.0f : 0.0f, 0.f);
+    {   // dag dokusu yogunlugu: 1 doku pikseli ~1.35 ekran pikseli (buyutme yok); tam turda tam sayi ayna periyodu (860 doku genislik) -> dikis izi yok
+        const float pi2 = 6.2831853f; const float vh = fmaxf(vpH, 1.f);
+        float dens = (vh / (2.f * tanY)) / 1.35f; int N = (int)floorf(pi2 * dens / 1720.f + 0.5f); if (N < 1) N = 1; dens = (float)N * 1720.f / pi2;
+        glUniform4f(s_uM, dens, 2.f * tanY / vh, s_skyTex ? 1.0f : 0.0f, 0.f);
+    }
     glUniform1f(s_uYmin, yMin);
     glActiveTexture(GL_TEXTURE1); glBindTexture(GL_TEXTURE_2D, s_noiseTex); glUniform1i(s_uNoise, 1);
     glActiveTexture(GL_TEXTURE0); glBindTexture(GL_TEXTURE_2D, s_skyTex); glUniform1i(s_uTex, 0);
     glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
-    glActiveTexture(GL_TEXTURE1); glBindTexture(GL_TEXTURE_2D, (GLuint)tex1); glActiveTexture(GL_TEXTURE0);
-    // --- durumu geri yaz ---
-    glBindBuffer(GL_ARRAY_BUFFER, (GLuint)ab0);
-    glVertexAttribPointer(0, sz0, (GLenum)ty0, (GLboolean)nm0, st0, pt0);
-    if (!en0) glDisableVertexAttribArray(0);
-    glBindBuffer(GL_ARRAY_BUFFER, (GLuint)abuf); glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, (GLuint)ebuf);
-    glBindTexture(GL_TEXTURE_2D, (GLuint)tex0); glActiveTexture((GLenum)atex); glUseProgram((GLuint)prog);
-    glDepthMask(dmask); glColorMask(cmask[0], cmask[1], cmask[2], cmask[3]);
-    if (eDepth) glEnable(GL_DEPTH_TEST); if (eBlend) glEnable(GL_BLEND); if (eCull) glEnable(GL_CULL_FACE); if (eScis) glEnable(GL_SCISSOR_TEST); if (eSten) glEnable(GL_STENCIL_TEST);
-    glBlendFuncSeparate((GLenum)bsr, (GLenum)bdr, (GLenum)bsa, (GLenum)bda); glBlendEquationSeparate((GLenum)beR, (GLenum)beA);
 }
-// v12: ISIK YONU. Oyun Environment::render icinde yonlu isigi (cihaz+0x765c, gorunum uzayi, normalize) kendi egrisinden yazar; bu yon benim cizdigim gunesle
-// ilgisizdi (hep ayni taraftan isik). Kare basina bir kez, arac cizimi basladiginda (Environment::render'dan SONRA, kuyruk bosaltilmadan ONCE) yon
-// gunesin yonune cevrilir. Oyunun yazdigi yonun "yukari" bileseninden isaret (isik yonu mu, isiga dogru yon mu) kendiliginden ogrenilir.
-static void ApplySunLight(void* devp) {
-    if (!devp || !g_EngineInstance) return;
-    const long long cm = g_CamMs.load();
-    if (NowMs() - cm > 500) return;
-    static long long s_stamp = 0; if (cm == s_stamp) return; s_stamp = cm;    // kare basina bir kez
-    uint8_t* dev = (uint8_t*)devp;
-    float* dv = (float*)(dev + 0x765c);
-    const float* V = g_CamView;
-    const float R[3] = {V[0], V[4], V[8]}, U[3] = {V[1], V[5], V[9]}, B[3] = {V[2], V[6], V[10]};
-    static float s_sgn = 0.f;
-    const float gx = dv[0], gy = dv[1], gz = dv[2];
-    if (gx == gx && gy == gy && gz == gz && fabsf(gx) < 2.f && fabsf(gy) < 2.f && fabsf(gz) < 2.f) {
-        const float wy = R[1] * gx + U[1] * gy + B[1] * gz;                     // oyunun isik yonunun dunya y bileseni
-        if (fabsf(wy) > 0.2f) {
-            const float ns = wy > 0.f ? 1.f : -1.f;
-            if (ns != s_sgn) { s_sgn = ns; LOGI("[LIGHT] oyun isik yonu dunya=(%.2f,%.2f,%.2f) isaret=%+.0f", R[0] * gx + U[0] * gy + B[0] * gz, wy, R[2] * gx + U[2] * gy + B[2] * gz, (double)ns); }
-        }
+// ILK-CIZIM DONMASI KOK NEDENI (log: "kare+1 gap=1450 ms", "dag dokusu yuklendi" 1.4 sn sonra): shader derleme + doku yukleme ilk yaya karesinde yapiliyordu.
+// Cozum: oyun acilirken, kareler arasina yayilmis asamalarla (program -> dokular -> isinma cizimi) onceden hazirlanir; yayaya inince hicbir sey beklenmez.
+static void SkyEnsureNow() {                                                   // yaya gokyuzu isterse ve on-hazirlik bitmediyse: kalan asamalari hemen yap
+    if (g_SkyGLOk || g_SkyGLFail) return;
+    SkyGlSave sv; sv.Save();
+    if (g_SkyInitStage < 1) { if (!SkyInitProgram()) { g_SkyGLFail = true; LOGI("[WALKER] gokyuzu GL kapandi (derleme hatasi): temizleme rengine donuldu"); } else g_SkyInitStage = 1; }
+    if (!g_SkyGLFail && g_SkyInitStage < 2) { SkyInitTextures(); g_SkyInitStage = 2; }
+    if (!g_SkyGLFail) g_SkyGLOk = true;
+    sv.Restore();
+}
+static void SkyPreInitStep(int w, int h) {
+    if (g_SkyGLOk || g_SkyGLFail || w <= 0 || h <= 0) return;
+    static int s_frames = 0; ++s_frames;
+    if (s_frames < 60 || (s_frames % 4) != 0) return;                         // acilis/yukleme karelerini atla; her 4 karede bir asama
+    const long long t0 = NowMs();
+    SkyGlSave sv; sv.Save();
+    if (g_SkyInitStage == 0) { if (!SkyInitProgram()) { g_SkyGLFail = true; LOGI("[WALKER] gokyuzu GL kapandi (derleme hatasi): temizleme rengine donuldu"); } else g_SkyInitStage = 1; }
+    else if (g_SkyInitStage == 1) { SkyInitTextures(); g_SkyInitStage = 2; }
+    else {
+        static const float R[3] = {1.f, 0.f, 0.f}, U[3] = {0.f, 1.f, 0.f}, F[3] = {0.f, 0.f, -1.f};
+        SkyParams sp; ComputeSky(12.0, &sp);
+        SkyDrawCore(R, U, F, sp, 0.64f, 0.36f, -1.f, (float)h, true);
+        g_SkyGLOk = true;
     }
-    if (s_sgn == 0.f) return;                                                  // oyunun yonu anlasilamadi: isige dokunma
-    SkyParams sp; ComputeSky(ReadHour(g_EngineInstance, nullptr), &sp);
-    float hx = sp.sun[0], hz = sp.sun[2]; float el = asinf(fminf(fmaxf(sp.sun[1], -1.f), 1.f));
-    if (el < 0.f) { hx = -hx; hz = -hz; el = -el; }                            // gece: ay tarafindan (yon korunur, oyunun diffuse egrisi zaten karartir)
-    el = fminf(fmaxf(el, 0.35f), 1.0f);                                        // cok dik/cok yatik isik arac yanlarini karartir: 20..57 derece
-    const float hl = sqrtf(hx * hx + hz * hz); if (hl < 1e-4f) return; hx /= hl; hz /= hl;
-    const float ce = cosf(el), se = sinf(el);
-    const float Lx = s_sgn * hx * ce, Ly = s_sgn * se, Lz = s_sgn * hz * ce;   // dunya uzayi
-    float vx = R[0] * Lx + R[1] * Ly + R[2] * Lz, vy = U[0] * Lx + U[1] * Ly + U[2] * Lz, vz = B[0] * Lx + B[1] * Ly + B[2] * Lz;
-    const float vl = sqrtf(vx * vx + vy * vy + vz * vz); if (!(vl > 1e-4f)) return;
-    dv[0] = vx / vl; dv[1] = vy / vl; dv[2] = vz / vl;
-    *(int*)(dev + 0x98) += 1;                                                  // oyunun isik surumu: shader uniform'lari yeniden yuklensin
-    static long long s_ll = 0; const long long nw = NowMs(); if (nw - s_ll > 10000) { s_ll = nw; LOGI("[LIGHT] gunes isigi uygulandi: dunya=(%.2f,%.2f,%.2f) gorunum=(%.2f,%.2f,%.2f) saat=%.2f", Lx, Ly, Lz, dv[0], dv[1], dv[2], ReadHour(g_EngineInstance, nullptr)); }
+    sv.Restore();
+    LOGI("[SKY] on-hazirlik: asama=%d hazir=%d hata=%d sure=%lld ms", g_SkyInitStage, (int)g_SkyGLOk, (int)g_SkyGLFail, (long long)(NowMs() - t0));
+}
+static void DrawSkyGL(uintptr_t game) {
+    if (!game) return;
+    if (!g_SkyGLOk) { SkyEnsureNow(); if (!g_SkyGLOk) return; }
+    GLint vp[4] = {0, 0, 0, 0}; glGetIntegerv(GL_VIEWPORT, vp);
+    double raw = 0; const double hour = ReadHour(game, &raw);
+    const bool haveLight = (NowMs() - g_GameLightMs) < 1500;                   // oyunun isigi taze mi (yoksa: saate gore yedek gunes)
+    SkyParams sp; ComputeSky(hour, &sp, haveLight ? g_GameLightT : nullptr);
+    // v10: bakis yonu GERCEK kameradan (RenderArgs::update'e giden gorunum matrisi): dunya yonleri = gorunum matrisinin satirlari (isim etiketleriyle ayni sozlesme)
+    float R[3], U[3], F[3];
+    if (NowMs() - g_CamMs.load() <= 500) {
+        const float* V = g_CamView;
+        R[0] = V[0]; R[1] = V[4]; R[2] = V[8];  U[0] = V[1]; U[1] = V[5]; U[2] = V[9];  F[0] = -V[2]; F[1] = -V[6]; F[2] = -V[10];
+    } else {                                                                   // kanca henuz veri vermediyse: aktif aracin kamera dunya matrisi
+        const uintptr_t av = LocalActiveVehiclePtr(game); if (!av) return;
+        const float* C = (const float*)(av + V_CAM_WORLD);
+        R[0] = C[0]; R[1] = C[1]; R[2] = C[2];  U[0] = C[4]; U[1] = C[5]; U[2] = C[6];  F[0] = -C[8]; F[1] = -C[9]; F[2] = -C[10];
+    }
+    for (int i = 0; i < 3; ++i) if (!(R[i] == R[i]) || !(U[i] == U[i]) || !(F[i] == F[i])) return;
+    float tanX = 0.80f, tanY = 0.50f;
+    { const float* pj = (const float*)(game + 0xa2b0); const float* pj2 = (const float*)(game + 0xa270);
+      if (pj[5] > 0.3f && pj[5] < 8.f && pj[0] > 0.3f && pj[0] < 8.f) { tanX = 1.f / pj[0]; tanY = 1.f / pj[5]; }
+      else if (pj2[5] > 0.3f && pj2[5] < 8.f && pj2[0] > 0.3f && pj2[0] < 8.f) { tanX = 1.f / pj2[0]; tanY = 1.f / pj2[5]; }
+      else if (vp[3] > 0) { tanX = tanY * (float)vp[2] / (float)vp[3]; } }
+    { static long long s_l = 0; const long long now = NowMs(); if (now - s_l > 10000) { s_l = now; LOGI("[WALKER] gokyuzu GL: saat=%.2f (ham=%.3f) tan=(%.2f,%.2f) vp=%dx%d gunes=(%.2f,%.2f,%.2f) gunduz=%.2f oyun_isigi=%d", hour, raw, tanX, tanY, vp[2], vp[3], sp.sun[0], sp.sun[1], sp.sun[2], sp.day, (int)haveLight); } }
+    const float yMin = SkyMinY(R, U, F, tanX, tanY);
+    if (yMin >= 1.f) return;                                                   // ufuk ekran disinda (yere bakiliyor): cizilecek gokyuzu yok
+    SkyGlSave sv; sv.Save();
+    SkyDrawCore(R, U, F, sp, tanX, tanY, yMin, (float)vp[3], false);
+    sv.Restore();
 }
 // v10: GOT YAMASI. Eski yontem (Substrate ile GLESHandheldRenderDevice::openQueues kancasi) "riskli prologue" nedeniyle atlaniyordu -> gokyuzu/daglar hic cizilmiyordu.
 // Artik libapp.so'nun glClear / glViewport ice aktarim (PLT) girdileri dogrudan degistirilir (fonksiyon govdesine dokunulmaz).
@@ -3469,6 +3652,7 @@ static void my_glViewport_sky(GLint x, GLint y, GLsizei w, GLsizei h) {
     if (g_SkyArm) {
         g_SkyArm = false; ++g_SkyStatVp;
         if (g_SkyWanted && !g_SkyGLFail && g_EngineInstance && w > 0 && h > 0) { DrawSkyGL(g_EngineInstance); ++g_SkyStatDraw; }
+        else SkyPreInitStep((int)w, (int)h);                                   // v13: yaya yokken bile gokyuzu kaynaklari onceden hazirlanir (ilk inis donmasi yok)
     }
 }
 #if defined(__LP64__)
@@ -3642,6 +3826,7 @@ static void OnGameFrame(uintptr_t game) {
     const long long nowF = NowMs(); const long long prevF = g_LastFrameMs.exchange(nowF);
     g_GameTid.store((int)syscall(__NR_gettid));
     const long long gap = prevF ? nowF - prevF : 0;
+    InstallSerializeWrap(game);                                                // v13: kayda yaya girmesin (golge kopya)
     {   // silinen/satilan yayalari temizle (uzak REMOVE orig'i dogrudan cagirir; havuz nesnesi yeniden kullanilabilir)
         std::lock_guard<std::mutex> lk(g_Mu);
         for (size_t i = g_Walkers.size(); i-- > 0;) if (SlotIndexOfVehicle(game, g_Walkers[i].p) < 0) {
@@ -3674,9 +3859,17 @@ static void OnGameFrame(uintptr_t game) {
             }
         } else if (act) s_prevAct = act;
     }
-    if (WK_AUTORECOVER && g_LocalWalker && gap > WK_SLOW_FRAME_MS) {          // yaya varken bir kare cok uzun surdu
-        LOGI("[WALKER] YAVAS KARE: %lld ms (esik %d) -> yaya kaldiriliyor, bu oturumda kapali", gap, (int)WK_SLOW_FRAME_MS);
-        g_Disabled = true; HardRemoveLocalWalker(game);
+    if (gap > 1500) LOGI("[FRAME] uzun kare araligi: %lld ms (yaya=%d, arka plan/kayit/menu olabilir; hicbir sey iptal edilmedi)", gap, (int)(g_LocalWalker != 0));   // v13: sadece kayit
+    {   // v13: 10 sn'de bir durum satiri (oturum logu: fps, arac/yaya sayisi, rol, saat)
+        static long long s_stMs = 0; static int s_stFrames = 0; ++s_stFrames;
+        if (s_stMs == 0) s_stMs = nowF;
+        if (nowF - s_stMs >= 10000) {
+            size_t nw = 0; { std::lock_guard<std::mutex> lk(g_Mu); nw = g_Walkers.size(); }
+            LOGI("[STATE] fps=%.1f arac=%u yaya=%u yerel_yaya=%d aktif=%u oyun_durumu=%d bagli=%d rol=%s saat=%.2f", s_stFrames * 1000.0 / (double)(nowF - s_stMs),
+                 (unsigned)VehicleCount(game), (unsigned)nw, (int)(g_LocalWalker != 0), *(uint32_t*)(game + G_ACTIVE), *(volatile int*)(game + G_STATE),
+                 (int)g_IsConnected.load(), g_IsHost.load() ? "host" : (g_IsClient.load() ? "client" : "tek"), ReadHour(game, nullptr));
+            s_stMs = nowF; s_stFrames = 0;
+        }
     }
     {   // v7: yaya varken aktif arac yaya degilse (arac degistirme dugmesi vb.) yayayi kaldir
         static int s_notActive = 0;
@@ -3701,7 +3894,7 @@ static void OnGameFrame(uintptr_t game) {
         TryResume(game, st);                                                   // v10: yukleme sonrasi yaya olarak devam
         g_OnFoot = g_LocalWalker && st == 6 && LocalActiveVehiclePtr(game) == g_LocalWalker;   // v9: menude/magazada dokunmalar yutulmasin
         g_Dialog = (st == 6 && sub != 0);                                      // v10: oyun penceresi (fiyat/gorev/onay) acik: dokunmalar oyuna, yaya arayuzu gizli
-        g_SkyWanted = g_OnFoot && !g_Disabled;                                 // gokyuzu + daglar sadece YAYADAYKEN (istek)
+        g_SkyWanted = g_OnFoot;                                                  // gokyuzu + daglar sadece YAYADAYKEN (istek)
         if (!g_OnFoot || g_Dialog) { g_JoyX = g_JoyY = 0; g_JoyActive = false; if (!g_OnFoot) g_Run = false; }
         SoundTick(game);
         HudTick(game);
@@ -3768,16 +3961,7 @@ static void DrawImGui(uintptr_t game, const ImVec2& screen) {
     const bool onFoot = (cur == g_LocalWalker);
     SkyTick(game);                                                             // yedek gokyuzu (GL gokyuzu calismazsa)
     if (g_Dialog) { g_BtnMode = 0; return; }                                   // v10: oyun penceresi acik: joystick/Enter/Exit dugmeleri gizli, dokunma oyuna
-    if (onFoot && !g_Disabled) { DrawFootUI(game, screen); return; }
-    if (g_Disabled) {
-        g_BtnMode = 0;
-        ImGui::SetNextWindowPos(ImVec2(screen.x * 0.985f, screen.y * 0.13f), ImGuiCond_Always, ImVec2(1.0f, 0.0f));
-        ImGui::Begin("##walker", nullptr, ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoScrollbar |
-                     ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoFocusOnAppearing);
-        ImGui::TextUnformatted("Walker off (slow frame)");
-        ImGui::End();
-        return;
-    }
+    if (onFoot) { DrawFootUI(game, screen); return; }
     if (IsWalker(cur)) { g_BtnMode = 0; return; }
     // Aractayken: yuvarlak "EXIT" dugmesi alt satirin sonunda (dokunma OnFootTouch'ta)
     ImDrawList* dl = ImGui::GetBackgroundDrawList(); if (!dl) return;
@@ -3808,7 +3992,6 @@ static void my_VehicleAttachTrailerGuard(void* vehicle, void* trailer, void* wor
 }
 
 // TANI + CANLI LOG yardimcilari WK icinde tanimli; dis kodun (my_GameUpdate, my_Vehicle_update, DrawImGui, ModMain) kullanabilmesi icin disari aciliyor
-namespace LL = WK::LL;
 using WK::StageG;
 using WK::StageR;
 using WK::TickRender;
@@ -5653,6 +5836,21 @@ static bool g_FsBad = false;
 static std::atomic<bool> g_FsResendAll(false);                // geri donen cihaz icin: TUM tarlalari tekrar yolla
 static std::vector<uint16_t> g_FsResendQ;                     // sadece oyun thread'i
 static uint32_t g_FsStatSent = 0, g_FsStatApplied = 0, g_FsStatRecv = 0, g_FsStatSkipped = 0;
+// v13: TARLA TUTARLILIGI. (a) Gelen goruntu artik "yerel is sessiz degil" diye ATILMAZ: ertelenir, tarla bazinda tekrar denenir.
+// (b) Host, tarlalari yavasca (hash degistiyse hemen, degismediyse 3 dk'da bir) idx|0x8000 bayragiyla clientlara yeniden yollar (host = gercek).
+// (c) Hosttan donus / client donusu sonrasi host bir sure yenileme yollamaz (clientin arka plandaki isini ezmesin).
+static const uint16_t kFsRefreshFlag = 0x8000;
+static const long long kFsLocalHoldMs = 6000;                 // bu tarlayi bu kadar sure once biz degistirdiysek gelen goruntu uygulanmaz
+static const long long kFsRefreshIdleMs = 180000;             // degismemis tarla en az bu aralikla yeniden yollanir
+static std::vector<long long> g_FsLastLocalMs;                // tarla bazinda: son YEREL degisiklik (oyun thread'i)
+static std::vector<uint32_t> g_FsRefHash;                     // host: tarla bazinda son yenileme hash'i
+static std::vector<long long> g_FsRefMs;                      // host: tarla bazinda son yenileme zamani
+static size_t g_FsRefCursor = 0; static long long g_FsRefTickMs = 0;
+static std::atomic<long long> g_FsRefreshHoldUntil(0);        // host: bu ana kadar yenileme yok
+struct FsDeferred { FieldSnapPacket p; long long ms; };
+static std::vector<FsDeferred> g_FsDeferred;                  // oyun thread'i: uygulanmayi bekleyen goruntuler
+static uint32_t g_FsStatRefSent = 0, g_FsStatRefApplied = 0, g_FsStatDropped = 0;
+static long long g_FsSumLogMs = 0;
 
 static uintptr_t FsFieldAt(uintptr_t map, uint32_t i) {
     const uintptr_t cells = *(volatile uintptr_t*)(map + 0x18);
@@ -5700,7 +5898,10 @@ static void FieldSnapFrame(uintptr_t game) {
     if (cnt == 0 || cnt > kFsMaxCells) return;
     const long long localOp = g_LastLocalFieldOpMs.load();
 
-    // 1) Duraklayan cihazdan gelen tarla goruntulerini uygula (kendimiz calismiyorsak).
+    // 1) Gelen tarla goruntuleri (duraklama devri / tam yeniden gonderim / host yenilemesi). v13: atilmaz, TARLA BAZINDA ertelenir:
+    //    - bu tarlayi son 6 sn'de biz degistirdiysek uygulanmaz; goruntu geldikten SONRA degistirdiysek goruntu eskidir -> atilir
+    //      (isimiz zaten ag uzerinden hosta/diger cihaza gidiyor; hostun hash'i degisince yeni goruntu gelir)
+    //    - yerel tarla isi son 0.8 sn'deyse kare basina beklenir (kismi uygulama olmasin)
     std::vector<FieldSnapPacket> snaps;
     {
         std::lock_guard<std::mutex> lock(g_VehicleEventMutex);
@@ -5708,28 +5909,41 @@ static void FieldSnapFrame(uintptr_t game) {
     }
     if (!snaps.empty()) {
         g_FsStatRecv += (uint32_t)snaps.size();
-        const bool quiet = localOp == 0 || (now - localOp) >= kFsApplyQuietMs;
-        if (g_FsValid.load() && g_FieldDeserFn && quiet) {
-            for (size_t k = 0; k < snaps.size(); ++k) {
-                FieldSnapPacket& sp = snaps[k];
-                const uintptr_t f = FsFieldAt(map, sp.idx);
-                if (!f) continue;
-                uint8_t cur[kFsB1 + kFsB2];
-                if (!FsRead(f, cur) || FsHash(cur) == FsHash(sp.d)) continue;
-                g_FieldDeserFn((void*)f, sp.d, false);
-                uint8_t after[kFsB1 + kFsB2];
-                if (FsRead(f, after)) {
-                    std::lock_guard<std::mutex> lock(g_FsMutex);
-                    if (sp.idx < g_FsKnown.size()) g_FsKnown[sp.idx] = FsHash(after);   // yerel degisiklik sanilmasin
-                }
-                ++g_FsStatApplied;
-            }
-        } else {
-            g_FsStatSkipped += (uint32_t)snaps.size();
+        for (size_t k = 0; k < snaps.size(); ++k) {
+            bool rep = false;
+            for (size_t q = 0; q < g_FsDeferred.size(); ++q) if (g_FsDeferred[q].p.idx == snaps[k].idx) { g_FsDeferred[q].p = snaps[k]; g_FsDeferred[q].ms = now; rep = true; break; }
+            if (!rep) { FsDeferred dq; dq.p = snaps[k]; dq.ms = now; g_FsDeferred.push_back(dq); }
         }
-        LOGI("[FIELDSNAP] duraklama devri alindi=%u uygulanan=%u atlanan=%u (yerel is sessiz=%d)", (unsigned)snaps.size(),
-             (unsigned)g_FsStatApplied, (unsigned)g_FsStatSkipped, (int)quiet);
-        g_FsStatApplied = g_FsStatSkipped = 0;
+        if (g_FsDeferred.size() > 600) g_FsDeferred.erase(g_FsDeferred.begin(), g_FsDeferred.begin() + (g_FsDeferred.size() - 600));
+    }
+    if (!g_FsDeferred.empty() && g_FsValid.load() && g_FieldDeserFn && (localOp == 0 || (now - localOp) >= 800)) {
+        uint32_t appliedNow = 0, refApplied = 0, dropped = 0;
+        size_t q = 0;
+        while (q < g_FsDeferred.size() && appliedNow < 12) {
+            FieldSnapPacket sp = g_FsDeferred[q].p; const long long arrMs = g_FsDeferred[q].ms;
+            const uint16_t idx = (uint16_t)(sp.idx & 0x7FFF); const bool isRef = (sp.idx & kFsRefreshFlag) != 0;
+            const uintptr_t f = FsFieldAt(map, idx);
+            const long long lastLocal = idx < g_FsLastLocalMs.size() ? g_FsLastLocalMs[idx] : 0;
+            bool erase = false;
+            if (!f || now - arrMs > 120000 || (lastLocal != 0 && lastLocal > arrMs)) { erase = true; ++dropped; }       // gecersiz / cok eski / bizim isimiz daha yeni
+            else if (lastLocal != 0 && now - lastLocal < kFsLocalHoldMs) { ++q; continue; }                          // az once biz isledik: sonra tekrar dene
+            else {
+                uint8_t cur[kFsB1 + kFsB2];
+                if (FsRead(f, cur) && FsHash(cur) != FsHash(sp.d)) {
+                    g_FieldDeserFn((void*)f, sp.d, false);
+                    uint8_t after[kFsB1 + kFsB2];
+                    if (FsRead(f, after)) {
+                        std::lock_guard<std::mutex> lock(g_FsMutex);
+                        if (idx < g_FsKnown.size()) g_FsKnown[idx] = FsHash(after);   // yerel degisiklik sanilmasin
+                    }
+                    ++appliedNow; if (isRef) ++refApplied;
+                }
+                erase = true;
+            }
+            if (erase) g_FsDeferred.erase(g_FsDeferred.begin() + q); else ++q;
+        }
+        g_FsStatApplied += appliedNow; g_FsStatRefApplied += refApplied; g_FsStatDropped += dropped;
+        if (appliedNow || dropped) LOGI("[FIELDSNAP] goruntu: uygulanan=%u (yenileme=%u) atilan=%u bekleyen=%u", appliedNow, refApplied, dropped, (unsigned)g_FsDeferred.size());
     }
 
     // 1b) Geri donen (arka plandan / ayarlardan) cihaz icin tum tarlalari kare basina birkac tane yolla.
@@ -5747,6 +5961,23 @@ static void FieldSnapFrame(uintptr_t game) {
         g_FsResendQ.pop_back();
     }
 
+    // 1c) HOST: tarlalari yavasca clientlara yenile (host = gercek). Hash degistiyse hemen, degismediyse 3 dk'da bir; en cok 0.5 sn'de 2 tarla.
+    if (g_IsHost.load() && g_FsValid.load() && g_FsResendQ.empty() && now >= g_FsRefreshHoldUntil.load() && cnt < 0x7FFF && now - g_FsRefTickMs >= 500) {
+        g_FsRefTickMs = now;
+        if (g_FsRefHash.size() != cnt) { g_FsRefHash.assign(cnt, 0); g_FsRefMs.assign(cnt, 0); g_FsRefCursor = 0; }
+        const size_t nf = g_FsFields.size(); int sent = 0;
+        for (int step = 0; step < 40 && nf && sent < 2; ++step) {
+            const uint16_t i = g_FsFields[g_FsRefCursor % nf]; ++g_FsRefCursor;
+            const uintptr_t f = FsFieldAt(map, i); if (!f || i >= g_FsRefHash.size()) continue;
+            uint8_t d[kFsB1 + kFsB2];
+            if (!FsRead(f, d)) continue;
+            const uint32_t h = FsHash(d);
+            if (h == g_FsRefHash[i] && now - g_FsRefMs[i] < kFsRefreshIdleMs) continue;
+            if (!QueueFieldSnap((uint16_t)(i | kFsRefreshFlag), d)) break;
+            g_FsRefHash[i] = h; g_FsRefMs[i] = now; ++sent; ++g_FsStatRefSent;
+        }
+    }
+
     // 2) Saniyede bir YEREL tarama: bu cihazin son zamanlarda isledigi tarlalari isaretle.
     if (now - g_FsScanMs < 1000) return;
     g_FsScanMs = now;
@@ -5754,6 +5985,7 @@ static void FieldSnapFrame(uintptr_t game) {
     if (!g_FsValid.load()) {
         g_FsKnown.assign(cnt, 0);
         g_FsDirtyMs.assign(cnt, 0);
+        g_FsLastLocalMs.assign(cnt, 0);
         g_FsFields.clear();
         for (uint32_t i = 0; i < cnt; ++i) {
             const uintptr_t f = FsFieldAt(map, i);
@@ -5772,6 +6004,7 @@ static void FieldSnapFrame(uintptr_t game) {
         return;
     }
     const bool localRecent = localOp != 0 && (now - localOp) < 4000;
+    uint32_t comb = 2166136261u;
     for (size_t k = 0; k < g_FsFields.size(); ++k) {
         const uint32_t i = g_FsFields[k];
         if (i >= g_FsKnown.size()) continue;
@@ -5780,9 +6013,16 @@ static void FieldSnapFrame(uintptr_t game) {
         uint8_t d[kFsB1 + kFsB2];
         if (!FsRead(f, d)) continue;
         const uint32_t h = FsHash(d);
+        comb = (comb ^ h) * 16777619u;
         if (h == g_FsKnown[i]) continue;
         g_FsKnown[i] = h;
-        if (localRecent) g_FsDirtyMs[i] = now;
+        if (localRecent) { g_FsDirtyMs[i] = now; if (i < g_FsLastLocalMs.size()) g_FsLastLocalMs[i] = now; }
+    }
+    if (now - g_FsSumLogMs >= 20000) {                                       // tani: iki cihazin logunda bu ozet AYNI olmali (tarlalar tutarliysa)
+        g_FsSumLogMs = now;
+        LOGI("[FSUM] rol=%s tarla=%u ozet=%08x bekleyen=%u yenileme_yollanan=%u yenileme_uygulanan=%u atilan=%u", g_IsHost.load() ? "host" : "client",
+             (unsigned)g_FsFields.size(), (unsigned)comb, (unsigned)g_FsDeferred.size(), g_FsStatRefSent, g_FsStatRefApplied, g_FsStatDropped);
+        g_FsStatRefSent = g_FsStatRefApplied = g_FsStatDropped = 0;
     }
 }
 
@@ -6390,6 +6630,7 @@ static void OnGameResumed(long long gapMs) {
     if (!g_IsConnected.load() || !g_VehNetArmed.load()) return;
     LOGI("[RESUME] oyun geri dondu (bosluk=%lld ms) rol=%s", gapMs, g_IsHost.load() ? "host" : "client");
     const uint8_t t = g_IsHost.load() ? PACKET_HOST_RESUME : PACKET_RESUME;
+    if (g_IsHost.load()) g_FsRefreshHoldUntil.store(NowMs() + 25000);       // v13: clientlar arka plandaki islerini hosta yollasin; host eski goruntuyle ezmesin
     QueueVehicleEvent(&t, 1);
     if (!g_IsHost.load()) g_SyncRequestOut.store(true);
 }
@@ -8154,6 +8395,7 @@ static bool ProcessPackets(uint8_t* buf, size_t& buffered, int peerId, std::vect
             if (kSyncMission && g_IsHost.load() && fromPeer) g_MissionDoneFlag.store(true);
         } else if (type == PACKET_RESUME) {
             if (g_IsHost.load() && fromPeer) {                 // client geri dondu: tarlalar + duran araclar + normal tam senkron
+                g_FsRefreshHoldUntil.store(NowMs() + 20000);   // v13: tum tarlalar zaten yollaniyor, yenileme beklesin
                 g_FsResendAll.store(true);
                 g_RestResendAll.store(true);
                 g_HostForceTable.store(true);
@@ -10145,7 +10387,6 @@ void DrawImGui() {
     TickRender();                                                              // TANI: cizim thread'i canli mi (watchdog)
     WK::AssetsTick(g_EngineInstance);                                          // v12: oda menusu acikken de varliklar yuklensin (yaya devam kaydi icin)
     if (!g_IsMultiplayerMenuActive) WK::DrawImGui(g_EngineInstance, screen);   // WALKER: Exit/Enter Vehicle dugmeleri (+ varlik yukleme: GL thread)
-    LL::Draw(screen);                                                          // CANLI LOG paneli (libmultiplayermod + libapp)
 
     if (g_IsMultiplayerMenuActive) {
         ImDrawList* bg = ImGui::GetBackgroundDrawList();
@@ -10796,6 +11037,7 @@ void my_GameUpdateStateBase(void* thiz, float param_1, uint32_t param_2, uint32_
     {
         const long long nowSb = NowMs();
         const long long prevSb = g_LastStateBaseMs.load();
+        if (prevSb > 0 && nowSb - prevSb > 2500) LOGI("[LIFECYCLE] oyun dongusu %lld ms durdu (arka plan / menu / kayit); durum=%u", nowSb - prevSb, thiz ? *(volatile uint32_t*)((uintptr_t)thiz + 0x64) : 0u);
         if (prevSb > 0 && nowSb - prevSb > 2500 && *(volatile uint32_t*)(thiz ? (uintptr_t)thiz + 0x64 : 0) == 6) OnGameResumed(nowSb - prevSb);
     }
     g_LastStateBaseMs.store(NowMs());   // dunya mantigi calisiyor (host duraklama algisi icin)
@@ -11082,7 +11324,8 @@ void* my_renderStartMenuMain(void* thiz, void* p1, void* p2, void* p3) {
 // ========================================================================
 __attribute__((constructor))
 void ModMain() {
-    LOGI(">>> MULTIPLAYER MOD STARTING <<< build=shopfix-46+walker-v12");
+    SL::Open("shopfix-47+walker-v13");
+    LOGI(">>> MULTIPLAYER MOD STARTING <<< build=shopfix-47+walker-v13");
 
     ResetVehicleSyncState();
     std::thread(StartPONGResponderThread).detach();
@@ -11159,7 +11402,6 @@ void ModMain() {
         HookChecked("Game::removeVehicle", remVeh, (void*)my_Game_removeVehicle, (void**)&orig_Game_removeVehicle, false);
         g_VehicleHooksOk = addVeh && remVeh && g_VehicleDestroyFn;
         WK::Init(appLib);                                      // WALKER: sembolleri bul + cizim kancalari (Vehicle::update'e DOKUNMAZ)
-        LL::Start();                                           // CANLI LOG: logcat okuyucu thread
 
         // Ortak para: hayalet varliklarin gelir/giderini geri alan kancalar (riskli prologue'da TAKILMAZ).
         if (kSharedMoney && kGuardGhostMoney) {
