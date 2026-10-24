@@ -2290,6 +2290,7 @@ static Entity_toggle_t g_VehicleAiStopFn = nullptr;                    // Vehicl
 static bool g_AiMirrored[VEHICLE_SLOT_LIMIT];                          // isci bu cihazda UZAKTAN baslatildi (konum yayinlama)
 static std::atomic<long long> g_RemoteHornUntilMs(0);                  // uzaktan korna: bu ana kadar acik
 static std::atomic<int> g_RemoteHornOrigin(-1);                         // kornaya basan uzak oyuncu
+static std::atomic<bool> g_RemoteHornWhistle(false);                    // v14: uzak korna yayadan (isik) mi? (kind 3 paketi flags bit 1)
 static bool g_HornForced = false;
 
 struct TrailerTrack { uintptr_t tp; uintptr_t av; uint32_t levelWord; uint32_t typeWord; uint64_t lastMs; };
@@ -2490,6 +2491,19 @@ static SwitchToState_t orig_SwitchToState = nullptr;
 static void my_SwitchToState(void* game);
 typedef void (*SetMasterVol_t)(void*, uint32_t);                    // VehicleSound::setMasterVolume(this, float bits)
 static SetMasterVol_t fnSetMasterVol = nullptr;
+// v14: yayadayken cevre sesleri / adim / isik icin oyun fonksiyonlari ve ozel ses nesneleri (kullanim: [W20b])
+typedef void (*VsStart_t)(void* self, int type, uint32_t speedBits, int playerDriven);   // VehicleSound::start(VEHICLE_TYPE, float, bool)
+typedef void (*VsState_t)(void* self, uint32_t speedBits, uint32_t rawBits);              // VehicleSound::setVehicleState(float, float)
+typedef void (*VsWork_t)(void* self, int work);                                           // VehicleSound::setWork(WORK_TYPE)
+typedef void (*AsPlay_t)(void* self, float vol, float pitch, bool loop);                  // AudioSource::play(float, float, bool)
+typedef uint32_t (*BufLoad_t)(void* self, const char* path, void* sysDev, void* audDev);  // AudioBuffer::load(const char*, SystemDevice*, AudioDevice*)
+typedef void (*SrcLoad_t)(void* self, void* dev, uint32_t bufId);                         // AudioSource::load(AudioDevice*, uint)
+static VsStart_t fnVsStart = nullptr; static VsState_t fnVsState = nullptr; static VsWork_t fnVsWork = nullptr;
+static AsPlay_t fnAsPlay = nullptr; static BufLoad_t fnBufLoad = nullptr; static SrcLoad_t fnSrcLoad = nullptr;
+struct AudObj { void* dev; uint32_t id; };                                                // AudioBuffer / AudioSource bellek duzeni: {cihaz, kimlik}
+static AudObj g_StepBuf = { nullptr, 0xFFFFFFFFu }, g_StepSrc = { nullptr, 0xFFFFFFFFu };
+static AudObj g_WhBuf = { nullptr, 0xFFFFFFFFu }, g_WhSrc = { nullptr, 0xFFFFFFFFu };
+static bool g_StepOk = false, g_WhOk = false, g_CustomTried = false;
 static volatile bool  g_Run = false;                               // v9: kosma acik mi (dugme ile acilip kapanir)
 static volatile float g_BtnCX = -1, g_BtnCY = -1, g_BtnR = 0;      // v9: Enter/Exit dugmesi (piksel; DrawImGui yazar, dokunma kodu okur)
 static volatile int   g_BtnMode = 0;                               // 0 yok, 1 = Exit Vehicle (aractayken), 2 = Enter Vehicle + Run (yayadayken)
@@ -2859,6 +2873,7 @@ static inline bool InCircle(float x, float y, float cx, float cy, float r) { ret
 // Enter/Exit dugmesi (g_BtnCX/CY/R) ve onun ustundeki Run dugmesi (yayadayken)
 static void RunBtnGeom(float* cx, float* cy, float* r) { *r = g_BtnR * 0.86f; *cx = g_BtnCX; *cy = g_BtnCY - g_BtnR * 2.25f; }
 static bool GameHudHit(uintptr_t game, float x, float y, float W, float H);   // asagida
+static bool MapPanelHit(uintptr_t game, float x, float y, float W, float H);   // asagida (v14)
 // v10: dokunmalar POINTER (parmak) bazinda dagitilir: joystick/bakis/Enter/Run bizim (yutulur), ust serit ve oyunun kendi alt satir dugmeleri OYUNUN (gecer).
 // Boylece joystick basili dururken baska parmakla oyun dugmelerine basilabilir ve yayadayken de calisirlar.
 static bool OnFootTouch(const AInputEvent* ev, int32_t rawAction, float W, float H) {
@@ -2889,7 +2904,7 @@ static bool OnFootTouch(const AInputEvent* ev, int32_t rawAction, float W, float
             float rx, ry, rr; RunBtnGeom(&rx, &ry, &rr);
             if (g_BtnR > 1.f && InCircle(x, y, g_BtnCX, g_BtnCY, g_BtnR * 1.15f)) { g_ReqEnter = true; }
             else if (g_BtnR > 1.f && InCircle(x, y, rx, ry, rr * 1.15f)) { g_Run = !g_Run; }
-            else if (y < H * 0.12f || GameHudHit(g_EngineInstance, x, y, W, H)) {   // ust serit / oyunun kendi dugmeleri: bu parmak OYUNUN
+            else if (y < H * 0.12f || GameHudHit(g_EngineInstance, x, y, W, H) || MapPanelHit(g_EngineInstance, x, y, W, H)) {   // ust serit / oyunun kendi dugmeleri / ACIK HARITA: bu parmak OYUNUN
                 if (s_gameN < 8) s_game[s_gameN++] = id;
                 eat = false;
             }
@@ -2936,6 +2951,11 @@ static void StripWalkerVehicleHud(uintptr_t self) {
     if (!IsWalker(self)) return;
     *(float*)(self + 0x440) = 0.0f;  // mevcut yakıt
     *(float*)(self + 0x444) = 0.0f;  // yakıt kapasitesi: HUD yakıt oranını kapat
+    // v14: yayalar benzin istasyonundan yakıt ALMASIN (Vehicle::update: +0x1c0 = istasyon menzilinde, +0x1b4 yakıt < +0x1b8 kapasite ise
+    // depo dolar ve game+0x6a0 parası düşer). Depoyu hep dolu tut + menzil bayrağını sıfırla -> hiç alım yapılmaz, para gitmez.
+    float cap = *(float*)(self + 0x1b8); if (!(cap >= 100.0f)) { cap = 100.0f; *(float*)(self + 0x1b8) = cap; }
+    *(float*)(self + 0x1b4) = cap;
+    *(uint8_t*)(self + 0x1c0) = 0;
 }
 
 // ------------------------------- [W15] CIZIM -------------------------------
@@ -3014,6 +3034,12 @@ static void Init(void* appLib) {
     fnBindAttrs = (BindAttrs_t)Sym(appLib, "", "_ZN24GLESHandheldRenderDevice20bindShaderAttributesE");
     fnActiveChanged = (ActiveChanged_t)Sym(appLib, "_ZN4Game20activeVehicleChangedEv", "_ZN4Game20activeVehicleChanged");
     fnSetMasterVol = (SetMasterVol_t)Sym(appLib, "_ZN12VehicleSound15setMasterVolumeEf", "_ZN12VehicleSound15setMasterVolumeE");   // v8: yayadayken motor sesi kapatma
+    fnVsStart = (VsStart_t)Sym(appLib, "_ZN12VehicleSound5startENS_12VEHICLE_TYPEEfb", "_ZN12VehicleSound5startE");                 // v14: yayadayken cevre sesleri
+    fnVsState = (VsState_t)Sym(appLib, "_ZN12VehicleSound15setVehicleStateEff", "_ZN12VehicleSound15setVehicleStateE");
+    fnVsWork  = (VsWork_t)Sym(appLib, "_ZN12VehicleSound7setWorkENS_9WORK_TYPEE", "_ZN12VehicleSound7setWorkE");
+    fnAsPlay  = (AsPlay_t)Sym(appLib, "_ZN11AudioSource4playEffb", "_ZN11AudioSource4playE");
+    fnBufLoad = (BufLoad_t)Sym(appLib, "_ZN11AudioBuffer4loadEPKcP27AndroidHandheldSystemDeviceP26AndroidHandheldAudioDevice", "_ZN11AudioBuffer4loadE");
+    fnSrcLoad = (SrcLoad_t)Sym(appLib, "_ZN11AudioSource4loadEP26AndroidHandheldAudioDevicej", "_ZN11AudioSource4loadE");
     // Vehicle::update'i KANCALAMIYORUZ: sizin my_Vehicle_update tutuyor -> WK::AfterVehicleUpdate oradan cagrilir.
     struct H { const char* n; const char* prefix; void* repl; void** orig; };
     const H hooks[] = {
@@ -3315,15 +3341,212 @@ static void my_SwitchToState(void* game) {
 
 // ------------------------------- [W20] v8: SES (motor) -------------------------------
 // VehicleSound master sesi 0'lanir (setVehicleState her kare sesi bununla carpar [D: this+0x124]); yayadan inince eski deger geri yazilir.
+static uint32_t g_SndSaved = 0x3f800000u; static bool g_SndMuted = false;
+static bool g_AmbActive = false;                                          // v14: yayadayken en yakin aracin sesi aciksa SoundTick ana sesi 0'lamaz
 static void SoundTick(uintptr_t game) {
-    static bool s_muted = false; static uint32_t s_saved = 0x3f800000u;
     if (!fnSetMasterVol || !game) return;
     void* snd = *(void**)(game + 0xa450); if (!snd) return;
     if (g_OnFoot) {
-        if (!s_muted) { s_muted = true; s_saved = *(uint32_t*)((uintptr_t)snd + 0x124); LOGI("[WALKER] motor sesi kapatildi (eski ses=%08x)", s_saved); }
-        fnSetMasterVol(snd, 0u);
-    } else if (s_muted) {
-        fnSetMasterVol(snd, s_saved); s_muted = false; LOGI("[WALKER] motor sesi geri acildi");
+        if (!g_SndMuted) { g_SndMuted = true; g_SndSaved = *(uint32_t*)((uintptr_t)snd + 0x124); LOGI("[WALKER] motor sesi kapatildi (eski ses=%08x)", g_SndSaved); }
+        if (!g_AmbActive) fnSetMasterVol(snd, 0u);
+    } else if (g_SndMuted) {
+        g_AmbActive = false; fnSetMasterVol(snd, g_SndSaved); g_SndMuted = false; LOGI("[WALKER] motor sesi geri acildi");
+    }
+}
+
+// ------------------------------- [W20b] v14: YAYADAYKEN CEVRE SESLERI -------------------------------
+// Oyun TEK bir VehicleSound (Game+0xA450) kullanir ve sadece aktif aracin sesini calar; yayadayken (aktif arac = sahte yaya) onu 0'lamistik.
+// v14: yayadayken en yakin "calisan" aracin (hareketli / AI / baska oyuncu surucu) sesi, mesafeye gore kisilarak calinir:
+//   - arac degisince VehicleSound::start(tip, azami hiz, false) ile o aracin motor sesi baslatilir [D: Game::activeVehicleChanged ayni argumanlari verir],
+//   - her kare (tum aracların update'inden SONRA) setVehicleState ile o aracin hizi yazilir, setWork ile hasat/pulluk/puskurtme sesi secilir,
+//   - ana ses = kullanicinin sesi x mesafe katsayisi. Boru bosaltma / silo dolum sesleri oyunun kendi "timed sound" mekanizmasidir; ana ses acikken duyulur.
+// Adim sesi (step.p1d) ve isik (whistle.p1d): APK'da assets/audio/ altinda VARSA yuklenir, yoksa adim sesi yok, isik yerine yuksek perdeli korna.
+static bool WhistleReady() { return g_WhOk && fnAsPlay; }
+static void PlayWhistle(float vol) { if (WhistleReady()) fnAsPlay(&g_WhSrc, vol, 1.0f, false); }
+static uint32_t Rd32(const uint8_t* p) { return (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24); }
+static uint32_t Rd16(const uint8_t* p) { return (uint32_t)p[0] | ((uint32_t)p[1] << 8); }
+// APK (zip) merkez dizininde dosya adi var mi? Oyunun AudioBuffer::load'u olmayan dosyada coker; bu yuzden once kendimiz bakariz.
+static bool ApkHasEntry(const char* apk, const char* entry) {
+    FILE* f = fopen(apk, "rb"); if (!f) return false;
+    bool found = false;
+    if (fseek(f, 0, SEEK_END) == 0) {
+        const long sz = ftell(f); const long tail = sz < 65600 ? sz : 65600;
+        std::vector<uint8_t> t((size_t)(tail > 0 ? tail : 0));
+        if (tail > 22 && fseek(f, sz - tail, SEEK_SET) == 0 && fread(t.data(), 1, (size_t)tail, f) == (size_t)tail) {
+            for (long i = tail - 22; i >= 0; --i) {
+                if (t[(size_t)i] == 0x50 && t[(size_t)i + 1] == 0x4b && t[(size_t)i + 2] == 5 && t[(size_t)i + 3] == 6) {
+                    const uint32_t cdSize = Rd32(&t[(size_t)i + 12]), cdOff = Rd32(&t[(size_t)i + 16]);
+                    if (cdSize > 0 && cdSize < 16u * 1024u * 1024u && (long)cdOff + (long)cdSize <= sz) {
+                        std::vector<uint8_t> cd(cdSize);
+                        if (fseek(f, (long)cdOff, SEEK_SET) == 0 && fread(cd.data(), 1, cdSize, f) == cdSize) {
+                            const size_t el = strlen(entry); size_t p = 0;
+                            while (p + 46 <= cdSize && cd[p] == 0x50 && cd[p + 1] == 0x4b && cd[p + 2] == 1 && cd[p + 3] == 2) {
+                                const size_t nl = Rd16(&cd[p + 28]), xl = Rd16(&cd[p + 30]), cl = Rd16(&cd[p + 32]);
+                                if (p + 46 + nl > cdSize) break;
+                                if (nl == el && memcmp(&cd[p + 46], entry, el) == 0) { found = true; break; }
+                                p += 46 + nl + xl + cl;
+                            }
+                        }
+                    }
+                    break;
+                }
+            }
+        }
+    }
+    fclose(f);
+    return found;
+}
+// APK yolu: libapp.so'nun yolundan ("...apk!/lib/..." ya da ".../lib/arm/libapp.so" -> yandaki base.apk).
+static bool FindApkPath(char* out, size_t n) {
+    Dl_info di; if (!fnBufLoad || !dladdr((void*)fnBufLoad, &di) || !di.dli_fname) return false;
+    char tmp[512]; snprintf(tmp, sizeof tmp, "%s", di.dli_fname);
+    char* bang = strstr(tmp, "!/");
+    if (bang) { *bang = 0; snprintf(out, n, "%s", tmp); return access(out, R_OK) == 0; }
+    char* lib = strstr(tmp, "/lib/"); if (!lib) return false;
+    *lib = 0;
+    snprintf(out, n, "%s/base.apk", tmp); if (access(out, R_OK) == 0) return true;
+    snprintf(out, n, "%s.apk", tmp); return access(out, R_OK) == 0;
+}
+static void CustomAudioInit(uintptr_t game) {
+    if (g_CustomTried) return;
+    const uintptr_t sysDev = *(uintptr_t*)(game + 0x74), audDev = *(uintptr_t*)(game + 0x80);
+    if (!sysDev || !audDev || !fnBufLoad || !fnSrcLoad) return;                 // henuz hazir degil: sonraki karede tekrar
+    g_CustomTried = true;
+    char apk[600] = {0};
+    if (!FindApkPath(apk, sizeof apk)) { LOGI("[SES] apk yolu bulunamadi: ozel sesler yok"); return; }
+    const bool hasStep = ApkHasEntry(apk, "assets/audio/step.p1d"), hasWh = ApkHasEntry(apk, "assets/audio/whistle.p1d");
+    LOGI("[SES] apk=%s step.p1d=%d whistle.p1d=%d", apk, (int)hasStep, (int)hasWh);
+    if (hasStep) {
+        fnBufLoad(&g_StepBuf, "audio/step.p1d", (void*)sysDev, (void*)audDev);
+        if (g_StepBuf.id != 0xFFFFFFFFu) { fnSrcLoad(&g_StepSrc, (void*)audDev, g_StepBuf.id); g_StepOk = (g_StepSrc.id != 0xFFFFFFFFu); }
+    }
+    if (hasWh) {
+        fnBufLoad(&g_WhBuf, "audio/whistle.p1d", (void*)sysDev, (void*)audDev);
+        if (g_WhBuf.id != 0xFFFFFFFFu) { fnSrcLoad(&g_WhSrc, (void*)audDev, g_WhBuf.id); g_WhOk = (g_WhSrc.id != 0xFFFFFFFFu); }
+    }
+    LOGI("[SES] ozel sesler: adim=%d isik=%d", (int)g_StepOk, (int)g_WhOk);
+}
+static bool RemoteDrivenVehicle(uintptr_t v) {
+    const int nid = NetIdOfVehicle(v); if (nid < 0) return false;
+    uint8_t owner = VEHICLE_OWNER_NONE;
+    { std::lock_guard<std::mutex> lk(g_VehicleStateMutex); owner = g_VehicleAuthority[nid].ownerId; }
+    return owner != VEHICLE_OWNER_NONE && owner != g_LocalPlayerId.load();
+}
+// Oyunun kendi kurali [D: Game::updateStateGame, setWork cagrisinin oncesi]: 3 = bicerdover kesici acik (harman), 2 = balya, 1 = puskurtme, 4 = pulluk.
+static int AmbientWorkType(uintptr_t v) {
+    int w = 0;
+    if (*(uint8_t*)(v + 0x328) && *(uint8_t*)(v + 0x498)) w = 3;
+    if (*(uint32_t*)(v + 0x55c) == 0) {                                          // romork bagli degilse alet sesleri
+        const uintptr_t tool = *(uintptr_t*)(v + 0x560);
+        if (tool > 0x10000u) {
+            const uint32_t f = *(uint32_t*)tool;
+            if (f & 0x400u) w = 2;
+            else if (*(uint8_t*)(tool + 0x230)) {
+                if ((f & 0x100u) && *(float*)(tool + 0x45c) > 0.0f) w = 1;
+                else if ((f & 0x200u) && fabsf(*(float*)(v + 0x564)) > 1.4f) w = 4;
+            }
+        }
+    }
+    return w;
+}
+struct StepTrk { uintptr_t v; float x, y, acc; };
+static StepTrk g_StepTrk[16]; static int g_StepRR = 0;
+static const float kAmbFull = 10.0f, kAmbMax = 150.0f;                          // m: tam ses / duyulmaz
+static float AmbGain(float d) { if (d <= kAmbFull) return 1.0f; if (d >= kAmbMax) return 0.0f; const float t = (kAmbMax - d) / (kAmbMax - kAmbFull); return t * t; }
+// Oyun karesinin SONUNDA (tum Vehicle::update'ler bittikten sonra) cagrilir.
+static void AmbientPost(uintptr_t game) {
+    if (!game) return;
+    CustomAudioInit(game);
+    const long long now = NowMs();
+    uintptr_t wk[16]; int nw = 0;
+    { std::lock_guard<std::mutex> lk(g_Mu); for (size_t i = 0; i < g_Walkers.size() && nw < 16; ++i) wk[nw++] = g_Walkers[i].p; }
+    // dinleyici konumu: yayadaysak yaya, degilse aktif arac
+    float lx = 0, ly = 0; bool haveL = false;
+    {
+        const uintptr_t lv = (g_OnFoot && g_LocalWalker) ? g_LocalWalker : LocalActiveVehiclePtr(game);
+        const uintptr_t lb = lv ? *(uintptr_t*)(lv + V_PHYS_BODY) : 0;
+        if (lb) { lx = *(float*)(lb + B_X); ly = *(float*)(lb + B_Y); haveL = (lx == lx && ly == ly); }
+    }
+    // ---- 1) arac / hasat sesleri (yalnizca yayadayken)
+    static uintptr_t s_amb = 0; static long long s_swMs = 0; static float s_lastGain = -1.0f; static int s_lastWork = 0; static bool s_wasFoot = false;
+    if (g_OnFoot && !s_wasFoot) { s_amb = 0; s_lastGain = -1.0f; }                // yeni yaya: oyun walker icin start() yapti, bizimkini yeniden baslat
+    s_wasFoot = g_OnFoot;
+    void* snd = *(void**)(game + 0xa450);
+    const bool sndOk = snd && *(int*)((uintptr_t)snd + 4) != 0 && fnVsStart && fnVsState && fnSetMasterVol;
+    if (g_OnFoot && haveL && sndOk) {
+        uintptr_t best = 0; float bestD = 1.0e9f; float curD = 1.0e9f; bool curRun = false;
+        const uint32_t n = VehicleCount(game);
+        for (uint32_t i = 0; i < n; ++i) {
+            const uintptr_t v = RawVehicleSlot(game, i);
+            if (!v) continue;
+            bool isW = false; for (int k = 0; k < nw; ++k) if (wk[k] == v) { isW = true; break; }
+            if (isW) continue;
+            const uintptr_t b = *(uintptr_t*)(v + V_PHYS_BODY); if (!b) continue;
+            const float dx = *(float*)(b + B_X) - lx, dy = *(float*)(b + B_Y) - ly, d = sqrtf(dx * dx + dy * dy);
+            if (!(d == d) || d > kAmbMax) continue;
+            const float sp = fabsf(*(float*)(v + 0x564));
+            bool run = (sp == sp && sp > 0.5f) || (*(int*)(v + 0x730) != 0);
+            if (!run) run = RemoteDrivenVehicle(v);
+            if (!run) continue;
+            if (v == s_amb) { curD = d; curRun = true; }
+            if (d < bestD) { bestD = d; best = v; }
+        }
+        uintptr_t pick = 0; float pickD = 0.0f;
+        if (s_amb && curRun && !(best && best != s_amb && bestD + 20.0f < curD && now - s_swMs > 1500)) { pick = s_amb; pickD = curD; }
+        else if (best) { pick = best; pickD = bestD; }
+        if (pick) {
+            if (pick != s_amb) {
+                const uint32_t ti = *(uint32_t*)(pick + 0x10);
+                if (ti < 64u) {
+                    const uint32_t type = *(uint32_t*)(game + ((uintptr_t)ti + 0x910u) * 4u + 0x70cu);
+                    const float maxSp = *(float*)(pick + 0x9d8) * *(float*)(pick + 0x72c);
+                    uint32_t mb; memcpy(&mb, &maxSp, 4);
+                    fnVsStart(snd, (int)type, mb, 0);
+                    s_amb = pick; s_swMs = now; s_lastWork = 0; s_lastGain = -1.0f;
+                    LOGI("[SES] cevre sesi: arac=%p tip=%u mesafe=%.0f m", (void*)pick, type, pickD);
+                } else pick = 0;
+            }
+        }
+        if (pick) {
+            const float spd = *(float*)(pick + 0x564), sc = *(float*)(pick + 0x72c), p1 = spd * sc;
+            uint32_t b1, b2; memcpy(&b1, &p1, 4); memcpy(&b2, &spd, 4);
+            fnVsState(snd, b1, b2);                                                // yayanin kendi (yavas) hiz degerini ezer
+            const int w = AmbientWorkType(pick);
+            if (fnVsWork && w != s_lastWork) { fnVsWork(snd, w); s_lastWork = w; }
+            const float g = AmbGain(pickD);
+            if (fabsf(g - s_lastGain) > 0.01f) {
+                float sv; memcpy(&sv, &g_SndSaved, 4);
+                const float m = sv * g; uint32_t mb; memcpy(&mb, &m, 4);
+                fnSetMasterVol(snd, mb); s_lastGain = g;
+            }
+            g_AmbActive = true;
+        } else {
+            if (g_AmbActive) { fnSetMasterVol(snd, 0u); if (fnVsWork && s_lastWork) { fnVsWork(snd, 0); s_lastWork = 0; } }
+            g_AmbActive = false; s_amb = 0;
+        }
+    } else if (!g_OnFoot) { g_AmbActive = false; s_amb = 0; }
+    // ---- 2) adim sesleri (step.p1d varsa): her ~0.7 m'de bir; uzak yayalar mesafeye gore kisilir
+    if (g_StepOk && fnAsPlay && haveL) {
+        static long long s_lastStepMs = 0; static int s_alt = 0;
+        for (int k = 0; k < nw; ++k) {
+            const uintptr_t v = wk[k]; const uintptr_t b = *(uintptr_t*)(v + V_PHYS_BODY); if (!b) continue;
+            const float px = *(float*)(b + B_X), py = *(float*)(b + B_Y);
+            if (!(px == px && py == py)) continue;
+            int ti = -1; for (int j = 0; j < 16; ++j) if (g_StepTrk[j].v == v) { ti = j; break; }
+            if (ti < 0) { for (int j = 0; j < 16; ++j) if (g_StepTrk[j].v == 0) { ti = j; break; } if (ti < 0) ti = (g_StepRR++) & 15; g_StepTrk[ti].v = v; g_StepTrk[ti].x = px; g_StepTrk[ti].y = py; g_StepTrk[ti].acc = 0; continue; }
+            StepTrk& t = g_StepTrk[ti];
+            const float dd = sqrtf((px - t.x) * (px - t.x) + (py - t.y) * (py - t.y)); t.x = px; t.y = py;
+            if (dd > 2.5f) { t.acc = 0; continue; }                                // isinlanma / yeniden dogma
+            t.acc += dd;
+            if (t.acc < 0.7f) continue;
+            t.acc = fmodf(t.acc, 0.7f);
+            const bool mine = (v == g_LocalWalker);
+            const float dx = px - lx, dy = py - ly, d = sqrtf(dx * dx + dy * dy);
+            const float gain = mine ? 1.0f : (d >= 28.0f ? 0.0f : (1.0f - d / 28.0f) * (1.0f - d / 28.0f));
+            if (gain < 0.03f || now - s_lastStepMs < 110) continue;
+            s_lastStepMs = now; s_alt ^= 1;
+            fnAsPlay(&g_StepSrc, 0.6f * gain, s_alt ? 0.96f : 1.04f, false);
+        }
     }
 }
 
@@ -3824,6 +4047,19 @@ static bool GameHudHit(uintptr_t game, float x, float y, float W, float H) {
         if ((x - cx) * (x - cx) + (y - cy) * (y - cy) <= (R * 1.25f) * (R * 1.25f)) return true;
     }
     return false;
+}
+
+// v14: oyunun haritasi (soldan surgu ile acilan panel) aciksa panelin kapladigi sol sutun. [D: GenericGUIManager::updateBaseMenu]
+//   gm+0x58e8 = panel genisligi (ekran genisligine oranla; >= 0.29 ise harita cizilir), gm+0x58f0 = (>=0.29'a kenetli) genislik.
+// Haritayi tutup kaydirirken parmak joystick/bakis olarak yakalanmasin diye bu sutundaki dokunmalar oyuna birakilir
+// (dikey sinir kullanilmaz: tahmine dayali alan yerine tum sutun; harita kapaninca joystick yine serbest).
+static bool MapPanelHit(uintptr_t game, float x, float y, float W, float H) {
+    (void)y; (void)H;
+    if (!game) return false;
+    const uint8_t* gm = (const uint8_t*)(game + 0x2c88);
+    const float open = *(const float*)(gm + 0x58e8), w = *(const float*)(gm + 0x58f0);
+    if (!(open >= 0.29f && open <= 1.0f)) return false;                         // harita kapali
+    return x <= (fmaxf(w, open) + 0.03f) * W;                                   // + kenar payi (surgu/tutamac)
 }
 
 static void OnGameFrame(uintptr_t game) {
@@ -4549,6 +4785,7 @@ typedef void (*AudioStop_t)(void* self);
 typedef void (*AudioSetVol_t)(void* self, float vol);
 static AudioStop_t g_AudioStopFn = nullptr;           // AudioSource::stop()
 static AudioSetVol_t g_AudioSetVolFn = nullptr;       // AudioSource::setVolume(float)
+static AudioSetVol_t g_AudioSetPitchFn = nullptr;     // v14: AudioSource::setPitch(float)
 static const uintptr_t kHornSourceOff = 0xA468;       // Game+0xA468 = korna AudioSource
 static const float kHornFullDist = 12.0f, kHornMaxDist = 150.0f;
 
@@ -4576,7 +4813,27 @@ static float RemoteHornGain(uintptr_t game) {
     return t * t;                                      // karesel azalma
 }
 
+// v14: YAYA KORNASI = ISIK. Yayadayken (ya da uzak oyuncu yayadayken) oyunun traktor kornasi susturulur; whistle.p1d varsa o calinir,
+// yoksa korna sesi yuksek perdeyle calinir. Oyunun kendi korna kodu (Game+0xA416/0xA417) degismez; ses, calmaya basladigi karede degistirilir.
+static bool g_WhistlePrev = false, s_pitched = false;
+static void WhistleFrame(uintptr_t game) {
+    void* hornSrc = (void*)(game + kHornSourceOff);
+    const bool playing = *(uint8_t*)(game + 0xA417) != 0;
+    const bool local = WK::g_OnFoot && !g_HornForced;
+    const bool remote = g_HornForced && g_RemoteHornWhistle.load();
+    const bool active = playing && (local || remote);
+    if (active && !g_WhistlePrev) {
+        if (WK::WhistleReady()) {
+            if (g_AudioStopFn) g_AudioStopFn(hornSrc);                              // traktor kornasi sussun
+            WK::PlayWhistle(remote ? RemoteHornGain(game) : 1.0f);
+        } else if (g_AudioSetPitchFn) { g_AudioSetPitchFn(hornSrc, 2.4f); s_pitched = true; }   // ozel ses yok: yuksek perde
+    }
+    if (!playing && s_pitched && g_AudioSetPitchFn) { g_AudioSetPitchFn(hornSrc, 1.0f); s_pitched = false; }   // arac kornasi normal perdeyle calsin
+    g_WhistlePrev = active;
+}
+
 static void HornFrame(uintptr_t game, uint64_t nowMs) {
+    WhistleFrame(game);
     if (!g_IsConnected.load()) {
         if (g_HornForced) { *(uint8_t*)(game + 0xA416) = 0; g_HornForced = false; }
         return;
@@ -4594,7 +4851,7 @@ static void HornFrame(uintptr_t game, uint64_t nowMs) {
 
     const bool localPressed = (*(uint8_t*)(game + 0xA416) != 0) && !g_HornForced;   // zorladigimiz degeri sayma
     if (!g_HornForced && (localPressed != s_sentOn || (localPressed && nowMs - s_lastSend > 1500))) {
-        QueueEntityState(3, 0, 0, 0, 0, localPressed ? 1 : 0);
+        QueueEntityState(3, 0, 0, 0, 0, (uint8_t)((localPressed ? 1 : 0) | ((localPressed && WK::g_OnFoot) ? 2 : 0)));   // bit1 = yayadan (isik)
         s_sentOn = localPressed; s_lastSend = nowMs;
     }
     const bool remoteHorn = (long long)nowMs < g_RemoteHornUntilMs.load();
@@ -8291,6 +8548,7 @@ static bool ProcessPackets(uint8_t* buf, size_t& buffered, int peerId, std::vect
             if (fromPeer) { ep.ownerId = (uint8_t)peerId; memcpy(buf, &ep, sizeof(ep)); }
             if (ep.kind == 3 && ep.ownerId != g_LocalPlayerId.load()) {                 // korna
                 g_RemoteHornUntilMs.store((ep.flags & 1) ? NowMs() + 2500 : 0);
+                g_RemoteHornWhistle.store((ep.flags & 2) != 0);
                 g_RemoteHornOrigin.store((int)ep.ownerId);
             } else if (ep.ownerId != g_LocalPlayerId.load() && (ep.kind == 1 || ep.kind == 2 || ep.kind == 4)) {
                 std::lock_guard<std::mutex> lock(g_VehicleEventMutex);
@@ -10813,6 +11071,30 @@ static void* GuardedEntityUpdate(EntityUpdate_t orig, uintptr_t ownerVeh, const 
     return r;
 }
 
+// v14 TANI (davranisi degistirmez): AI isci ile bicerdoverde sira gecisleri. Sira kaydirma = 2 x (kesici yan olcusu - ortusme) [D: Vehicle::updateAIState];
+// "ikinci siranin yarisi bos" sorununun sebebini kesinlestirmek icin durum degisimlerinde ve satirda yanal hata olculur. Oturum logunda [AI] satirlari.
+static void AiDiag(uintptr_t v) {
+    if (!v || *(uint8_t*)(v + 0x328) == 0) return;                                  // sadece bicerdover
+    struct Tr { uintptr_t v; int st; long long ms; };
+    static Tr tr[8]; static int n = 0; static int logs = 0;
+    int ti = -1; for (int i = 0; i < n; ++i) if (tr[i].v == v) { ti = i; break; }
+    const int st = *(int*)(v + 0x730);
+    if (ti < 0) { if (st == 0 || n >= 8) return; ti = n++; tr[ti].v = v; tr[ti].st = 0; tr[ti].ms = 0; }
+    const long long now = NowMs();
+    const bool changed = (st != tr[ti].st);
+    if (!changed && !(st == 1 && now - tr[ti].ms > 4000)) return;
+    if (logs >= 400) return;
+    const uintptr_t b = *(uintptr_t*)(v + 0x528); if (!b) return;
+    const float px = *(float*)(b + 0xC), py = *(float*)(b + 0x10), fx = *(float*)(b + 0x1c), fy = *(float*)(b + 0x20);
+    const float hx = *(float*)(v + 0x73c), hy = *(float*)(v + 0x740), ox = *(float*)(v + 0x744), oy = *(float*)(v + 0x748);
+    const float lat = hx * (py - oy) - hy * (px - ox), dot = hx * fx + hy * fy;
+    ++logs;
+    LOGI("[AI] arac=%p durum %d->%d kesici=%d x1=%.2f x2=%.2f yan=%d kaydirma=%.2f yanal_hata=%.2f yon_dot=%.2f konum=(%.1f,%.1f) satir_orijin=(%.1f,%.1f) yon=(%.2f,%.2f) alan=[%.0f..%.0f]x[%.0f..%.0f]",
+         (void*)v, tr[ti].st, st, (int)*(uint8_t*)(v + 0x498), *(float*)(v + 0x3b4), *(float*)(v + 0x3c4), (int)*(uint8_t*)(v + 0x760), *(float*)(v + 0x764), lat, dot,
+         px, py, ox, oy, hx, hy, *(float*)(v + 0x750), *(float*)(v + 0x758), *(float*)(v + 0x754), *(float*)(v + 0x75c));
+    tr[ti].st = st; tr[ti].ms = now;
+}
+
 static void* my_Vehicle_update(void* t, uint32_t a, uint32_t b, uint32_t c, uint32_t d, uint32_t e) {
     // Uzaktan surulen aracin direksiyon durumunu (Vehicle+0x568) oyunun kendi tekerlek kodu kullansin diye yaz.
     if (kSyncSteering && t && g_IsConnected.load() && g_VehNetArmed.load()) {
@@ -10833,8 +11115,10 @@ static void* my_Vehicle_update(void* t, uint32_t a, uint32_t b, uint32_t c, uint
         }
     }
     StageG("orig_Vehicle_update");
+    WK::StripWalkerVehicleHud((uintptr_t)t);               // v14: update'ten ÖNCE de (yakıt alımı update'in başında yapılır)
     void* wkRet = GuardedEntityUpdate(orig_Vehicle_update, (uintptr_t)t, "Vehicle", t, a, b, c, d, e);
     WK::StripWalkerVehicleHud((uintptr_t)t);               // WALKER: sahte aracın yakıt HUD değerlerini temizle
+    AiDiag((uintptr_t)t);                                  // v14: AI bicerdover sira gecisi tanisi (sadece log)
     WK::AfterVehicleUpdate((uintptr_t)t, a, b, c, d);     // WALKER: yerel yayanin hareketi + birinci sahis kamera (update'ten SONRA)
     return wkRet;
 }
@@ -11085,6 +11369,7 @@ void my_GameUpdateStateBase(void* thiz, float param_1, uint32_t param_2, uint32_
         CaptureAndQueueLocalVehicleState(g_EngineInstance);
         ActiveVehicleFrame(g_EngineInstance);
         HornFrame(g_EngineInstance, GetMonotonicMilliseconds());
+        WK::AmbientPost(g_EngineInstance);                 // v14: yayadayken en yakin aracin sesi + adim sesleri (tum update'lerden sonra)
     }
 
     // Oyun ici ImGui cizimi: ekran renderQueues'ta (presentGLESFramebuffer) ekrana verilir,
@@ -11329,8 +11614,8 @@ void* my_renderStartMenuMain(void* thiz, void* p1, void* p2, void* p3) {
 // ========================================================================
 __attribute__((constructor))
 void ModMain() {
-    SL::Open("shopfix-47+walker-v13");
-    LOGI(">>> MULTIPLAYER MOD STARTING <<< build=shopfix-47+walker-v13");
+    SL::Open("shopfix-48+walker-v14");
+    LOGI(">>> MULTIPLAYER MOD STARTING <<< build=shopfix-48+walker-v14");
 
     ResetVehicleSyncState();
     std::thread(StartPONGResponderThread).detach();
@@ -11380,6 +11665,7 @@ void ModMain() {
         if (!g_CombineToggleFn) g_CombineToggleFn = (Entity_toggle_t)FindElfSymbolByPrefix("libapp.so", "_ZN7Vehicle23toggleCombineIsTurnedOn");
         g_AudioStopFn = (AudioStop_t)dlsym(appLib, "_ZN11AudioSource4stopEv");
         g_AudioSetVolFn = (AudioSetVol_t)dlsym(appLib, "_ZN11AudioSource9setVolumeEf");
+        g_AudioSetPitchFn = (AudioSetVol_t)dlsym(appLib, "_ZN11AudioSource8setPitchEf");
         LOGI("[HORN] AudioSource::stop=%p setVolume=%p", (void*)g_AudioStopFn, (void*)g_AudioSetVolFn);
         g_ToolToggleActiveFn = (Entity_toggle_t)dlsym(appLib, "_ZN4Tool12toogleActiveEv");
         if (!g_ToolToggleActiveFn) g_ToolToggleActiveFn = (Entity_toggle_t)FindElfSymbolByPrefix("libapp.so", "_ZN4Tool12toogleActive");
