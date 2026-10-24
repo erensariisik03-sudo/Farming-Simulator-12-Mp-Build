@@ -3565,17 +3565,21 @@ static double ReadHour(uintptr_t game, double* rawOut) {
     if (rawOut) *rawOut = v;
     return h;
 }
+// v15: GUNES/AY KONUMU SAATE GORE (oyunun isik yonune bagli degil). Oyunun isigi sabah/aksam bile neredeyse dikey geldigi icin 06:00'da gunes tepede cikiyordu;
+//      ayrica ayar menusunden donuste isik "taze degil" yedegine dusup gunes ziplatiyordu. Artik: 06:00 dogus (dogu ufku), 12:00 en yuksek, 18:00 batis, gece ay tam karsida.
+//      gT parametresi geriye uyumluluk icin duruyor, KULLANILMAZ (oyunun isigi/golgeleri hic degistirilmez; sadece gokyuzu cizimi saate bakar).
 static void ComputeSky(double hour, SkyParams* o, const float* gT = nullptr) {
+    (void)gT;
     const float pi = 3.14159265f;
-    const float ang = (float)((hour - 6.0) / 12.0 * pi);                       // 6:00 dogus, 12:00 tepe, 18:00 batis (YEDEK: oyunun isigi yoksa)
-    float sn = sinf(ang);
-    float sx = cosf(ang), sy = sn, sz = 0.35f; const float l = sqrtf(sx * sx + sy * sy + sz * sz);
+    double hh = fmod(hour, 24.0); if (hh < 0) hh += 24.0;
+    const float ang = (float)((hh - 6.0) / 12.0 * pi);                         // 6:00 dogus, 12:00 tepe, 18:00 batis, 24:00 en alt (ay en tepede)
+    const float sn = sinf(ang);
+    const float sx = cosf(ang), sy = sn, sz = 0.40f; const float l = sqrtf(sx * sx + sy * sy + sz * sz);   // sz: yolun kuzeye egimi -> ogle gunesi ~66 derece, tam tepe degil
     o->sun[0] = sx / l; o->sun[1] = sy / l; o->sun[2] = sz / l;
-    if (gT) { sn = fminf(sn, gT[1]); o->sun[0] = gT[0]; o->sun[1] = gT[1]; o->sun[2] = gT[2]; }   // v13: gunes = oyunun isik yonu (golgelerle ayni); gece/gunduz: saat ve isik yonundan kucuk olan
-    const float day = Sstep(-0.10f, 0.30f, sn);
-    const float tw = expf(-powf(sn / 0.20f, 2.f));                             // gun dogumu/batimi (turuncu) agirligi
-    o->day = day; o->night = 1.f - Sstep(-0.18f, 0.02f, sn);
-    if (gT && day <= 0.03f && gT[1] > -0.05f) { o->sun[0] = -gT[0]; o->sun[1] = -gT[1]; o->sun[2] = -gT[2]; }   // gece oyun isigi hala ustteyse: ay o yonde (gunes ufkun altina)
+    const float se = o->sun[1];                                                 // gercek yukseklik (normalize sonrasi)
+    const float day = Sstep(-0.10f, 0.30f, se);
+    const float tw = expf(-powf(se / 0.20f, 2.f));                             // gun dogumu/batimi (turuncu) agirligi
+    o->day = day; o->night = 1.f - Sstep(-0.18f, 0.02f, se);
     static const float dayH[3] = {0.74f, 0.84f, 0.93f}, dayZ[3] = {0.30f, 0.52f, 0.84f}, nightH[3] = {0.05f, 0.06f, 0.13f}, nightZ[3] = {0.01f, 0.015f, 0.05f};
     static const float orange[3] = {0.98f, 0.60f, 0.34f}, twZ[3] = {0.30f, 0.33f, 0.58f};
     float h[3], z[3];
@@ -3839,13 +3843,16 @@ static void DrawSkyGL(uintptr_t game) {
     if (!g_SkyGLOk) { SkyEnsureNow(); if (!g_SkyGLOk) return; }
     GLint vp[4] = {0, 0, 0, 0}; glGetIntegerv(GL_VIEWPORT, vp);
     double raw = 0; const double hour = ReadHour(game, &raw);
-    const bool haveLight = (NowMs() - g_GameLightMs) < 1500;                   // oyunun isigi taze mi (yoksa: saate gore yedek gunes)
-    SkyParams sp; ComputeSky(hour, &sp, haveLight ? g_GameLightT : nullptr);
+    SkyParams sp; ComputeSky(hour, &sp);                                       // v15: gunes/ay yalnizca saate gore (oyunun isigi kullanilmaz -> ayar menusu sonrasi kayma/ziplama yok)
     // v10: bakis yonu GERCEK kameradan (RenderArgs::update'e giden gorunum matrisi): dunya yonleri = gorunum matrisinin satirlari (isim etiketleriyle ayni sozlesme)
     float R[3], U[3], F[3];
+    static float s_lastCam[9]; static long long s_lastCamMs = 0;
     if (NowMs() - g_CamMs.load() <= 500) {
         const float* V = g_CamView;
         R[0] = V[0]; R[1] = V[4]; R[2] = V[8];  U[0] = V[1]; U[1] = V[5]; U[2] = V[9];  F[0] = -V[2]; F[1] = -V[6]; F[2] = -V[10];
+        memcpy(s_lastCam, R, 12); memcpy(s_lastCam + 3, U, 12); memcpy(s_lastCam + 6, F, 12); s_lastCamMs = NowMs();
+    } else if (s_lastCamMs && NowMs() - s_lastCamMs < 20000) {                 // v15: ayar menusu vb. sonrasi kamera verisi gecici yoksa SON IYI kamera (arac kamerasina atlayip dagi/gunesi kaydirmasin)
+        memcpy(R, s_lastCam, 12); memcpy(U, s_lastCam + 3, 12); memcpy(F, s_lastCam + 6, 12);
     } else {                                                                   // kanca henuz veri vermediyse: aktif aracin kamera dunya matrisi
         const uintptr_t av = LocalActiveVehiclePtr(game); if (!av) return;
         const float* C = (const float*)(av + V_CAM_WORLD);
@@ -3857,7 +3864,7 @@ static void DrawSkyGL(uintptr_t game) {
       if (pj[5] > 0.3f && pj[5] < 8.f && pj[0] > 0.3f && pj[0] < 8.f) { tanX = 1.f / pj[0]; tanY = 1.f / pj[5]; }
       else if (pj2[5] > 0.3f && pj2[5] < 8.f && pj2[0] > 0.3f && pj2[0] < 8.f) { tanX = 1.f / pj2[0]; tanY = 1.f / pj2[5]; }
       else if (vp[3] > 0) { tanX = tanY * (float)vp[2] / (float)vp[3]; } }
-    { static long long s_l = 0; const long long now = NowMs(); if (now - s_l > 10000) { s_l = now; LOGI("[WALKER] gokyuzu GL: saat=%.2f (ham=%.3f) tan=(%.2f,%.2f) vp=%dx%d gunes=(%.2f,%.2f,%.2f) gunduz=%.2f oyun_isigi=%d", hour, raw, tanX, tanY, vp[2], vp[3], sp.sun[0], sp.sun[1], sp.sun[2], sp.day, (int)haveLight); } }
+    { static long long s_l = 0; const long long now = NowMs(); if (now - s_l > 10000) { s_l = now; LOGI("[WALKER] gokyuzu GL: saat=%.2f (ham=%.3f) tan=(%.2f,%.2f) vp=%dx%d gunes=(%.2f,%.2f,%.2f) gunduz=%.2f (v15: saate gore)", hour, raw, tanX, tanY, vp[2], vp[3], sp.sun[0], sp.sun[1], sp.sun[2], sp.day); } }
     const float yMin = SkyMinY(R, U, F, tanX, tanY);
     if (yMin >= 1.f) return;                                                   // ufuk ekran disinda (yere bakiliyor): cizilecek gokyuzu yok
     SkyGlSave sv; sv.Save();
@@ -11082,8 +11089,8 @@ static void AiDiag(uintptr_t v) {
     if (ti < 0) { if (st == 0 || n >= 8) return; ti = n++; tr[ti].v = v; tr[ti].st = 0; tr[ti].ms = 0; }
     const long long now = NowMs();
     const bool changed = (st != tr[ti].st);
-    if (!changed && !(st == 1 && now - tr[ti].ms > 4000)) return;
-    if (logs >= 400) return;
+    if (!changed && !(st != 0 && now - tr[ti].ms > 1500)) return;                    // v15: durum degisiminde + sirada/doneste her 1.5 sn
+    if (logs >= 1500) return;
     const uintptr_t b = *(uintptr_t*)(v + 0x528); if (!b) return;
     const float px = *(float*)(b + 0xC), py = *(float*)(b + 0x10), fx = *(float*)(b + 0x1c), fy = *(float*)(b + 0x20);
     const float hx = *(float*)(v + 0x73c), hy = *(float*)(v + 0x740), ox = *(float*)(v + 0x744), oy = *(float*)(v + 0x748);
@@ -11092,6 +11099,13 @@ static void AiDiag(uintptr_t v) {
     LOGI("[AI] arac=%p durum %d->%d kesici=%d x1=%.2f x2=%.2f yan=%d kaydirma=%.2f yanal_hata=%.2f yon_dot=%.2f konum=(%.1f,%.1f) satir_orijin=(%.1f,%.1f) yon=(%.2f,%.2f) alan=[%.0f..%.0f]x[%.0f..%.0f]",
          (void*)v, tr[ti].st, st, (int)*(uint8_t*)(v + 0x498), *(float*)(v + 0x3b4), *(float*)(v + 0x3c4), (int)*(uint8_t*)(v + 0x760), *(float*)(v + 0x764), lat, dot,
          px, py, ox, oy, hx, hy, *(float*)(v + 0x750), *(float*)(v + 0x758), *(float*)(v + 0x754), *(float*)(v + 0x75c));
+    {   // v15 EK TANI: kesim dortgeni ham degerleri (alan islemine giden), kesici/ikinci dortgen, bunker doluluk, hiz -> "ikinci sirada kesicinin yarisi bos" nedenini loglardan cozmek icin
+        const float* q = (const float*)(v + 0x3a8); const float* q2 = (const float*)(v + 0x40c);
+        LOGI("[AI+] arac=%p durum=%d hiz=%.2f yakit=%.0f bunker=%.1f/%.1f ham_kesim[3a8..3d4]=%.2f %.2f %.2f %.2f %.2f %.2f %.2f %.2f %.2f %.2f %.2f %.2f ham_alet[40c..438]=%.2f %.2f %.2f %.2f %.2f %.2f %.2f %.2f %.2f %.2f %.2f %.2f kayd=%.2f yan=%d",
+             (void*)v, st, *(float*)(v + 0x564), *(float*)(v + 0x1b4), *(float*)(v + 0x440), *(float*)(v + 0x444),
+             q[0], q[1], q[2], q[3], q[4], q[5], q[6], q[7], q[8], q[9], q[10], q[11],
+             q2[0], q2[1], q2[2], q2[3], q2[4], q2[5], q2[6], q2[7], q2[8], q2[9], q2[10], q2[11], *(float*)(v + 0x764), (int)*(uint8_t*)(v + 0x760));
+    }
     tr[ti].st = st; tr[ti].ms = now;
 }
 
@@ -11614,8 +11628,8 @@ void* my_renderStartMenuMain(void* thiz, void* p1, void* p2, void* p3) {
 // ========================================================================
 __attribute__((constructor))
 void ModMain() {
-    SL::Open("shopfix-48+walker-v14");
-    LOGI(">>> MULTIPLAYER MOD STARTING <<< build=shopfix-48+walker-v14");
+    SL::Open("shopfix-48+walker-v15");
+    LOGI(">>> MULTIPLAYER MOD STARTING <<< build=shopfix-48+walker-v15");
 
     ResetVehicleSyncState();
     std::thread(StartPONGResponderThread).detach();
